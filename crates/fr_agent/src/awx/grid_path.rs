@@ -353,8 +353,7 @@ fn foreign_pad_distance(
     let mut best = f64::INFINITY;
     for key in request.board.board.get_pins() {
         let item = request.board.board.item(key);
-        if item.net_numbers().is_empty()
-            || item.contains_net(request.net)
+        if item.contains_net(request.net)
             || !item.is_on_layer(&request.board.board, layer)
         {
             continue;

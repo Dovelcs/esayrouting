@@ -3,12 +3,17 @@ use crate::{
     awx::{
         braid_connect::{rung_specs, LadderMode, RungEndpoint, RungRequest},
         fab_rules::{EscalationPolicy, FabTier},
-        native_rung::{endpoint_grid_calls, route_multilayer_endpoints},
+        native_rung::{endpoint_grid_calls, route_multilayer_endpoint_sets},
         whole_context::RoutingRules,
     },
     board_adapter::BoardAdapter,
 };
-use fr_engine::{drc::NetIncompletes, ids::NetNo};
+use fr_engine::{
+    board::{ItemKey, ItemKind, ItemSet},
+    drc::NetIncompletes,
+    ids::NetNo,
+};
+use fr_geom::Point;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -238,6 +243,83 @@ fn log_event(log: &mut fs::File, event: &serde_json::Value) -> Result<(), String
     log.flush().map_err(|e| e.to_string())
 }
 
+/// True when a native contact handle (tile shape) of `key` on one of its own
+/// layers contains `point`. Gates conduction-area terminals: only corners a
+/// native area shape actually contains may attach, and no geometry outside
+/// the native shapes is invented.
+fn native_contact_handle_contains(board: &BoardAdapter, key: ItemKey, point: &Point) -> bool {
+    let item = board.board.item(key);
+    let from = item.first_layer(&board.board);
+    let to = item.last_layer(&board.board);
+    (0..board.board.tile_shape_count(key)).any(|index| {
+        let layer = board.board.shape_layer(key, index);
+        layer >= from
+            && layer <= to
+            && board
+                .board
+                .tile_shape(key, index)
+                .is_some_and(|shape| shape.contains(point))
+    })
+}
+
+/// The exact ORIGINAL native terminal points of one item the grid router may
+/// attach to without inventing or interpolating geometry. Pins and vias
+/// attach at their drill center; a trace only at its two polyline corners
+/// (an interior corner would require splitting the trace). A conduction area
+/// contributes the ratsnest corners a native contact handle contains.
+fn item_terminal_points(board: &BoardAdapter, key: ItemKey) -> Vec<Point> {
+    let item = board.board.item(key);
+    match &item.kind {
+        ItemKind::Pin(_) | ItemKind::Via(_) => vec![item.center(&board.board)],
+        ItemKind::Trace(_) => vec![item.first_corner(), item.last_corner()],
+        ItemKind::ConductionArea(_) => board
+            .board
+            .ratsnest_corners(key)
+            .into_iter()
+            .filter(|point| native_contact_handle_contains(board, key, point))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Deterministic Point+layer candidates from every native terminal in one
+/// native connected group, restricted to the supplied active signal layers.
+/// Duplicates at the same exact board point and layer collapse.
+fn connected_group_candidates(
+    board: &BoardAdapter,
+    group: &ItemSet,
+    active_layers: &[(i32, String)],
+) -> Vec<RungEndpoint> {
+    let mut seen = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    for member in group.iter() {
+        let item = board.board.item(member);
+        for point in item_terminal_points(board, member) {
+            let exact = point.to_float();
+            let mm = [exact.x / board.units_per_mm, exact.y / board.units_per_mm];
+            for (layer_index, layer_name) in active_layers {
+                if !item.is_on_layer(&board.board, *layer_index) {
+                    continue;
+                }
+                if seen.insert((mm[0].to_bits(), mm[1].to_bits(), layer_name.clone())) {
+                    endpoints.push(RungEndpoint {
+                        point: mm,
+                        layer: layer_name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    endpoints.sort_by(|a, b| {
+        (a.point[0].to_bits(), a.point[1].to_bits(), &a.layer).cmp(&(
+            b.point[0].to_bits(),
+            b.point[1].to_bits(),
+            &b.layer,
+        ))
+    });
+    endpoints
+}
+
 fn resolved_destination(path: &Path) -> Result<std::path::PathBuf, String> {
     if path.exists() {
         return fs::canonicalize(path).map_err(|e| e.to_string());
@@ -318,9 +400,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             continue;
         }
         // Keep the mature native Delaunay/Kruskal airline order. Refresh after
-        // every accepted transaction. Never retry the same geometric endpoints
-        // on the same layer, even if an airline's native item identity changes.
-        let mut tried = BTreeSet::new();
+        // every accepted transaction so endpoint groups reflect the new board.
         loop {
             if Instant::now() >= deadline {
                 skips.push(serde_json::json!({"net":name,"reason":"deadline"}));
@@ -332,19 +412,14 @@ pub fn run(path: &Path) -> Result<(), String> {
                 break;
             }
             let mut committed = false;
+            // Suppress duplicate airline edges during this board revision.
+            // A successful commit starts a fresh pass with a fresh set.
+            let mut tried = BTreeSet::new();
             for edge in current.incompletes {
                 let from = board.board.item(edge.from_item);
                 let to = board.board.item(edge.to_item);
                 let from_id = from.id().0;
                 let to_id = to.id().0;
-                let start_point = [
-                    edge.from_corner.x / board.units_per_mm,
-                    edge.from_corner.y / board.units_per_mm,
-                ];
-                let end_point = [
-                    edge.to_corner.x / board.units_per_mm,
-                    edge.to_corner.y / board.units_per_mm,
-                ];
                 let route_layers: Vec<_> = board
                     .board
                     .layer_structure
@@ -361,105 +436,139 @@ pub fn run(path: &Path) -> Result<(), String> {
                     })
                     .map(|(i, l)| (i as i32, l.name.clone()))
                     .collect();
-                let endpoint_pairs: Vec<_> = route_layers
+                if route_layers.is_empty() {
+                    continue;
+                }
+                // The airline's two items stand for two native connected
+                // groups. Build the candidate sets from every eligible
+                // ORIGINAL terminal in those groups, not from the single
+                // airline corner replicated on each layer.
+                let from_group = board.board.connected_set(edge.from_item, net, false);
+                let to_group = board.board.connected_set(edge.to_item, net, false);
+                let start_candidates =
+                    connected_group_candidates(&board, &from_group, &route_layers);
+                let target_candidates =
+                    connected_group_candidates(&board, &to_group, &route_layers);
+                if start_candidates.is_empty() || target_candidates.is_empty() {
+                    continue;
+                }
+                let start_point = start_candidates[0].point;
+                let end_point = target_candidates[0].point;
+                // Suppress repeat work on the same ordered group pair during
+                // this board revision using stable native group identities
+                // (their member item ids), never the per-airline corner.
+                // The set is rebuilt after every acceptance below.
+                let mut from_members: Vec<i32> = from_group
                     .iter()
-                    .filter(|(i, _)| from.is_on_layer(&board.board, *i))
-                    .flat_map(|(i, a)| {
+                    .map(|member| board.board.item(member).id().0)
+                    .collect();
+                from_members.sort_unstable();
+                let mut to_members: Vec<i32> = to_group
+                    .iter()
+                    .map(|member| board.board.item(member).id().0)
+                    .collect();
+                to_members.sort_unstable();
+                let mut group_key = (from_members, to_members);
+                if group_key.1 < group_key.0 {
+                    group_key = (group_key.1, group_key.0);
+                }
+                if !tried.insert(group_key) {
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                // Rule selection keeps its old contract: the first route
+                // layer the original from-item sits on. Candidates from
+                // other members of the connected group can also start the
+                // route, so fall back to the first selected candidate's layer
+                // when the representative item is off the active stack
+                // (uniform benchmark rules make these equivalent).
+                let rule_layer = route_layers
+                    .iter()
+                    .find(|(i, _)| from.is_on_layer(&board.board, *i))
+                    .map(|(i, _)| *i)
+                    .or_else(|| {
                         route_layers
                             .iter()
-                            .filter(|(j, _)| to.is_on_layer(&board.board, *j))
-                            .map(move |(j, b)| (*i, a.clone(), *j, b.clone()))
+                            .find(|(_, name)| *name == start_candidates[0].layer)
+                            .map(|(i, _)| *i)
                     })
-                    .collect();
-                for (layer_no, layer, end_layer_no, end_layer) in endpoint_pairs {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    let mut key = [
-                        (start_point.map(f64::to_bits), layer_no),
-                        (end_point.map(f64::to_bits), end_layer_no),
-                    ];
-                    key.sort();
-                    if !tried.insert(key) {
-                        continue;
-                    }
-                    let rules = rules_for_layer(
+                    .expect("start candidate set is non-empty");
+                let rules = rules_for_layer(
+                    &board,
+                    net,
+                    rule_layer,
+                    job.grid_step_mm,
+                    job.via_drill_mm,
+                    job.min_annular_ring_mm,
+                    job.hole_to_hole_clearance_mm,
+                )?;
+                let mut event = serde_json::json!({"event":"attempt_start","net":name,
+                    "from_item":from_id,"to_item":to_id,"start":start_point,"end":end_point,
+                    "start_layers":start_candidates.iter().map(|e| e.layer.clone()).collect::<Vec<_>>(),
+                    "end_layers":target_candidates.iter().map(|e| e.layer.clone()).collect::<Vec<_>>(),
+                    "scheduler":"native NetIncompletes Delaunay/Kruskal airlines",
+                    "width_mm":rules.track_width,"clearance_mm":rules.clearance,
+                    "algorithm":"awx_grid::GridRouter","new_vias_allowed":true,
+                    "new_via_drill_source":"explicit job rule",
+                    "existing_pad_drill_source":"native explicit padstack metadata",
+                    "via_drill_mm":rules.via_drill});
+                log_event(&mut log, &event)?;
+                let request = RungRequest {
+                    board: board.clone(),
+                    net: name.clone(),
+                    net_id: net,
+                    stage: "ordinary_dsn_multilayer".into(),
+                    start: start_candidates[0].clone(),
+                    end: target_candidates[0].clone(),
+                    b_alternatives: Vec::new(),
+                    pair: None,
+                    spec: rung_specs(LadderMode::Open)[2],
+                    band: None,
+                    band_slack: 0.0,
+                    window_points: None,
+                    virtual_tracks: Vec::new(),
+                    virtual_vias: Vec::new(),
+                    free_via_pads: free_via_pads.clone(),
+                    same_net_pads: same_net_pads.clone(),
+                    existing_vias: crate::awx::board_snapshot::BoardSnapshot::capture_vias(
                         &board,
-                        net,
-                        layer_no,
-                        job.grid_step_mm,
-                        job.via_drill_mm,
-                        job.min_annular_ring_mm,
-                        job.hole_to_hole_clearance_mm,
-                    )?;
-                    let mut event = serde_json::json!({"event":"attempt_start","net":name,
-                        "from_item":from_id,"to_item":to_id,"start":start_point,"end":end_point,"layer":layer,
-                        "scheduler":"native NetIncompletes Delaunay/Kruskal airlines",
-                        "width_mm":rules.track_width,"clearance_mm":rules.clearance,
-                        "algorithm":"awx_grid::GridRouter","new_vias_allowed":true,
-                        "new_via_drill_source":"explicit job rule",
-                        "existing_pad_drill_source":"native explicit padstack metadata",
-                        "via_drill_mm":rules.via_drill});
-                    log_event(&mut log, &event)?;
-                    let request = RungRequest {
-                        board: board.clone(),
-                        net: name.clone(),
-                        net_id: net,
-                        stage: "ordinary_dsn_multilayer".into(),
-                        start: RungEndpoint {
-                            point: start_point,
-                            layer: layer.clone(),
-                        },
-                        end: RungEndpoint {
-                            point: end_point,
-                            layer: end_layer.clone(),
-                        },
-                        b_alternatives: Vec::new(),
-                        pair: None,
-                        spec: rung_specs(LadderMode::Open)[2],
-                        band: None,
-                        band_slack: 0.0,
-                        window_points: None,
-                        virtual_tracks: Vec::new(),
-                        virtual_vias: Vec::new(),
-                        free_via_pads: free_via_pads.clone(),
-                        same_net_pads: same_net_pads.clone(),
-                        existing_vias: crate::awx::board_snapshot::BoardSnapshot::capture_vias(
-                            &board,
-                            &BTreeMap::new(),
-                        )?,
-                        paste_pads: BTreeMap::new(),
-                        rules,
-                        fabrication: FabTier::Standard,
-                        escalation: EscalationPolicy::Off,
-                        fabrication_overrides: BTreeMap::new(),
-                        fab_clearance_floor_mm: 0.0,
-                        fab_track_floor_mm: 0.0,
-                        may_narrow: false,
-                        fab_via_rungs: Vec::new(),
-                        max_iterations: job.max_iterations,
-                        route_layers: route_layers.iter().map(|(_, n)| n.clone()).collect(),
-                        deadline: Some(deadline),
-                    };
-                    let calls_before = endpoint_grid_calls();
-                    let (candidate, mut report) =
-                        match route_multilayer_endpoints(request, edge.from_item, edge.to_item) {
-                            Ok(v) => v,
-                            Err(e) => (None, serde_json::json!({"accepted":false,"reason":e})),
-                        };
-                    report["grid_router_calls"] = (endpoint_grid_calls() - calls_before).into();
-                    event["event"] = "attempt_end".into();
-                    event["result"] = report;
-                    log_event(&mut log, &event)?;
-                    attempts.push(event);
-                    if let Some(candidate) = candidate {
-                        board = candidate;
-                        accepted += 1;
-                        committed = true;
-                        break;
-                    }
-                }
-                if committed {
+                        &BTreeMap::new(),
+                    )?,
+                    paste_pads: BTreeMap::new(),
+                    rules,
+                    fabrication: FabTier::Standard,
+                    escalation: EscalationPolicy::Off,
+                    fabrication_overrides: BTreeMap::new(),
+                    fab_clearance_floor_mm: 0.0,
+                    fab_track_floor_mm: 0.0,
+                    may_narrow: false,
+                    fab_via_rungs: Vec::new(),
+                    max_iterations: job.max_iterations,
+                    route_layers: route_layers.iter().map(|(_, n)| n.clone()).collect(),
+                    deadline: Some(deadline),
+                };
+                let calls_before = endpoint_grid_calls();
+                let (candidate, mut report) = match route_multilayer_endpoint_sets(
+                    request,
+                    edge.from_item,
+                    edge.to_item,
+                    &start_candidates,
+                    &target_candidates,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => (None, serde_json::json!({"accepted":false,"reason":e})),
+                };
+                report["grid_router_calls"] = (endpoint_grid_calls() - calls_before).into();
+                event["event"] = "attempt_end".into();
+                event["result"] = report;
+                log_event(&mut log, &event)?;
+                attempts.push(event);
+                if let Some(candidate) = candidate {
+                    board = candidate;
+                    accepted += 1;
+                    committed = true;
                     break;
                 }
             }

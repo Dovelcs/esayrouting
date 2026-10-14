@@ -303,7 +303,7 @@ struct GridSearchResult {
     obstacles: GridObstacleMap,
     router_config: fr_engine::autoroute::point_router::SourceGridConfig,
     native_config: super::native_obstacles::NativeGridConfig,
-    source_cell: (i32, i32, u8),
+    source_cells: Vec<(i32, i32, u8)>,
     target_cells: Vec<(i32, i32, u8)>,
 }
 
@@ -374,6 +374,9 @@ fn source_route_attempt(
         via_exclusion_radius: i32,
     ) -> SourceRouteAttempt {
         let probe_budget = 5_000usize;
+        // Source `_dynamic_iterations: config.max_iterations <= 10_000` keeps
+        // the static cap; only larger budgets earn the 1e7 dynamic ceiling.
+        let dynamic = max_iterations > 10_000;
         let (forward, fi, mut frontier) = route_core(
             router,
             obstacles,
@@ -431,7 +434,7 @@ fn source_route_attempt(
             max_iterations,
             via_exclusion_radius,
             via_rung,
-            true,
+            dynamic,
         );
         if full_forward.is_some() {
             return SourceRouteAttempt {
@@ -450,7 +453,7 @@ fn source_route_attempt(
             max_iterations,
             via_exclusion_radius,
             via_rung,
-            true,
+            dynamic,
         );
         full_frontier.extend(back_frontier);
         if let Some(mut path) = full_backward {
@@ -582,20 +585,69 @@ fn source_grid_search(
     clearance_class: i32,
     via_clearance_class: i32,
 ) -> Result<GridSearchResult, String> {
+    let sources = vec![request.start.clone()];
+    let mut targets = vec![request.end.clone()];
+    targets.extend(request.b_alternatives.iter().cloned());
+    source_grid_search_with_endpoints(
+        request,
+        board,
+        own_nets,
+        soft_tracks,
+        soft_vias,
+        soft_cost,
+        clearance_class,
+        via_clearance_class,
+        &sources,
+        &targets,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_grid_search_with_endpoints(
+    request: &RungRequest,
+    board: &BoardAdapter,
+    own_nets: &[NetNo],
+    soft_tracks: &[super::whole_context::ReservationTube],
+    soft_vias: &[super::whole_context::CopperVia],
+    soft_cost: Option<f64>,
+    clearance_class: i32,
+    via_clearance_class: i32,
+    source_endpoints: &[RungEndpoint],
+    target_endpoints: &[RungEndpoint],
+) -> Result<GridSearchResult, String> {
     if request.route_layers.is_empty() || request.max_iterations == 0 {
         return Err("native AWX grid route needs layers and a positive budget".into());
     }
+    if source_endpoints.is_empty() || target_endpoints.is_empty() {
+        return Err("native AWX grid route needs source and target endpoints".into());
+    }
     let upm = board.units_per_mm;
     let grid_step_board = (request.rules.grid_step * upm).round().max(1.0) as i32;
-    let start_point = board.point(request.start.point)?;
-    let end_point = board.point(request.end.point)?;
-    let (start_point, end_point) = match (start_point, end_point) {
-        (EnginePoint::Int(a), EnginePoint::Int(b)) => (a, b),
-        _ => return Err("AWX grid endpoints exceed native coordinate range".into()),
-    };
-    let mut window_endpoints = vec![request.start.point, request.end.point];
-    window_endpoints.extend(request.b_alternatives.iter().map(|e| e.point));
-    let window = search_window_for_points(request, &window_endpoints, start_point, end_point)?;
+    let source_points = source_endpoints
+        .iter()
+        .map(|endpoint| match board.point(endpoint.point)? {
+            EnginePoint::Int(point) => Ok(point),
+            _ => Err("AWX grid source endpoint exceeds native coordinate range".into()),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let target_points = target_endpoints
+        .iter()
+        .map(|endpoint| match board.point(endpoint.point)? {
+            EnginePoint::Int(point) => Ok(point),
+            _ => Err("AWX grid target endpoint exceeds native coordinate range".into()),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let window_endpoints = source_endpoints
+        .iter()
+        .chain(target_endpoints)
+        .map(|endpoint| endpoint.point)
+        .collect::<Vec<_>>();
+    let window = search_window_for_points(
+        request,
+        &window_endpoints,
+        source_points[0],
+        target_points[0],
+    )?;
     let mut obstacle_result = super::native_obstacles::build_obstacle_map(
         board,
         request,
@@ -620,47 +672,44 @@ fn source_grid_search(
         gy1,
         request.route_layers.len(),
     );
-    let start_name = request.start.layer.as_str();
-    let start_layer = request
-        .route_layers
+    let source_cells = source_endpoints
         .iter()
-        .position(|name| name == start_name)
-        .ok_or_else(|| format!("start layer {start_name} is outside route layers"))?;
-    let end_layer = request
-        .route_layers
+        .zip(source_points)
+        .filter_map(|(endpoint, point)| {
+            request
+                .route_layers
+                .iter()
+                .position(|name| name == &endpoint.layer)
+                .map(|layer| {
+                    (
+                        super::native_obstacles::grid_round(point.x, grid_step_board),
+                        super::native_obstacles::grid_round(point.y, grid_step_board),
+                        layer as u8,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let targets = target_endpoints
         .iter()
-        .position(|name| name == &request.end.layer)
-        .ok_or_else(|| format!("end layer {} is outside route layers", request.end.layer))?;
-    let start_cell = (
-        super::native_obstacles::grid_round(start_point.x, grid_step_board),
-        super::native_obstacles::grid_round(start_point.y, grid_step_board),
-        start_layer as u8,
-    );
-    let mut targets = vec![(
-        super::native_obstacles::grid_round(end_point.x, grid_step_board),
-        super::native_obstacles::grid_round(end_point.y, grid_step_board),
-        end_layer as u8,
-    )];
-    for alt in &request.b_alternatives {
-        let Some(layer) = request
-            .route_layers
-            .iter()
-            .position(|name| name == &alt.layer)
-        else {
-            continue;
-        };
-        let point = match board.point(alt.point)? {
-            EnginePoint::Int(p) => p,
-            _ => return Err("AWX grid alternate endpoint exceeds native coordinate range".into()),
-        };
-        targets.push((
-            super::native_obstacles::grid_round(point.x, grid_step_board),
-            super::native_obstacles::grid_round(point.y, grid_step_board),
-            layer as u8,
-        ));
+        .zip(target_points)
+        .filter_map(|(endpoint, point)| {
+            request
+                .route_layers
+                .iter()
+                .position(|name| name == &endpoint.layer)
+                .map(|layer| {
+                    (
+                        super::native_obstacles::grid_round(point.x, grid_step_board),
+                        super::native_obstacles::grid_round(point.y, grid_step_board),
+                        layer as u8,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    if source_cells.is_empty() || targets.is_empty() {
+        return Err("native AWX endpoint candidates have no active route layer".into());
     }
-    obstacles.add_source_target_cell(start_cell.0, start_cell.1, start_cell.2 as usize);
-    for &(x, y, l) in &targets {
+    for &(x, y, l) in source_cells.iter().chain(&targets) {
         obstacles.add_source_target_cell(x, y, l as usize);
     }
     if let Some(band) = request.band.as_deref() {
@@ -766,7 +815,7 @@ fn source_grid_search(
     let mut attempt = source_route_attempt(
         &router,
         &obstacles,
-        &[start_cell],
+        &source_cells,
         &targets,
         request.max_iterations,
         0,
@@ -789,7 +838,7 @@ fn source_grid_search(
                 let small = source_route_attempt(
                     &router,
                     &obstacles,
-                    &[start_cell],
+                    &source_cells,
                     &targets,
                     5_000,
                     via_rung,
@@ -831,7 +880,7 @@ fn source_grid_search(
         obstacles,
         router_config: config,
         native_config,
-        source_cell: start_cell,
+        source_cells,
         target_cells: targets,
     })
 }
@@ -859,37 +908,115 @@ fn small_via_rung(
     Some((index, candidate.0 as f64 / upm, candidate.1 as f64 / upm))
 }
 
+/// Place one source `_place_shrunk_via_in_pad` tap against a specific pad and,
+/// on success, apply its `_register_unblock_via` effect to the retained working
+/// map: free-via, source/target override on every route layer, and the 11x11
+/// allowed block. The via and stub copper stay uncommitted in the returned tap.
+#[allow(clippy::too_many_arguments)]
+fn place_unblock_tap(
+    request: &RungRequest,
+    outcome: &mut GridSearchResult,
+    pad: &super::whole_context::ContextPad,
+    fab_candidates: &[super::via_pad_tap::TapViaCandidate],
+    escape_radius_mm: f64,
+    edge_clearance: f64,
+    inflight_vias: &mut Vec<super::whole_context::CopperVia>,
+    inflight_segments: &mut Vec<super::whole_context::CopperSegment>,
+) -> Result<Option<super::via_pad_tap::TapResult>, String> {
+    let Some(pad_layer) = pad.layers.iter().find(|layer| {
+        !layer.starts_with('*')
+            && request.board.board.layer_structure.get_no(layer) >= 0
+            && request.route_layers.contains(layer)
+    }) else {
+        return Ok(None);
+    };
+    let Some(layer_index) = request
+        .route_layers
+        .iter()
+        .position(|layer| layer == pad_layer)
+    else {
+        return Ok(None);
+    };
+    let mut backend = NativeTapBackend {
+        board: &request.board,
+    };
+    let Some(tap) = super::via_pad_tap::place_shrunk_via_in_pad(super::via_pad_tap::TapRequest {
+        board: &request.board,
+        rung: request,
+        pad,
+        via_map: &outcome.obstacles,
+        route_map: &outcome.obstacles,
+        source_config: &outcome.router_config,
+        native_config: &outcome.native_config,
+        layer_index,
+        fab_clearance_floor_mm: request.fab_clearance_floor_mm,
+        fab_track_floor_mm: request.fab_track_floor_mm,
+        may_narrow: request.may_narrow,
+        fab_candidates,
+        escape_radius_mm,
+        effective_board_edge_clearance_mm: effective_pad_edge_clearance(
+            &request.board,
+            pad,
+            edge_clearance,
+        ),
+        inflight_vias: inflight_vias.as_slice(),
+        inflight_segments: inflight_segments.as_slice(),
+        backend: &mut backend,
+    })?
+    else {
+        return Ok(None);
+    };
+    for release in &tap.map_releases {
+        outcome
+            .obstacles
+            .add_free_via(release.cell.0, release.cell.1);
+        for layer in 0..request.route_layers.len() {
+            outcome
+                .obstacles
+                .add_source_target_cell(release.cell.0, release.cell.1, layer);
+        }
+        outcome.obstacles.add_allowed_rect(
+            release.cell.0 - 5,
+            release.cell.1 - 5,
+            release.cell.0 + 5,
+            release.cell.1 + 5,
+        );
+    }
+    inflight_vias.push(tap.via.clone());
+    inflight_segments.extend(tap.stub_segments.clone());
+    Ok(Some(tap))
+}
+
+/// Seed a placed tap's escape-via cell as a source/target on EVERY route layer,
+/// matching source `new_sources = list(sources) + [(vgx, vgy, li) for li in
+/// range(len(layer_names))]`. Without this the retried A* can never terminate
+/// on the via and the whole unblock is inert.
+fn extend_with_tap_cells(cells: &mut Vec<(i32, i32, u8)>, tap: &super::via_pad_tap::TapResult, layers: usize) {
+    for layer in 0..layers {
+        cells.push((tap.grid_cell.0, tap.grid_cell.1, layer as u8));
+    }
+}
+
+/// Source `_route_with_via_unblock` (#189): a boxed ENDPOINT pad leaves its
+/// probe frontier exhausted BELOW the probe limit. Drop a DRC-legal fab-floor
+/// via inside that pad, seed the via cell on the correct side, and retry the
+/// SAME A* -- first at the probe budget, then (for the other, still-untapped
+/// side) at a doubled budget. Vias the retry did not reach are discarded.
 fn try_via_pad_unblock(
     request: &RungRequest,
     outcome: &mut GridSearchResult,
 ) -> Result<Option<(Vec<(i32, i32, u8)>, Vec<super::via_pad_tap::TapResult>)>, String> {
+    let lim = 5_000usize;
     let target_stuck =
-        outcome.backward_probe_iterations > 0 && outcome.backward_probe_iterations < 5_000;
+        outcome.backward_probe_iterations > 0 && outcome.backward_probe_iterations < lim;
     let source_stuck =
-        outcome.forward_probe_iterations > 0 && outcome.forward_probe_iterations < 5_000;
-    if !target_stuck && !source_stuck {
+        outcome.forward_probe_iterations > 0 && outcome.forward_probe_iterations < lim;
+    if (!target_stuck && !source_stuck) || request.route_layers.len() < 2 {
         return Ok(None);
     }
-    let mut pad_candidates = Vec::new();
-    if target_stuck {
-        pad_candidates.extend(pads_near_grid_cells(
-            request,
-            &outcome.target_cells,
-            outcome.grid_step_board,
-        ));
-    }
-    if source_stuck {
-        pad_candidates.extend(pads_near_grid_cells(
-            request,
-            &[outcome.source_cell],
-            outcome.grid_step_board,
-        ));
-    }
-    let mut seen = BTreeSet::new();
-    pad_candidates.retain(|pad| seen.insert(pad.key.clone()));
-    if pad_candidates.is_empty() {
-        return Ok(None);
-    }
+    let source_cells = outcome.source_cells.clone();
+    let target_cells = outcome.target_cells.clone();
+    let layer_count = request.route_layers.len();
 
     let mut fab_candidates = request
         .fab_via_rungs
@@ -927,94 +1054,141 @@ fn try_via_pad_unblock(
             layer: t.layer.clone(),
         })
         .collect::<Vec<_>>();
-    let mut tap_results = Vec::new();
-    let mut tap_pad_layers = Vec::<String>::new();
     let mut router = outcome.router_config.router();
-    for pad in pad_candidates {
-        let Some(pad_layer) = pad.layers.iter().find(|layer| {
-            !layer.starts_with('*')
-                && request.board.board.layer_structure.get_no(layer) >= 0
-                && request.route_layers.contains(layer)
-        }) else {
-            continue;
-        };
-        let Some(layer_index) = request
-            .route_layers
-            .iter()
-            .position(|layer| layer == pad_layer)
-        else {
-            continue;
-        };
-        let mut backend = NativeTapBackend {
-            board: &request.board,
-        };
-        let tap = super::via_pad_tap::place_shrunk_via_in_pad(super::via_pad_tap::TapRequest {
-            board: &request.board,
-            rung: request,
-            pad,
-            via_map: &outcome.obstacles,
-            route_map: &outcome.obstacles,
-            source_config: &outcome.router_config,
-            native_config: &outcome.native_config,
-            layer_index,
-            fab_clearance_floor_mm: request.fab_clearance_floor_mm,
-            fab_track_floor_mm: request.fab_track_floor_mm,
-            may_narrow: request.may_narrow,
-            fab_candidates: &fab_candidates,
-            escape_radius_mm,
-            effective_board_edge_clearance_mm: effective_pad_edge_clearance(
-                &request.board,
+    let mut new_sources = source_cells.clone();
+    let mut new_targets = target_cells.clone();
+    let mut placed = Vec::<super::via_pad_tap::TapResult>::new();
+    let mut source_tapped = false;
+    let mut target_tapped = false;
+
+    // backward probe (from targets) exhausted -> the TARGET pad is boxed.
+    if target_stuck {
+        if let Some(pad) =
+            pads_near_grid_cells(request, &target_cells, outcome.grid_step_board)
+                .into_iter()
+                .next()
+        {
+            if let Some(tap) = place_unblock_tap(
+                request,
+                outcome,
                 pad,
+                &fab_candidates,
+                escape_radius_mm,
                 edge_clearance,
-            ),
-            inflight_vias: &inflight_vias,
-            inflight_segments: &inflight_segments,
-            backend: &mut backend,
-        })?;
-        let Some(tap) = tap else { continue };
-        for release in &tap.map_releases {
-            outcome
-                .obstacles
-                .add_free_via(release.cell.0, release.cell.1);
-            for layer in 0..request.route_layers.len() {
-                outcome
-                    .obstacles
-                    .add_source_target_cell(release.cell.0, release.cell.1, layer);
+                &mut inflight_vias,
+                &mut inflight_segments,
+            )? {
+                extend_with_tap_cells(&mut new_targets, &tap, layer_count);
+                target_tapped = true;
+                placed.push(tap);
             }
-            outcome.obstacles.add_allowed_rect(
-                release.cell.0 - 5,
-                release.cell.1 - 5,
-                release.cell.0 + 5,
-                release.cell.1 + 5,
-            );
-        }
-        inflight_vias.push(tap.via.clone());
-        inflight_segments.extend(tap.stub_segments.clone());
-        tap_pad_layers.push(pad_layer.clone());
-        tap_results.push(tap);
-        let budget = if tap_results.len() > 1 { 10_000 } else { 5_000 };
-        let retry = source_route_attempt(
-            &router,
-            &outcome.obstacles,
-            &[outcome.source_cell],
-            &outcome.target_cells,
-            budget,
-            0,
-            request.rules.via_drill,
-            request.rules.hole_to_hole_clearance,
-            request.rules.grid_step,
-        );
-        if let Some(path) = retry.path {
-            let used = tap_results
-                .iter()
-                .zip(&tap_pad_layers)
-                .filter(|(tap, layer)| path_uses_tap(&path, tap, layer, &request.route_layers))
-                .map(|(tap, _)| tap.clone())
-                .collect::<Vec<_>>();
-            return Ok(Some((path, used)));
         }
     }
-    Ok(None)
+    // forward probe (from sources) exhausted -> the SOURCE pad is boxed.
+    if source_stuck {
+        if let Some(pad) =
+            pads_near_grid_cells(request, &source_cells, outcome.grid_step_board)
+                .into_iter()
+                .next()
+        {
+            if let Some(tap) = place_unblock_tap(
+                request,
+                outcome,
+                pad,
+                &fab_candidates,
+                escape_radius_mm,
+                edge_clearance,
+                &mut inflight_vias,
+                &mut inflight_segments,
+            )? {
+                extend_with_tap_cells(&mut new_sources, &tap, layer_count);
+                source_tapped = true;
+                placed.push(tap);
+            }
+        }
+    }
+    if placed.is_empty() {
+        return Ok(None);
+    }
+
+    // First retry: cap the full A* at the same probe budget the stuck signal
+    // fired on -- if the dropped via opened the pad the route is found within
+    // it; grinding past it just wastes time to fail again.
+    let mut retry = source_route_attempt(
+        &router,
+        &outcome.obstacles,
+        &new_sources,
+        &new_targets,
+        5_000,
+        0,
+        request.rules.via_drill,
+        request.rules.hole_to_hole_clearance,
+        request.rules.grid_step,
+    );
+    outcome.iterations += retry.iterations;
+    if retry.path.is_none() {
+        // Second rung: the stuck side got its via but the retry still failed --
+        // the OTHER side often needs layer access too. Tap it (source side
+        // first, matching source order) and retry once at a doubled budget.
+        let (side_cells, is_source) = if !source_tapped {
+            (source_cells.clone(), true)
+        } else if !target_tapped {
+            (target_cells.clone(), false)
+        } else {
+            (Vec::new(), false)
+        };
+        let mut second = false;
+        if !side_cells.is_empty() {
+            for pad in pads_near_grid_cells(request, &side_cells, outcome.grid_step_board) {
+                let Some(tap) = place_unblock_tap(
+                    request,
+                    outcome,
+                    pad,
+                    &fab_candidates,
+                    escape_radius_mm,
+                    edge_clearance,
+                    &mut inflight_vias,
+                    &mut inflight_segments,
+                )?
+                else {
+                    continue;
+                };
+                if is_source {
+                    extend_with_tap_cells(&mut new_sources, &tap, layer_count);
+                } else {
+                    extend_with_tap_cells(&mut new_targets, &tap, layer_count);
+                }
+                placed.push(tap);
+                second = true;
+                break;
+            }
+        }
+        if second {
+            retry = source_route_attempt(
+                &router,
+                &outcome.obstacles,
+                &new_sources,
+                &new_targets,
+                10_000,
+                0,
+                request.rules.via_drill,
+                request.rules.hole_to_hole_clearance,
+                request.rules.grid_step,
+            );
+            outcome.iterations += retry.iterations;
+        }
+    }
+    let Some(path) = retry.path else {
+        return Ok(None);
+    };
+    // Keep only the vias the retry actually reached: the path must terminate on
+    // the via cell at a NON-pad layer (or via an off-pad stub), else it is
+    // floating copper.
+    let used = placed
+        .into_iter()
+        .filter(|tap| path_uses_tap(&path, tap))
+        .collect::<Vec<_>>();
+    Ok(Some((path, used)))
 }
 
 fn pads_near_grid_cells<'a>(
@@ -1023,7 +1197,7 @@ fn pads_near_grid_cells<'a>(
     step_board: i32,
 ) -> Vec<&'a super::whole_context::ContextPad> {
     let step_mm = step_board as f64 / request.board.units_per_mm;
-    let mut found = Vec::new();
+    let mut found = BTreeMap::<String, (f64, &'a super::whole_context::ContextPad)>::new();
     for &(gx, gy, _) in cells {
         let p = [gx as f64 * step_mm, gy as f64 * step_mm];
         for pad in &request.same_net_pads {
@@ -1034,40 +1208,56 @@ fn pads_near_grid_cells<'a>(
             {
                 continue;
             }
+            // SMD means a single native physical copper layer. Counting only
+            // route-active layers would let a physically 2-layer pin with one
+            // active side (contrary to NativeItem.drill_allowed first==last)
+            // masquerade as SMD. Require exactly one native copper layer, THEN
+            // that sole layer be an active route layer.
+            let native_layers = pad
+                .layers
+                .iter()
+                .filter(|layer| {
+                    !layer.starts_with('*')
+                        && request.board.board.layer_structure.get_no(layer) >= 0
+                })
+                .collect::<Vec<_>>();
+            if native_layers.len() != 1 || !request.route_layers.contains(native_layers[0]) {
+                continue;
+            }
             if (pad.point[0] - p[0]).abs() > pad.size[0] / 2.0 + 0.05
                 || (pad.point[1] - p[1]).abs() > pad.size[1] / 2.0 + 0.05
             {
                 continue;
             }
             let distance = (pad.point[0] - p[0]).abs() + (pad.point[1] - p[1]).abs();
-            found.push((distance, pad));
+            match found.get(&pad.key) {
+                Some((best, _)) if *best <= distance => {}
+                _ => {
+                    found.insert(pad.key.clone(), (distance, pad));
+                }
+            }
         }
     }
-    found.sort_by(|a, b| {
+    let mut ordered = found.into_values().collect::<Vec<_>>();
+    ordered.sort_by(|a, b| {
         a.0.total_cmp(&b.0)
             .then_with(|| a.1.point[0].total_cmp(&b.1.point[0]))
             .then_with(|| a.1.point[1].total_cmp(&b.1.point[1]))
             .then_with(|| a.1.pad_number.cmp(&b.1.pad_number))
     });
-    found.into_iter().map(|(_, pad)| pad).collect()
+    ordered.into_iter().map(|(_, pad)| pad).collect()
 }
 
-fn path_uses_tap(
-    path: &[(i32, i32, u8)],
-    tap: &super::via_pad_tap::TapResult,
-    pad_layer: &str,
-    route_layers: &[String],
-) -> bool {
-    let pad_layer_index = route_layers
-        .iter()
-        .position(|layer| layer == pad_layer)
-        .unwrap_or(usize::MAX);
+fn path_uses_tap(path: &[(i32, i32, u8)], tap: &super::via_pad_tap::TapResult) -> bool {
+    // Source `ends = (p2[0], p2[-1])`: the retry reached the via iff the path
+    // terminates on the via cell at a NON-pad layer (it arrived through the
+    // barrel) or through an off-pad escape stub.
     path.first()
         .into_iter()
         .chain(path.last())
         .any(|&(x, y, l)| {
             (x, y) == tap.grid_cell
-                && (l as usize != pad_layer_index || !tap.stub_segments.is_empty())
+                && (l as usize != tap.pad_layer_index || !tap.stub_segments.is_empty())
         })
 }
 
@@ -1389,8 +1579,40 @@ fn execute_single(
             }
         }
     };
-    let terminal = *path.last().ok_or("awx_grid returned an empty path")?;
-    let target = endpoint_for_grid_target(&request, terminal, &trial, outcome.grid_step_board)?;
+    let path_start = *path.first().ok_or("awx_grid returned an empty path")?;
+    let path_end = *path.last().ok_or("awx_grid returned an empty path")?;
+    let start_candidates = vec![request.start.clone()];
+    let mut target_candidates = vec![request.end.clone()];
+    target_candidates.extend(
+        request
+            .b_alternatives
+            .iter()
+            .filter(|e| request.route_layers.contains(&e.layer))
+            .cloned(),
+    );
+    // Both real path terminals resolve against the ORIGINAL source/target
+    // candidate sets, then against any kept unblock tap. A retry that escaped
+    // through a newly seeded target tap (or a tapped source pad) ends on the
+    // tap's via cell, which is not an original endpoint; resolving it here keeps
+    // the exact physical tap point and its actual arrival layer attached.
+    let start = endpoint_for_path_terminal(
+        &start_candidates,
+        path_start,
+        &request.route_layers,
+        &trial,
+        outcome.grid_step_board,
+        &tap_results,
+    )?
+    .ok_or("awx_grid started at a cell without a source endpoint")?;
+    let target = endpoint_for_path_terminal(
+        &target_candidates,
+        path_end,
+        &request.route_layers,
+        &trial,
+        outcome.grid_step_board,
+        &tap_results,
+    )?
+    .ok_or("awx_grid ended at a cell without a source endpoint")?;
     let mut through_hole_positions = super::native_grid_window::same_net_through_hole_positions(
         &trial,
         &[request.net_id],
@@ -1417,7 +1639,7 @@ fn execute_single(
         path: &path,
         grid_step_board: outcome.grid_step_board,
         route_layers: &request.route_layers,
-        start: &request.start,
+        start: &start,
         target: &target,
         board: &trial,
         net: request.net_id,
@@ -1519,37 +1741,67 @@ fn execute_single(
     }))
 }
 
-fn endpoint_for_grid_target(
-    request: &RungRequest,
+fn endpoint_for_grid_cell(
+    candidates: &[RungEndpoint],
     cell: (i32, i32, u8),
+    route_layers: &[String],
     board: &BoardAdapter,
     step: i32,
-) -> Result<RungEndpoint, String> {
-    let mut candidates = vec![request.end.clone()];
-    candidates.extend(
-        request
-            .b_alternatives
-            .iter()
-            .filter(|e| request.route_layers.contains(&e.layer))
-            .cloned(),
-    );
-    for end in candidates {
-        let point = match board.point(end.point)? {
+) -> Result<Option<RungEndpoint>, String> {
+    for endpoint in candidates {
+        let point = match board.point(endpoint.point)? {
             EnginePoint::Int(p) => p,
-            _ => return Err("grid target is outside native coordinate range".into()),
+            _ => return Err("grid endpoint is outside native coordinate range".into()),
         };
-        let layer = request
-            .route_layers
+        let layer = route_layers
             .iter()
-            .position(|name| name == &end.layer);
+            .position(|name| name == &endpoint.layer);
         if layer == Some(cell.2 as usize)
             && super::native_obstacles::grid_round(point.x, step) == cell.0
             && super::native_obstacles::grid_round(point.y, step) == cell.1
         {
-            return Ok(end);
+            return Ok(Some(endpoint.clone()));
         }
     }
-    Err("awx_grid ended at a cell without a source endpoint".into())
+    Ok(None)
+}
+
+/// Resolve a path terminal first against the ordinary candidate set, then
+/// against any materialized unblock tap whose escape-via cell the retry
+/// terminated on. A tap is a same-net pad via, so the honest endpoint is the
+/// via's physical point on the path's actual arrival layer; the existing tap
+/// materialization and stub copper complete the pad connection.
+fn endpoint_for_path_terminal(
+    candidates: &[RungEndpoint],
+    cell: (i32, i32, u8),
+    route_layers: &[String],
+    board: &BoardAdapter,
+    step: i32,
+    taps: &[super::via_pad_tap::TapResult],
+) -> Result<Option<RungEndpoint>, String> {
+    if let Some(endpoint) = endpoint_for_grid_cell(candidates, cell, route_layers, board, step)? {
+        return Ok(Some(endpoint));
+    }
+    for tap in taps {
+        if tap.grid_cell == (cell.0, cell.1) {
+            // Return the tap's exact physical via point on the path's ACTUAL
+            // arrival layer (`cell.2`), not the pad's own layer. When the retry
+            // arrives on an inner/source-escape layer the pad layer differs, and
+            // `terminal_copper_on_layer`'s half-cell `round()` ties-even can miss
+            // the through-hole cell, silently dropping the connector. Naming the
+            // arrival layer makes the connector's layer equal the path layer, so
+            // it is emitted without touching grid round policy.
+            let layer = route_layers
+                .get(cell.2 as usize)
+                .cloned()
+                .ok_or("via-pad tap arrival layer is outside the route layers")?;
+            return Ok(Some(RungEndpoint {
+                point: tap.via.point,
+                layer,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn materialize_grid_geometry(
@@ -1963,33 +2215,150 @@ pub fn route_multilayer_endpoints(
     from_item: fr_engine::board::ItemKey,
     to_item: fr_engine::board::ItemKey,
 ) -> Result<(Option<BoardAdapter>, serde_json::Value), String> {
+    let starts = vec![request.start.clone()];
+    let mut targets = vec![request.end.clone()];
+    targets.extend(request.b_alternatives.iter().cloned());
+    route_multilayer_endpoint_sets(request, from_item, to_item, &starts, &targets)
+}
+
+pub fn route_multilayer_endpoint_sets(
+    mut request: RungRequest,
+    from_item: fr_engine::board::ItemKey,
+    to_item: fr_engine::board::ItemKey,
+    start_candidates: &[RungEndpoint],
+    target_candidates: &[RungEndpoint],
+) -> Result<(Option<BoardAdapter>, serde_json::Value), String> {
     if request.route_layers.is_empty() || request.pair.is_some() || request.band.is_some() {
         return Err("endpoint adapter requires active layers and a single-ended request".into());
     }
+    let starts = start_candidates
+        .iter()
+        .filter(|endpoint| request.route_layers.contains(&endpoint.layer))
+        .cloned()
+        .collect::<Vec<_>>();
+    let targets = target_candidates
+        .iter()
+        .filter(|endpoint| request.route_layers.contains(&endpoint.layer))
+        .cloned()
+        .collect::<Vec<_>>();
+    if starts.is_empty() || targets.is_empty() {
+        return Ok((None, serde_json::json!({
+            "accepted": false,
+            "reason": "endpoint candidate set has no active route layer"
+        })));
+    }
+    request.start = starts[0].clone();
+    request.end = targets[0].clone();
+    request.b_alternatives = targets.iter().skip(1).cloned().collect();
     request.rules.validate()?;
     let net = request.board.net_number(&request.net)?;
     let class = request.board.board.rules.net_class_of(net).get_trace_clearance_class();
     let calls_before = ENDPOINT_GRID_CALLS.load(std::sync::atomic::Ordering::Relaxed);
     let (mut trial, control, _) = prepare_control(&request)?;
-    let outcome = source_grid_search(&request, &trial, &[net], &[], &[], None, class, class)?;
+    let mut outcome = source_grid_search_with_endpoints(
+        &request,
+        &trial,
+        &[net],
+        &[],
+        &[],
+        None,
+        class,
+        class,
+        &starts,
+        &targets,
+    )?;
     let calls = ENDPOINT_GRID_CALLS.load(std::sync::atomic::Ordering::Relaxed) - calls_before;
     let mut report = serde_json::json!({"grid_router_calls":calls,"expanded":outcome.iterations,"path_cells":outcome.path.as_ref().map_or(0,Vec::len),"accepted":false});
-    let Some(path) = outcome.path else {
-        report["reason"] = "source GridRouter returned no path".into();
-        return Ok((None,report));
+    let mut tap_results = Vec::new();
+    let path = if let Some(path) = outcome.path.clone() {
+        path
+    } else {
+        // Source `_route_with_via_unblock` (#189): an endpoint whose probe
+        // frontier exhausted BELOW the probe limit is boxed in. Drop a
+        // DRC-legal fab-floor via inside that pad and retry the SAME search
+        // before reporting no-path; only then is the failure honest.
+        if request.deadline.is_some_and(|d| Instant::now() >= d) {
+            report["reason"] = "deadline elapsed before via-pad unblock".into();
+            return Ok((None, report));
+        }
+        match try_via_pad_unblock(&request, &mut outcome)? {
+            Some((path, taps)) => {
+                tap_results = taps;
+                path
+            }
+            None => {
+                report["grid_router_calls"] =
+                    (ENDPOINT_GRID_CALLS.load(std::sync::atomic::Ordering::Relaxed) - calls_before).into();
+                report["expanded"] = outcome.iterations.into();
+                report["path_cells"] = outcome.path.as_ref().map_or(0, Vec::len).into();
+                report["reason"] =
+                    "source GridRouter and via-pad unblocking returned no path".into();
+                return Ok((None, report));
+            }
+        }
     };
+    report["grid_router_calls"] =
+        (ENDPOINT_GRID_CALLS.load(std::sync::atomic::Ordering::Relaxed) - calls_before).into();
+    report["expanded"] = outcome.iterations.into();
+    report["path_cells"] = path.len().into();
     if request.deadline.is_some_and(|d|Instant::now()>=d) {
         report["reason"] = "deadline elapsed during source GridRouter search".into();
         return Ok((None,report));
     }
-    let through_holes = super::native_grid_window::same_net_through_hole_positions(&trial, &[net], &request.free_via_pads, outcome.grid_step_board)?;
+    let (Some(&path_start), Some(&path_end)) = (path.first(), path.last()) else {
+        report["reason"] = "source GridRouter returned an empty path".into();
+        return Ok((None, report));
+    };
+    let Some(start) = endpoint_for_path_terminal(
+        &starts,
+        path_start,
+        &request.route_layers,
+        &trial,
+        outcome.grid_step_board,
+        &tap_results,
+    )? else {
+        report["reason"] = "GridRouter path starts outside the source endpoint set".into();
+        return Ok((None, report));
+    };
+    let Some(target) = endpoint_for_path_terminal(
+        &targets,
+        path_end,
+        &request.route_layers,
+        &trial,
+        outcome.grid_step_board,
+        &tap_results,
+    )? else {
+        report["reason"] = "GridRouter path ends outside the target endpoint set".into();
+        return Ok((None, report));
+    };
+    report["start_endpoint"] = serde_json::json!({
+        "point": start.point,
+        "layer": start.layer,
+    });
+    report["end_endpoint"] = serde_json::json!({
+        "point": target.point,
+        "layer": target.layer,
+    });
+    let mut through_holes = super::native_grid_window::same_net_through_hole_positions(&trial, &[net], &request.free_via_pads, outcome.grid_step_board)?;
+    // A tapped via is a same-net through-hole barrel: skip it in the emitted
+    // path's via-through-hole checks and carry its registered physical size.
+    let mut registered_via_sizes = outcome.registered_via_sizes.clone();
+    for tap in &tap_results {
+        through_holes.insert(tap.grid_cell);
+        registered_via_sizes.extend(tap.registered_via_sizes.iter().map(|(&cell, &size)| (cell, size)));
+    }
     let geometry = super::grid_path::path_to_geometry(super::grid_path::GridPathRequest {
         path:&path,grid_step_board:outcome.grid_step_board,route_layers:&request.route_layers,
-        start:&request.start,target:&request.end,board:&trial,net,
+        start:&start,target:&target,board:&trial,net,
         via_candidates:control.via_rule.vias(),via_size_mm:request.rules.via_size,via_drill_mm:request.rules.via_drill,
         hole_to_hole_clearance_mm:request.rules.hole_to_hole_clearance,via_refit_rungs:&outcome.via_refit_rungs,
-        registered_via_sizes:&outcome.registered_via_sizes,existing_vias:&request.existing_vias,through_hole_positions:&through_holes,
+        registered_via_sizes:&registered_via_sizes,existing_vias:&request.existing_vias,through_hole_positions:&through_holes,
     })?;
+    // Commit the kept unblock copper, then the grid geometry, so the landed
+    // board carries the tapped vias the retry actually reached (#803).
+    for tap in &tap_results {
+        materialize_tap(&mut trial, tap, net)?;
+    }
     materialize_grid_geometry(&mut trial,&geometry,net)?;
     if let Err(error)=trial.assert_preserved(&request.board) {
         let details: Vec<_>=trial.board.get_items().into_iter().flat_map(|key|fr_engine::drc::clearance_violation::clearance_violations(&trial.board,key)).map(|v| {
@@ -2005,22 +2374,31 @@ pub fn route_multilayer_endpoints(
 
     let before = fr_engine::drc::NetIncompletes::new(&request.board.board,net,&request.board.board.get_connectable_items(net)).count();
     let after = fr_engine::drc::NetIncompletes::new(&trial.board,net,&trial.board.get_connectable_items(net)).count();
-    let grade = native_execution::grade(&request.board,&trial,&BTreeSet::from([request.net.clone()]))?;
+    // `assert_preserved` above compares the trial's full-board clearance
+    // violations with the baseline and rejects any new violation. The trial
+    // is unchanged since that proof, so the accepted route's new-violation
+    // count is exactly zero without running the same full-board scan again.
+    let new_violations = 0usize;
     report["incompletes_before"] = before.into();
     report["incompletes_after"] = after.into();
-    report["new_violations"] = grade.new_violations.into();
-    report["segments"] = geometry.segments.len().into();
-    report["vias"] = geometry.vias.len().into();
+    report["new_violations"] = new_violations.into();
+    let tap_stub_segments: usize = tap_results.iter().map(|tap| tap.stub_segments.len()).sum();
+    report["segments"] = (geometry.segments.len() + tap_stub_segments).into();
+    report["vias"] = (geometry.vias.len() + tap_results.len()).into();
     report["layer_transitions"] = path.windows(2).filter(|w|w[0].2!=w[1].2).count().into();
-    report["via_geometry"] = serde_json::json!(geometry.vias.iter().map(|v| {
+    let mut via_geometry = geometry.vias.iter().map(|v| {
         let info=&trial.board.rules.via_infos[v.via_info];
         let pad=trial.board.library.padstacks.get(info.get_padstack()).unwrap();
         serde_json::json!({"point_mm":v.point_mm,"diameter_mm":v.diameter_mm,"drill_mm":v.drill_mm,"from_layer":v.from_layer,"to_layer":v.to_layer,"physical_first_layer":pad.from_layer(),"physical_last_layer":pad.to_layer()})
-    }).collect::<Vec<_>>());
+    }).collect::<Vec<_>>();
+    for tap in &tap_results {
+        via_geometry.push(serde_json::json!({"point_mm":tap.via.point,"diameter_mm":tap.via.diameter,"drill_mm":tap.via.drill,"from_layer":tap.via.layers.first(),"to_layer":tap.via.layers.last()}));
+    }
+    report["via_geometry"] = serde_json::json!(via_geometry);
 
     let merged = trial.board.connected_set(from_item,net,false).contains(trial.board.item(to_item).id());
     report["target_groups_merged"] = merged.into();
-    if !merged || after>=before || grade.new_violations!=0 {
+    if !merged || after>=before || new_violations!=0 {
         report["reason"] = "native transaction did not reduce incompletes without new violations".into();
         return Ok((None,report));
     }

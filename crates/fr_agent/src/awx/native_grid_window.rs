@@ -4,7 +4,7 @@ use super::native_obstacles::NativeGridConfig;
 use crate::board_adapter::BoardAdapter;
 use awx_grid::obstacle_map::GridObstacleMap;
 use fr_engine::ids::NetNo;
-use fr_geom::IntBox;
+use fr_geom::{IntBox, IntPoint, Point};
 use std::collections::BTreeSet;
 
 /// Explicit pad drill evidence carried from LogicalPad/ContextPad through the
@@ -212,6 +212,94 @@ fn owned_via_positions(
     Ok(positions)
 }
 
+/// Existing same-net native pins can also be reused as layer transitions when
+/// their native copper proves a conductive site on every physical signal
+/// copper layer. This intentionally does not infer a drill: the free transition
+/// corresponds to the existing native Pin electrical node, not an inferred
+/// fabrication hole, and the route emits no new via.
+///
+/// A site is reusable only when the checked integer grid cell equals the actual
+/// native `item.center(&board.board)` exactly, in addition to that cell lying in
+/// the pad copper on every signal layer. Native trace/drill normal contacts
+/// require an exact Pin-center match, so a rounded off-grid cell would be
+/// rejected even though it lies inside the pad copper.
+fn native_stack_pin_positions(
+    board: &BoardAdapter,
+    own_nets: &[NetNo],
+    grid_step_board: i32,
+) -> Result<BTreeSet<(i32, i32)>, String> {
+    if grid_step_board <= 0 {
+        return Err("native pin-via grid step must be positive".into());
+    }
+    let own: BTreeSet<_> = own_nets.iter().copied().collect();
+    if own.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let last_board_layer = board.board.layer_count() - 1;
+    if last_board_layer < 0 {
+        return Ok(BTreeSet::new());
+    }
+    let copper_layers: Vec<_> = board
+        .board
+        .layer_structure
+        .layers
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, info)| info.is_signal.then_some(layer as i32))
+        .collect();
+    if copper_layers.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut positions = BTreeSet::new();
+    for key in board.board.get_pins() {
+        let item = board.board.item(key);
+        if !item.net_numbers().iter().any(|number| own.contains(number))
+            || item.first_layer(&board.board) != 0
+            || item.last_layer(&board.board) != last_board_layer
+        {
+            continue;
+        }
+        let Some(padstack) = item.padstack(&board.board) else {
+            continue;
+        };
+        if padstack.hole_only {
+            continue;
+        }
+
+        let center = item.center(&board.board).to_float();
+        let gx = round_ties_even_grid(center.x, grid_step_board)?;
+        let gy = round_ties_even_grid(center.y, grid_step_board)?;
+        let cell_x = gx
+            .checked_mul(grid_step_board)
+            .ok_or("native pin-via x coordinate overflow")?;
+        let cell_y = gy
+            .checked_mul(grid_step_board)
+            .ok_or("native pin-via y coordinate overflow")?;
+        let cell = Point::Int(IntPoint::new(cell_x, cell_y));
+        let pin_center = item.center(&board.board);
+
+        // Native trace/drill normal contacts require the checked point to equal
+        // the Pin center exactly (`*point == other.center(self)`), not merely to
+        // lie inside the pad copper. A rounded cell whose coordinates differ
+        // from the actual native center has no center connector, so an
+        // intermediate transition there is rejected by the native contact
+        // check; qualify the site only when the cell equals the native center.
+        // In addition, require actual copper containing the cell on every
+        // physical signal copper layer, since the stack span alone can include
+        // layers with no pad copper.
+        if cell == pin_center
+            && copper_layers.iter().all(|&layer| {
+                item.drill_shape_on_layer(&board.board, layer)
+                    .is_some_and(|shape| shape.contains(&cell))
+            })
+        {
+            positions.insert((gx, gy));
+        }
+    }
+    Ok(positions)
+}
+
 /// Source routing_context._add_free_via_positions: only explicit plated pads
 /// with a real drill are free pad sites, plus existing same-net via centers.
 pub fn free_via_positions(
@@ -228,6 +316,7 @@ pub fn free_via_positions(
         return Ok(BTreeSet::new());
     }
     let mut positions = owned_via_positions(board, own_nets, grid_step_board)?;
+    positions.extend(native_stack_pin_positions(board, own_nets, grid_step_board)?);
     for pad in explicit_pads {
         if !own.contains(&pad.net_id) || pad.drill_board <= 0 || pad.non_plated_hole {
             continue;
@@ -253,6 +342,7 @@ pub fn same_net_through_hole_positions(
     }
     let own: BTreeSet<_> = own_nets.iter().copied().collect();
     let mut positions = owned_via_positions(board, own_nets, grid_step_board)?;
+    positions.extend(native_stack_pin_positions(board, own_nets, grid_step_board)?);
     for pad in explicit_pads {
         if !own.contains(&pad.net_id) || pad.drill_board <= 0 || pad.non_plated_hole {
             continue;

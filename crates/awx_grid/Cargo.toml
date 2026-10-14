@@ -1,0 +1,13 @@
+[package]
+name = "awx_grid"
+version = "0.23.0"
+edition = "2021"
+license = "MIT"
+
+[package.metadata.upstream]
+repository = "https://github.com/drandyhaas/KiCadRoutingTools"
+revision = "caad45cd252f9a50f1fb4b3b15461bdf1b9457a1"
+
+[dependencies]
+rustc-hash = "2.1"
+ndarray = "0.16"

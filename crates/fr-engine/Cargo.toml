@@ -1,0 +1,17 @@
+[package]
+name = "fr-engine"
+description = "Freerouting routing engine: board model, search trees, autorouter, DRC, scoring"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+fr-geom = { path = "../fr-geom" }
+awx_grid = { path = "../awx_grid" }
+fr-jcompat = { path = "../fr-jcompat" }
+fr-settings = { path = "../fr-settings" }
+log = "0.4"
+rayon = "1"
+
+[dev-dependencies]
+num-bigint = "0.4"

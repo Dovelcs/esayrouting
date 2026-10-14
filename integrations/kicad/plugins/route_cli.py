@@ -1,0 +1,175 @@
+"""Headless autorouting of a .kicad_pcb file with fastroute.
+
+Run with the Python interpreter that ships with KiCad (it provides `pcbnew`):
+
+    macOS:   /Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3
+    Linux:   python3 (with the distribution's KiCad Python module installed)
+    Windows: "C:\\Program Files\\KiCad\\<ver>\\bin\\python.exe"
+
+    python3 route_cli.py board.kicad_pcb [-o routed.kicad_pcb] [--clear | --keep-existing] [--mode fast|exact|quick]
+                         [--max-passes N] [--threads N] [--max-time SECONDS] [--fastroute PATH]
+                         [-- extra fastroute args, e.g. --router.autorouter.ignore_net_classes=GUC]
+"""
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import pcbnew  # noqa: E402
+
+import core  # noqa: E402
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Autoroute a KiCad board with fastroute")
+    ap.add_argument("board", type=Path)
+    ap.add_argument("-o", "--output", type=Path, help="output board (default: overwrite input)")
+    existing = ap.add_mutually_exclusive_group()
+    existing.add_argument("--clear", action="store_true", help="remove unlocked tracks and vias first")
+    existing.add_argument(
+        "--keep-existing",
+        action="store_true",
+        help="keep all existing tracks and vias unchanged, route only the open connections "
+        "(by default unlocked tracks may be moved or rerouted)",
+    )
+    ap.add_argument("--mode", choices=("fast", "exact", "quick"), default="fast")
+    ap.add_argument("--max-passes", type=int, default=0)
+    ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument(
+        "--neckdown", choices=("on", "off"), default="on", help="narrow traces at pins"
+    )
+    ap.add_argument(
+        "--ignore-min-width",
+        action="store_true",
+        help="allow neck-down below the board's minimum track width",
+    )
+    ap.add_argument("--no-refill", action="store_true", help="do not refill zones afterwards")
+    ap.add_argument(
+        "--zones-as-planes",
+        action="store_true",
+        help="treat zone nets as connected by the zone (Freerouting's behaviour) instead of routing them",
+    )
+    ap.add_argument(
+        "--no-text-keepouts", action="store_true", help="do not keep traces away from copper texts"
+    )
+    ap.add_argument(
+        "--max-time", type=float, help="stop after this many seconds and keep the best result"
+    )
+    ap.add_argument(
+        "--clearance-margin-um", type=float, default=5.0,
+        help="added to every clearance for the router (KiCad measures exact circles; default 5)",
+    )
+    ap.add_argument(
+        "--obstacle-zones", default="",
+        help="comma separated net names or net classes (* and ? allowed) whose zones stay fixed "
+        "copper that other nets must not cross (e.g. a power pour on an outer layer)",
+    )
+    ap.add_argument("--fastroute", type=Path, help="path to the fastroute executable")
+    ap.add_argument("--work-dir", type=Path, help="keep the DSN/SES files in this directory")
+    ap.add_argument(
+        "--export-only",
+        action="store_true",
+        help="only write the prepared DSN (and tune/pairs files) to --work-dir and "
+        "the fastroute arguments to args.txt there; do not route",
+    )
+    ap.add_argument(
+        "--no-keep-stitching", action="store_true",
+        help="do not keep zone stitching vias (vias without a track); by default they are "
+        "locked for the run so the router neither removes nor moves them",
+    )
+    ap.add_argument(
+        "--live", action="store_true",
+        help="watch the routing live in the web browser (fastroute --live)",
+    )
+    ap.add_argument("-q", "--quiet", action="store_true")
+    # Everything after "--" goes to fastroute unchanged (argparse cannot mix a positional
+    # argument with a trailing "--" list).
+    argv = list(sys.argv[1:] if argv is None else argv)
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    args = ap.parse_args(argv)
+    args.extra = extra
+
+    if not args.board.is_file():
+        print(f"error: {args.board}: no such file", file=sys.stderr)
+        return 2
+    board = pcbnew.LoadBoard(str(args.board))
+    if board is None or not core.has_board_outline(board):
+        print(f"error: {args.board}: not a board with an outline on Edge.Cuts", file=sys.stderr)
+        return 2
+    if args.work_dir:
+        args.work_dir.mkdir(parents=True, exist_ok=True)
+
+    min_width = 0 if args.ignore_min_width else core.min_track_width_nm(board)
+    neckdown = args.neckdown == "on"
+    router = core.Router(
+        board,
+        binary=args.fastroute,
+        extra_args=core.mode_args(
+            args.mode, args.max_passes, args.threads, neckdown, min_width,
+            core.copper_edge_clearance_nm(board),
+        )
+        + args.extra,
+        work_dir=args.work_dir,
+        refill=not args.no_refill,
+        route_zone_nets=not args.zones_as_planes,
+        text_keepouts=not args.no_text_keepouts,
+        clear_tracks=args.clear,
+        keep_existing=args.keep_existing,
+        max_time=args.max_time,
+        clearance_margin_um=args.clearance_margin_um,
+        obstacle_zones=[p.strip() for p in args.obstacle_zones.split(",")],
+        live=args.live,
+        keep_stitching=not args.no_keep_stitching,
+    )
+
+    def show(level, text):
+        if not args.quiet or level in ("WARN", "ERROR"):
+            print(f"{level:5} {text}", file=sys.stderr)
+
+    if args.export_only:
+        if not args.work_dir:
+            print("error: --export-only needs --work-dir", file=sys.stderr)
+            return 2
+        failed = router.prepare()
+        if failed is not None:
+            print(f"error: {failed.message}", file=sys.stderr)
+            return 1
+        for w in getattr(router, "warnings", []):
+            print(f"WARN  .kicad_dru {w}", file=sys.stderr)
+        # the arguments after the binary, one per line (paths as written in work_dir)
+        (args.work_dir / "args.txt").write_text("\n".join(router.command()[1:]) + "\n")
+        print(f"exported to {args.work_dir}")
+        return 0
+
+    t = time.monotonic()
+    result = router.run(show)
+    if not result.ok:
+        print(f"error: {result.message}", file=sys.stderr)
+        return 1
+    out = args.output or args.board
+    pcbnew.SaveBoard(str(out), board)
+    if result.partial:
+        print(f"warning: {result.message.splitlines()[0]}", file=sys.stderr)
+    for w in result.warnings:
+        if not w.startswith(".kicad_dru"):  # (those were shown before routing)
+            print(f"warning: {w}", file=sys.stderr)
+    if result.unrouted_ignored:
+        print(f"{result.unrouted_ignored} of the unrouted connections are in ignored net classes", file=sys.stderr)
+    print(
+        f"routed in {time.monotonic() - t:.1f} s: score {result.score}, "
+        f"{result.unrouted} unrouted, {result.violations} violations"
+        + (f" ({result.violations_unfixable} pre-existing, unfixable)" if result.violations_unfixable else "")
+        + (f", KiCad: {result.kicad_unconnected} open connections" if result.kicad_unconnected is not None else "")
+        + f" -> {out}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

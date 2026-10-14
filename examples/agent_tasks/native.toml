@@ -1,0 +1,7 @@
+# Paths resolve relative to this configuration, not the shell working directory.
+version = "9.15.6755"
+archive_sha256 = "de0400a45939a66ee13cd8360c230e830fc5e03a6ed5a8a8b60f58a39e4a67bc"
+archive_url = "https://github.com/google/or-tools/releases/download/v9.15/or-tools_arm64_macOS-26.2_cpp_v9.15.6755.tar.gz"
+prefix = "../../vendor/ortools"
+binary = "../../target/release/fastroute_agent"
+destination = "../../../fastroute_agent_macos_arm64"

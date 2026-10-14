@@ -1,0 +1,88 @@
+version = 1
+route_remaining = false
+input = "awx_route.dsn"
+output = "awx_route.ses"
+
+[[nets]]
+name = "BUS"
+width_mm = 0.15
+clearance_mm = 0.1
+allowed_layers = ["Top"]
+via_budget = 0
+max_length_mm = 30.0
+
+[[nets]]
+name = "OTHER"
+width_mm = 0.15
+clearance_mm = 0.1
+allowed_layers = ["Top"]
+via_budget = 0
+max_length_mm = 30.0
+
+[[groups]]
+id = "two_chip_bus"
+nets = ["BUS", "OTHER"]
+
+[groups.awx]
+source = "U1"
+destination = "U2"
+routing_layers = ["Top", "Bottom"]
+pairs = []
+fanout_rounds = 1
+geometry_rounds = 1
+
+[execution]
+threads = 1
+budget_ms = 60000
+seed = 17
+
+[awx]
+via_drills = { VIA = 0.9 }
+fabrication = "standard"
+escalation = "off"
+seed_export = { directory = "awx_route_seeds" }
+
+[[awx.components]]
+reference = "U1"
+kind = "bga"
+[[awx.components.pads]]
+native_ref = "U1.1"
+number = "1"
+shape = "rect"
+rect_rotation = 0.0
+[[awx.components.pads]]
+native_ref = "U1.2"
+number = "2"
+shape = "rect"
+rect_rotation = 0.0
+
+[[awx.components]]
+reference = "U2"
+kind = "bga"
+[[awx.components.pads]]
+native_ref = "U2.1"
+number = "1"
+shape = "rect"
+rect_rotation = 0.0
+[[awx.components.pads]]
+native_ref = "U2.2"
+number = "2"
+shape = "rect"
+rect_rotation = 0.0
+
+[awx.rules]
+grid_step = 0.1
+track_width = 0.15
+clearance = 0.1
+via_size = 1.0
+via_drill = 0.9
+pair_gap = 0.1
+lane_pitch = 0.6
+lane_min = 0.2
+min_turning_radius = 0.0
+max_turn_angle = 180.0
+max_setback_angle = 45.0
+routing_clearance_margin = 1.0
+board_edge_clearance = 0.1
+hole_to_hole_clearance = 0.2
+fan_clearance = 0.1

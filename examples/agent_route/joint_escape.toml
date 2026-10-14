@@ -1,0 +1,49 @@
+# Replace board names and pin references with your DSN. All distances are mm.
+version = 1
+input = "board.dsn"
+output = "joint_routed.ses"
+
+[[nets]]
+name = "D0"
+width_mm = 0.2
+clearance_mm = 0.15
+allowed_layers = ["F.Cu"]
+via_budget = 0
+max_length_mm = 50.0
+
+[[nets]]
+name = "D1"
+width_mm = 0.2
+clearance_mm = 0.15
+allowed_layers = ["F.Cu"]
+via_budget = 0
+max_length_mm = 50.0
+
+[[endpoint_groups]]
+id = "chip_bus"
+endpoints = [{ net = "D0", chip = "U1", pad = "1" }, { net = "D1", chip = "U1", pad = "2" }]
+
+[[channels]]
+id = "bus_corridor"
+[channels.region]
+kind = "rectangle"
+min = [0.0, 0.0]
+max = [30.0, 10.0]
+# Alternative region: kind="polyline", points=[[0.0,0.0],[30.0,0.0]],
+# width_mm=10.0; width_mm is the full width around the centreline.
+
+[[groups]]
+id = "bus"
+nets = ["D0", "D1"]
+endpoint_groups = ["chip_bus"]
+channels = ["bus_corridor"]
+priority = 20
+depends_on = []
+joint_escape = true
+# Candidate escapes account for every nearby chip pad, including other nets.
+# Only two-terminal net paths are supported; no implicit differential coupling.
+
+[execution]
+threads = 1
+budget_ms = 30000
+seed = 0

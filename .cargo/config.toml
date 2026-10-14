@@ -1,0 +1,6 @@
+[env]
+ORTOOLS_PREFIX = { value = "vendor/ortools", relative = true }
+PROTOC = { value = "vendor/ortools/bin/protoc", relative = true }
+
+[alias]
+agent-task = "run -p fr_agent_tasks --"

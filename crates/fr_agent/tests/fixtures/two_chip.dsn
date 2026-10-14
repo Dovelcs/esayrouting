@@ -1,0 +1,18 @@
+(pcb two_chip.dsn
+ (resolution mm 1000)
+ (unit mm)
+ (structure
+  (layer Top (type signal))
+  (layer Bottom (type signal))
+  (via VIA)
+  (boundary (rect pcb 0 0 20 10))
+  (rule (width 0.15) (clearance 0.1))
+ )
+ (library
+  (image CHIP (pin PAD 1 0 0) (pin PAD 2 0 1))
+  (padstack PAD (shape (rect Top -0.2 -0.2 0.2 0.2)))
+  (padstack VIA (shape (circle Top 0.5)) (shape (circle Bottom 0.5)))
+ )
+ (placement (component CHIP (place U1 2 4 front 0) (place U2 18 4 front 0)))
+ (network (net BUS (pins U1-1 U2-1)) (net OTHER (pins U1-2 U2-2)))
+)

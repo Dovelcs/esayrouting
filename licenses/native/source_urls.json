@@ -1,0 +1,14 @@
+{
+  "abseil": "https://raw.githubusercontent.com/abseil/abseil-cpp/master/LICENSE",
+  "protobuf": "https://raw.githubusercontent.com/protocolbuffers/protobuf/main/LICENSE",
+  "re2": "https://raw.githubusercontent.com/google/re2/main/LICENSE",
+  "highs": "https://raw.githubusercontent.com/ERGO-Code/HiGHS/master/LICENSE.txt",
+  "cbc": "https://raw.githubusercontent.com/coin-or/Cbc/master/LICENSE",
+  "clp": "https://raw.githubusercontent.com/coin-or/Clp/master/LICENSE",
+  "cgl": "https://raw.githubusercontent.com/coin-or/Cgl/master/LICENSE",
+  "osi": "https://raw.githubusercontent.com/coin-or/Osi/master/LICENSE",
+  "coinutils": "https://raw.githubusercontent.com/coin-or/CoinUtils/master/LICENSE",
+  "utf8_range": "https://raw.githubusercontent.com/protocolbuffers/utf8_range/main/LICENSE",
+  "zlib": "https://raw.githubusercontent.com/madler/zlib/v1.3.1/LICENSE",
+  "bzip2": "https://raw.githubusercontent.com/libarchive/bzip2/bzip2-1.0.8/LICENSE"
+}

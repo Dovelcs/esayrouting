@@ -1,0 +1,30 @@
+# DSN input and SES output resolve relative to this file. Output must not exist.
+version = 1
+input = "board.dsn"
+output = "board_routed.ses"
+
+# All geometry and widths are millimetres. Layer names must match the DSN board.
+[[nets]]
+name = "SIGNAL"
+width_mm = 0.2
+clearance_mm = 0.15
+allowed_layers = ["F.Cu"]
+via_budget = 0
+# Maximum two-terminal endpoint path length; branched nets are rejected.
+max_length_mm = 50.0
+
+[[groups]]
+id = "signal"
+nets = ["SIGNAL"]
+priority = 10
+# Dependencies order groups; joint_escape enables collective candidate selection.
+joint_escape = false
+
+[execution]
+# One worker permits repeatable seeded solver runs. Parallel runs may vary.
+threads = 1
+budget_ms = 30000
+seed = 0
+# check validates structure only; plan trial-routes without writing; route exports
+# only after board references, candidate feasibility, and requested rules pass.
+# Differential coupling, impedance and cross-net paths are unsupported hard rules.

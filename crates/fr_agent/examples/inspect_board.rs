@@ -56,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 priority: 0,
                 depends_on: vec![],
                 joint_escape: false,
+                awx: None,
             });
             rules.push(rule);
         }
@@ -109,6 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 seed: 0,
             },
             advanced: None,
+            awx: None,
         };
         use std::io::Write;
         let mut job = std::fs::OpenOptions::new()

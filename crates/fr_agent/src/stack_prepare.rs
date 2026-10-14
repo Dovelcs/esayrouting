@@ -32,9 +32,31 @@ fn cross_layer_dsn(count:usize)->String {
  layers.push_str("(layer BottomLayer (type signal))");
  format!("(PCB cross_layer (resolution mm 1000) (structure {layers} (boundary (rect pcb 0 0 12 10)) (via through) (rule (width 0.25) (clearance 0.15))) (placement (component terminals (place terminals 0 0 front 0))) (library (image terminals (pin top a 2 5) (pin bottom b 10 5)) (padstack top (shape (circle TopLayer 1))) (padstack bottom (shape (circle BottomLayer 1))) (padstack through (shape (circle TopLayer 0.6096)) (shape (circle BottomLayer 0.6096)))) (network (net N (pins terminals-a terminals-b)) (class default N (circuit (use_via through)) (rule (width 0.25) (clearance 0.15)))) (wiring))")
 }
+fn validate_outputs(input:&Path,output_dir:&Path)->Result<(),String>{
+ let source=fs::metadata(input).map_err(|e|e.to_string())?;
+ let source_path=fs::canonicalize(input).map_err(|e|e.to_string())?;
+ for count in [2,4,6] {
+  for name in [format!("board_{count}.dsn"),format!("board_{count}.ses"),format!("board_{count}.jsonl"),format!("case_{count}.toml"),format!("cross_layer_{count}.dsn"),format!("cross_layer_{count}.ses"),format!("cross_layer_{count}.jsonl"),format!("cross_layer_{count}.toml")] {
+   let target=output_dir.join(name);
+   let metadata=match fs::metadata(&target) {Ok(m)=>m,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>continue,Err(e)=>return Err(e.to_string())};
+   let aliases=fs::canonicalize(&target).map_err(|e|e.to_string())?==source_path;
+   #[cfg(unix)] {
+    use std::os::unix::fs::MetadataExt;
+    let aliases=aliases||source.dev()==metadata.dev()&&source.ino()==metadata.ino();
+    if aliases {return Err(format!("output {} aliases original input {}",target.display(),input.display()))}
+   }
+   #[cfg(not(unix))] {
+    let _=(&source,&metadata);
+    if aliases {return Err(format!("output {} aliases original input {}",target.display(),input.display()))}
+   }
+  }
+ }
+ Ok(())
+}
 pub fn run(path:&Path)
 ->Result<(),String>{
  let j:Job=toml::from_str(&fs::read_to_string(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+ validate_outputs(Path::new(&j.input),Path::new(&j.output_dir))?;
  let source=fs::read(&j.input).map_err(|e|e.to_string())?;
  let expressions=fr_dsn::sexpr::parse(&source).map_err(|e|e.to_string())?;
  fs::create_dir_all(&j.output_dir).map_err(|e|e.to_string())?;

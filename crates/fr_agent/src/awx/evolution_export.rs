@@ -72,6 +72,10 @@ pub(super) struct NativeViaDrill {
     pub padstack: String,
     pub diameter_mm: f64,
     pub drill_mm: f64,
+    /// Nets on which this explicit native via stack occurs in the exported
+    /// routed/fanout boards. This is the authorization scope for SES replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nets: Vec<String>,
 }
 
 /// Exact route scope captured from the native execution, without source or
@@ -121,25 +125,48 @@ fn write_new(
     Ok(())
 }
 
-fn native_via_drills(board: &BoardAdapter) -> Vec<NativeViaDrill> {
-    board
-        .board
-        .library
-        .padstacks
-        .iter()
-        .filter_map(|stack| {
-            let drill_radius = stack.get_explicit_drill_radius()?;
-            let diameter = (stack.from_layer()..=stack.to_layer())
-                .filter_map(|layer| stack.get_shape(layer))
-                .map(|shape| shape.max_width())
-                .fold(0.0_f64, f64::max);
-            (diameter > 0.0).then(|| NativeViaDrill {
-                padstack: stack.name.clone(),
-                diameter_mm: diameter / board.units_per_mm,
-                drill_mm: 2.0 * drill_radius / board.units_per_mm,
-            })
-        })
-        .collect()
+fn native_via_drills(board: &BoardAdapter) -> Result<Vec<NativeViaDrill>, String> {
+    let mut by_stack: BTreeMap<String, NativeViaDrill> = BTreeMap::new();
+    for key in board.board.get_vias() {
+        let item = board.board.item(key);
+        let stack = item.padstack(&board.board).ok_or("native via has no padstack")?;
+        let Some(drill_radius) = stack.get_explicit_drill_radius() else {
+            continue;
+        };
+        let diameter = (stack.from_layer()..=stack.to_layer())
+            .filter_map(|layer| stack.get_shape(layer))
+            .map(|shape| shape.max_width())
+            .fold(0.0_f64, f64::max);
+        if diameter <= 0.0 {
+            return Err(format!("native via {} has no copper diameter", stack.name));
+        }
+        let mut nets = BTreeSet::new();
+        for &net_id in item.net_numbers() {
+            let net = board.board.rules.nets.get(net_id)
+                .ok_or("native via refers to an unknown net")?;
+            nets.insert(net.name.clone());
+        }
+        if nets.is_empty() {
+            return Err(format!("native via {} has no net association", stack.name));
+        }
+        let via = by_stack.entry(stack.name.clone()).or_insert_with(|| NativeViaDrill {
+            padstack: stack.name.clone(),
+            diameter_mm: diameter / board.units_per_mm,
+            drill_mm: 2.0 * drill_radius / board.units_per_mm,
+            nets: Vec::new(),
+        });
+        if (via.diameter_mm - diameter / board.units_per_mm).abs() > 1e-9
+            || (via.drill_mm - 2.0 * drill_radius / board.units_per_mm).abs() > 1e-9
+        {
+            return Err(format!("native via {} has inconsistent physical dimensions", stack.name));
+        }
+        via.nets.extend(nets);
+    }
+    for via in by_stack.values_mut() {
+        via.nets.sort();
+        via.nets.dedup();
+    }
+    Ok(by_stack.into_values().collect())
 }
 
 fn session_bytes(board: &BoardAdapter) -> Result<Vec<u8>, String> {
@@ -408,12 +435,11 @@ fn export_inner(
         verdicts: (!verdicts.is_empty()).then_some("verdicts.json"),
         native_vias: {
             let mut by_name: BTreeMap<String, NativeViaDrill> = BTreeMap::new();
-            for via in native_via_drills(input.routed)
+            for via in native_via_drills(input.routed)?
                 .into_iter()
-                .chain(native_via_drills(input.fanout))
+                .chain(native_via_drills(input.fanout)?)
             {
-                if let Some(old) = by_name.get(&via.padstack) {
-                    let old: &NativeViaDrill = old;
+                if let Some(old) = by_name.get_mut(&via.padstack) {
                     if (old.diameter_mm - via.diameter_mm).abs() > 1e-9
                         || (old.drill_mm - via.drill_mm).abs() > 1e-9
                     {
@@ -422,6 +448,9 @@ fn export_inner(
                             via.padstack
                         ));
                     }
+                    old.nets.extend(via.nets);
+                    old.nets.sort();
+                    old.nets.dedup();
                 } else {
                     by_name.insert(via.padstack.clone(), via);
                 }

@@ -28,7 +28,7 @@ pub fn strip_nets(board: &mut BoardAdapter, names: &BTreeSet<String>) -> Result<
         .iter()
         .map(|n| board.net_number(n))
         .collect::<Result<_, _>>()?;
-    let remove: Vec<_> = board
+    let selected: Vec<_> = board
         .board
         .get_items()
         .into_iter()
@@ -37,13 +37,36 @@ pub fn strip_nets(board: &mut BoardAdapter, names: &BTreeSet<String>) -> Result<
             (item.is_trace() || item.is_via()) && item.net_numbers().iter().any(|n| ids.contains(n))
         })
         .collect();
-    for &k in &remove {
+    for &k in &selected {
         let item = board.board.item(k);
         if item.net_numbers().iter().any(|n| !ids.contains(n)) {
             return Err("Unsupported: selected bus copper also belongs to another net".into());
         }
     }
-    board.board.remove_items(remove);
+    let remove: Vec<_> = selected
+        .into_iter()
+        .filter(|&key| !board.is_source_protected_copper(key))
+        .collect();
+    let mut candidate = board.clone();
+    for &key in &remove {
+        let item = candidate.board.item(key);
+        if item.component_no() > 0
+            || item.fixed_state() == FixedState::SystemFixed
+        {
+            return Err("AWX selected copper includes source-protected board geometry".into());
+        }
+        // The selected net set is the rollback transaction boundary. AWX materialized
+        // copper is UserFixed so the router cannot shove it; temporarily lower that state
+        // only on this private candidate while removing the explicitly selected copper.
+        if item.is_user_fixed() {
+            candidate.board.item_mut(key).set_fixed_state(FixedState::Unfixed);
+        }
+        candidate.board.remove_item(key);
+        if candidate.board.item(key).is_on_board() {
+            return Err("AWX could not remove all selected copper".into());
+        }
+    }
+    *board = candidate;
     Ok(())
 }
 pub fn via(
@@ -319,21 +342,220 @@ pub fn grade(
         copper_mm,
     })
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SourceCopperSignature {
+    Trace {
+        nets: Vec<String>,
+        layer: String,
+        half_width: i32,
+        points: Vec<String>,
+        clearance: String,
+        fixed: FixedState,
+    },
+    Via {
+        nets: Vec<String>,
+        center: String,
+        first_layer: String,
+        last_layer: String,
+        padstack: String,
+        attach_allowed: bool,
+        placed_absolute: bool,
+        copper_shapes: Vec<(String, Option<String>)>,
+        explicit_drill_radius_bits: Option<u64>,
+        clearance: String,
+        fixed: FixedState,
+    },
+}
+
+impl SourceCopperSignature {
+    fn nets(&self) -> &[String] {
+        match self {
+            Self::Trace { nets, .. } | Self::Via { nets, .. } => nets,
+        }
+    }
+}
+
+fn source_copper_signature(
+    board: &BoardAdapter,
+    key: fr_engine::board::ItemKey,
+) -> Result<SourceCopperSignature, String> {
+    let item = board.board.item(key);
+    let mut nets = item
+        .net_numbers()
+        .iter()
+        .map(|&net| {
+            board
+                .board
+                .rules
+                .nets
+                .get(net)
+                .map(|entry| entry.name.clone())
+                .ok_or_else(|| "source copper net identity is missing".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    nets.sort();
+    let clearance = board
+        .board
+        .rules
+        .clearance_matrix
+        .get_name(item.clearance_class())
+        .ok_or("source copper clearance class is missing")?
+        .to_string();
+    if item.is_trace() {
+        let trace = item.trace();
+        let layer = board
+            .board
+            .layer_structure
+            .layers
+            .get(trace.layer() as usize)
+            .ok_or("source trace layer is missing")?
+            .name
+            .clone();
+        let polyline = trace.polyline();
+        let mut points: Vec<_> = (0..polyline.corner_count())
+            .map(|i| crate::board_adapter::canonical_point_key(&polyline.corner(i)))
+            .collect();
+        let reverse: Vec<_> = points.iter().cloned().rev().collect();
+        if reverse < points {
+            points = reverse;
+        }
+        Ok(SourceCopperSignature::Trace {
+            nets,
+            layer,
+            half_width: trace.half_width(),
+            points,
+            clearance,
+            fixed: item.fixed_state(),
+        })
+    } else if item.is_via() {
+        let center = item.center(&board.board);
+        let padstack = item
+            .padstack(&board.board)
+            .ok_or("source via padstack is missing")?;
+        let copper_shapes = board
+            .board
+            .layer_structure
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(layer, info)| {
+                (
+                    info.name.clone(),
+                    padstack
+                        .get_shape(layer as i32)
+                        .map(|shape| format!("{shape:?}")),
+                )
+            })
+            .collect();
+        let explicit_drill_radius_bits = padstack
+            .get_explicit_drill_radius()
+            .map(f64::to_bits);
+        let padstack_name = padstack.name.clone();
+        let first_layer = board
+            .board
+            .layer_structure
+            .layers
+            .get(item.first_layer(&board.board) as usize)
+            .ok_or("source via first layer is missing")?
+            .name
+            .clone();
+        let last_layer = board
+            .board
+            .layer_structure
+            .layers
+            .get(item.last_layer(&board.board) as usize)
+            .ok_or("source via last layer is missing")?
+            .name
+            .clone();
+        Ok(SourceCopperSignature::Via {
+            nets,
+            center: crate::board_adapter::canonical_point_key(&center),
+            first_layer,
+            last_layer,
+            padstack: padstack_name,
+            attach_allowed: padstack.attach_allowed,
+            placed_absolute: padstack.placed_absolute,
+            copper_shapes,
+            explicit_drill_radius_bits,
+            clearance,
+            fixed: item.fixed_state(),
+        })
+    } else {
+        Err("source signature requested for non-copper item".into())
+    }
+}
+
+fn protected_source_copper_counts(
+    board: &BoardAdapter,
+) -> Result<BTreeMap<SourceCopperSignature, usize>, String> {
+    let mut counts = BTreeMap::new();
+    for key in board.board.get_items() {
+        if board.is_source_protected_copper(key) {
+            *counts.entry(source_copper_signature(board, key)?).or_default() += 1;
+        }
+    }
+    Ok(counts)
+}
+
+fn consume_protected_source(
+    counts: &mut BTreeMap<SourceCopperSignature, usize>,
+    signature: &SourceCopperSignature,
+) -> bool {
+    let Some(count) = counts.get_mut(signature) else {
+        return false;
+    };
+    if *count == 0 {
+        return false;
+    }
+    *count -= 1;
+    true
+}
+
 pub fn restore_nets(
     original: &BoardAdapter,
     trial: &mut BoardAdapter,
     names: &BTreeSet<String>,
 ) -> Result<(), String> {
+    let mut candidate = trial.clone();
+    restore_nets_into(original, &mut candidate, names)?;
+    *trial = candidate;
+    Ok(())
+}
+
+fn restore_nets_into(
+    original: &BoardAdapter,
+    trial: &mut BoardAdapter,
+    names: &BTreeSet<String>,
+) -> Result<(), String> {
     strip_nets(trial, names)?;
+    let mut trial_source = protected_source_copper_counts(trial)?;
     for key in original.board.get_traces() {
         let item = original.board.item(key);
+        let signature = if original.is_source_protected_copper(key) {
+            Some(source_copper_signature(original, key)?)
+        } else {
+            None
+        };
+        let mut target_nets = Vec::new();
         for &n in item.net_numbers() {
             let Some(net) = original.board.rules.nets.get(n) else {
                 continue;
             };
-            if !names.contains(&net.name) {
+            if names.contains(&net.name) {
+                target_nets.push(net.name.clone());
+            }
+        }
+        if target_nets.is_empty() {
+            continue;
+        }
+        if let Some(signature) = &signature {
+            if consume_protected_source(&mut trial_source, signature) {
                 continue;
             }
+            return Err("AWX rollback is missing source-protected trace copper".into());
+        }
+        for net_name in target_nets {
             let layer = &original.board.layer_structure.layers
                 [item.first_layer(&original.board) as usize]
                 .name;
@@ -342,7 +564,7 @@ pub fn restore_nets(
             for pair in points.windows(2) {
                 trace(
                     trial,
-                    &net.name,
+                    &net_name,
                     layer,
                     [
                         pair[0].x / original.units_per_mm,
@@ -359,17 +581,34 @@ pub fn restore_nets(
     }
     for key in original.board.get_vias() {
         let item = original.board.item(key);
-        let stack = item
-            .padstack(&original.board)
-            .ok_or("source via padstack missing")?;
-        let p = item.center(&original.board).to_float();
+        let signature = if original.is_source_protected_copper(key) {
+            Some(source_copper_signature(original, key)?)
+        } else {
+            None
+        };
+        let mut target_nets = Vec::new();
         for &n in item.net_numbers() {
             let Some(net) = original.board.rules.nets.get(n) else {
                 continue;
             };
-            if !names.contains(&net.name) {
+            if names.contains(&net.name) {
+                target_nets.push(net.name.clone());
+            }
+        }
+        if target_nets.is_empty() {
+            continue;
+        }
+        if let Some(signature) = &signature {
+            if consume_protected_source(&mut trial_source, signature) {
                 continue;
             }
+            return Err("AWX rollback is missing source-protected via copper".into());
+        }
+        let stack = item
+            .padstack(&original.board)
+            .ok_or("source via padstack missing")?;
+        let p = item.center(&original.board).to_float();
+        for net_name in target_nets {
             let target = trial
                 .board
                 .library
@@ -378,7 +617,7 @@ pub fn restore_nets(
                 .ok_or("source via library identity lost")?
                 .id;
             let point = trial.point([p.x / original.units_per_mm, p.y / original.units_per_mm])?;
-            let net_no = trial.net_number(&net.name)?;
+            let net_no = trial.net_number(&net_name)?;
             trial.board.insert_via(
                 target,
                 point,
@@ -388,6 +627,11 @@ pub fn restore_nets(
                 true,
             );
         }
+    }
+    if trial_source.iter().any(|(signature, count)| {
+        *count > 0 && signature.nets().iter().any(|net| names.contains(net))
+    }) {
+        return Err("AWX rollback found extra source-protected copper on a selected net".into());
     }
     Ok(())
 }
@@ -415,8 +659,45 @@ pub fn require_native_geometry(geometry: &GeometryResult) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_via_candidate;
+    use super::{ensure_via_candidate, restore_nets, strip_nets, trace};
     use crate::board_adapter::BoardAdapter;
+    use fr_engine::ids::FixedState;
+    use std::collections::BTreeSet;
+
+    fn protected_source_board(
+        with_prior_other_copper: bool,
+        bus_copies: usize,
+        with_via: bool,
+        mismatch_via_shape: bool,
+    ) -> BoardAdapter {
+        let fixture = std::str::from_utf8(include_bytes!("../../tests/fixtures/two_chip.dsn"))
+            .expect("fixture is UTF-8");
+        let mut dsn = fixture
+            .trim_end()
+            .strip_suffix(')')
+            .expect("fixture root closes")
+            .to_string();
+        if mismatch_via_shape {
+            dsn = dsn.replace(
+                "(shape (circle Top 0.5))",
+                "(shape (circle Top 0.4))",
+            );
+        }
+        let prior = if with_prior_other_copper {
+            "(wire (path Top 0.2 10 7 11 7) (net OTHER) (type protect)) "
+        } else {
+            ""
+        };
+        let bus_wires = "(wire (path Top 0.2 3 3 4 3) (net BUS) (type protect)) "
+            .repeat(bus_copies);
+        let via = if with_via {
+            "(via VIA 5 5 (net BUS) (type protect))"
+        } else {
+            ""
+        };
+        dsn.push_str(&format!("\n (wiring {prior}{bus_wires}{via})\n)"));
+        BoardAdapter::load(dsn.as_bytes()).expect("protected source board loads")
+    }
 
     #[test]
     fn registering_native_via_does_not_change_shared_net_class_rule() {
@@ -450,5 +731,162 @@ mod tests {
         let padstack = board.board.rules.via_infos[candidate].get_padstack();
         let stack = board.board.library.padstacks.get(padstack).unwrap();
         assert!((2.0 * stack.get_drill_radius() / board.units_per_mm - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn strip_nets_removes_user_fixed_transaction_copper() {
+        let mut board = BoardAdapter::load(include_bytes!("../../tests/fixtures/two_chip.dsn"))
+            .expect("fixture board loads");
+        trace(&mut board, "BUS", "Top", [0.0, 0.0], [1.0, 0.0], 0.2)
+            .expect("transaction trace inserts");
+        let names = BTreeSet::from(["BUS".to_string()]);
+
+        strip_nets(&mut board, &names).expect("selected net copper is removed");
+
+        let bus = board.net_number("BUS").unwrap();
+        assert!(board
+            .board
+            .get_traces()
+            .iter()
+            .all(|&key| !board.board.item(key).contains_net(bus)));
+        assert!(board
+            .board
+            .get_vias()
+            .iter()
+            .all(|&key| !board.board.item(key).contains_net(bus)));
+    }
+
+    #[test]
+    fn strip_nets_preserves_source_protected_copper_identity() {
+        let mut board = protected_source_board(false, 1, false, false);
+        let bus = board.net_number("BUS").unwrap();
+        trace(&mut board, "BUS", "Top", [5.0, 5.0], [6.0, 5.0], 0.2)
+            .expect("generated trace inserts");
+        let source = board
+            .board
+            .get_traces()
+            .into_iter()
+            .find(|&key| board.board.item(key).contains_net(bus) && board.is_source_protected_copper(key))
+            .expect("fixture BUS source trace");
+        let generated = board
+            .board
+            .get_traces()
+            .into_iter()
+            .find(|&key| key != source)
+            .expect("generated BUS trace");
+        assert_eq!(board.board.item(source).fixed_state(), FixedState::UserFixed);
+        assert!(board.is_source_protected_copper(source));
+        let result = strip_nets(&mut board, &BTreeSet::from(["BUS".to_string()]));
+
+        assert!(result.is_ok());
+        assert!(board.board.item(source).is_on_board());
+        assert!(board.is_source_protected_copper(source));
+        assert!(!board.board.item(generated).is_on_board());
+    }
+
+    #[test]
+    fn restore_nets_removes_generated_fixed_copper_and_restores_source_once() {
+        let original = protected_source_board(false, 2, false, false);
+        // Read all source instances separately to exercise signature multiplicity.
+        let mut original_source_keys: Vec<_> = original
+            .board
+            .get_traces()
+            .into_iter()
+            .filter(|&key| {
+                original.board.item(key).contains_net(original.net_number("BUS").unwrap())
+                    && original.is_source_protected_copper(key)
+            })
+            .collect();
+        original_source_keys.sort();
+        assert_eq!(original_source_keys.len(), 2);
+        // This independent import adds earlier copper, so the BUS source ItemKey differs
+        // even though its physical source signature is identical.
+        let mut trial = protected_source_board(true, 2, false, false);
+        let mut trial_source_keys: Vec<_> = trial
+            .board
+            .get_traces()
+            .into_iter()
+            .filter(|&key| {
+                trial.board.item(key).contains_net(trial.net_number("BUS").unwrap())
+                    && trial.is_source_protected_copper(key)
+            })
+            .collect();
+        trial_source_keys.sort();
+        assert_eq!(trial_source_keys.len(), original_source_keys.len());
+        assert_ne!(original_source_keys[0], trial_source_keys[0]);
+        trace(&mut trial, "BUS", "Top", [2.0, 0.0], [3.0, 0.0], 0.2)
+            .expect("generated trial trace inserts");
+        let generated_key = trial
+            .board
+            .get_traces()
+            .into_iter()
+            .find(|&key| !trial.is_source_protected_copper(key))
+            .expect("generated trace exists");
+        assert!(!trial.is_source_protected_copper(generated_key));
+
+        restore_nets(&original, &mut trial, &BTreeSet::from(["BUS".to_string()]))
+            .expect("failed transaction copper is rolled back");
+
+        let bus = trial.net_number("BUS").unwrap();
+        let mut bus_traces: Vec<_> = trial
+            .board
+            .get_traces()
+            .into_iter()
+            .filter(|&key| trial.board.item(key).contains_net(bus))
+            .collect();
+        bus_traces.sort();
+        assert_eq!(bus_traces, trial_source_keys);
+        assert!(bus_traces.iter().all(|&key| trial.is_source_protected_copper(key)));
+        assert!(!trial.board.item(generated_key).is_on_board());
+    }
+
+    #[test]
+    fn restore_nets_rejects_extra_selected_source_multiplicity_atomically() {
+        let original = protected_source_board(false, 1, false, false);
+        let mut trial = protected_source_board(true, 2, false, false);
+        let before_traces = trial.board.get_traces();
+        let before_vias = trial.board.get_vias();
+        let names = BTreeSet::from(["BUS".to_string()]);
+
+        let result = restore_nets(&original, &mut trial, &names);
+
+        assert!(result.is_err());
+        assert_eq!(trial.board.get_traces(), before_traces);
+        assert_eq!(trial.board.get_vias(), before_vias);
+        assert!(before_traces.iter().all(|&key| trial.board.item(key).is_on_board()));
+    }
+
+    #[test]
+    fn restore_nets_rejects_mismatched_via_physics_atomically() {
+        let original = protected_source_board(false, 1, true, false);
+        let mut trial = protected_source_board(true, 1, true, true);
+        trace(&mut trial, "BUS", "Top", [2.0, 0.0], [3.0, 0.0], 0.2)
+            .expect("generated trial trace inserts");
+        let before_traces = trial.board.get_traces();
+        let before_vias = trial.board.get_vias();
+        let names = BTreeSet::from(["BUS".to_string()]);
+
+        let result = restore_nets(&original, &mut trial, &names);
+
+        assert!(result.is_err());
+        assert_eq!(trial.board.get_traces(), before_traces);
+        assert_eq!(trial.board.get_vias(), before_vias);
+        assert!(before_traces.iter().all(|&key| trial.board.item(key).is_on_board()));
+        assert!(before_vias.iter().all(|&key| trial.board.item(key).is_on_board()));
+    }
+
+    #[test]
+    fn source_point_signatures_normalize_equivalent_rationals() {
+        use fr_geom::Line;
+
+        let first = Line::new_ints(0, 0, 1, 1)
+            .intersection(&Line::new_ints(0, 1, 1, 0));
+        let equivalent = Line::new_ints(0, 0, 2, 2)
+            .intersection(&Line::new_ints(-1, 2, 2, -1));
+
+        assert_eq!(
+            crate::board_adapter::canonical_point_key(&first),
+            crate::board_adapter::canonical_point_key(&equivalent)
+        );
     }
 }

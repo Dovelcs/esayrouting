@@ -5,15 +5,65 @@
 //! so subsequent solving, auditing, and realization see the copper on its actual layer.
 use super::board_snapshot::{BoardSnapshot, LogicalComponent};
 use super::{
-    corridor::distance,
+    corridor::{distance, Point},
     whole_context::{CopperVia, WholeContext},
     whole_frame::FlowFrame,
     whole_types::WholePlan,
 };
 use crate::board_adapter::BoardAdapter;
+use fr_engine::board::ItemKey;
 use std::collections::{BTreeMap, BTreeSet};
 
 const END_TOL_MM: f64 = 1e-3;
+
+fn native_point(board: &BoardAdapter, flow: FlowFrame, point: Point) -> Result<fr_geom::Point, String> {
+    board.point(flow.to_board(point))
+}
+
+fn relayer_trace_keys(
+    board: &BoardAdapter,
+    moves: &[(i32, fr_geom::Point, fr_geom::Point, i32, i32)],
+) -> Result<BTreeSet<ItemKey>, String> {
+    let mut found = vec![0usize; moves.len()];
+    let mut owned = BTreeSet::new();
+    for key in board.board.get_traces() {
+        let item = board.board.item(key);
+        let trace = item.trace();
+        let polyline = trace.polyline();
+        let layer = trace.layer();
+        let corners: Vec<_> = (0..polyline.corner_count())
+            .map(|i| polyline.corner(i))
+            .collect();
+        for edge in 0..corners.len().saturating_sub(1) {
+            let a = corners[edge].clone();
+            let b = corners[edge + 1].clone();
+            let hits: Vec<_> = moves
+                .iter()
+                .enumerate()
+                .filter(|(_, (net, x, y, from, _))| {
+                    item.net_numbers().contains(net)
+                        && *from == layer
+                        && ((*x == a && *y == b) || (*x == b && *y == a))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if hits.len() > 1 {
+                return Err("AWX relayer: trace piece has ambiguous native move".into());
+            }
+            if let Some(&index) = hits.first() {
+                found[index] += 1;
+                if board.is_source_protected_copper(key) {
+                    return Err("AWX relayer: selected trace is source-protected copper".into());
+                }
+                owned.insert(key);
+            }
+        }
+    }
+    if found.iter().any(|count| *count != 1) {
+        return Err("AWX relayer: selected copper segment was absent or ambiguous on native board".into());
+    }
+    Ok(owned)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct RelayReport {
@@ -65,20 +115,44 @@ pub fn relay_native_board(
         }
         native_moves.push((
             old.net_id,
-            board.point(old.a)?,
-            board.point(old.b)?,
+            native_point(board, flow, old.a)?,
+            native_point(board, flow, old.b)?,
             from,
             to,
         ));
     }
+    let owned_traces = relayer_trace_keys(board, &native_moves)?;
     let mut candidate = board.clone();
-    candidate.board.relayer_trace_segments(&native_moves)?;
+    candidate
+        .board
+        .relayer_trace_segments(&native_moves, &owned_traces)?;
     let native_vias: Vec<_> = report
         .dropped_via_sites
         .iter()
-        .map(|(net, point)| Ok((*net, candidate.point(*point)?)))
+        .map(|(net, point)| Ok((*net, native_point(&candidate, flow, *point)?)))
         .collect::<Result<_, String>>()?;
-    candidate.board.remove_relayer_vias(&native_vias)?;
+    let mut owned_vias = BTreeSet::new();
+    for (net, point) in &native_vias {
+        let matches: Vec<_> = candidate
+            .board
+            .get_vias()
+            .into_iter()
+            .filter(|&key| {
+                let item = candidate.board.item(key);
+                item.contains_net(*net) && item.center(&candidate.board) == *point
+            })
+            .collect();
+        if matches.len() != 1 {
+            return Err("AWX relayer: via identity at selected net/center is ambiguous".into());
+        }
+        if candidate.is_source_protected_copper(matches[0]) {
+            return Err("AWX relayer: selected via is source-protected copper".into());
+        }
+        owned_vias.insert(matches[0]);
+    }
+    candidate
+        .board
+        .remove_relayer_vias(&native_vias, &owned_vias)?;
     let snapshot = BoardSnapshot::capture(&candidate, components, via_drills)?;
     let mut report = report;
     report.elapsed_us = Some(started.elapsed().as_micros().min(u64::MAX as u128) as u64);
@@ -287,4 +361,27 @@ fn find_run(
         current = if near(s.a, current) { s.b } else { s.a };
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_point;
+    use super::super::whole_frame::FlowFrame;
+    use crate::board_adapter::BoardAdapter;
+
+    #[test]
+    fn native_point_inverts_mirror_and_quarter_turn() {
+        let board = BoardAdapter::load(include_bytes!("../../tests/fixtures/two_chip.dsn"))
+            .expect("fixture board loads");
+        let flow = FlowFrame {
+            mirror_axis_y: Some(1.0),
+            quarter_turns: 1,
+            center: [0.0, 0.0],
+        };
+
+        assert_eq!(
+            native_point(&board, flow, [0.5, 2.0]).unwrap(),
+            board.point([2.0, 2.5]).unwrap()
+        );
+    }
 }

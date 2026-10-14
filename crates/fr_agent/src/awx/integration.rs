@@ -559,6 +559,21 @@ fn sync_plan_endpoint_layers(
 }
 /// Certify the requested numerical and channel rules against the realized board,
 /// after routing and before the single transaction is committed.
+fn disallowed_via_span_layer<'a>(
+    from: i32,
+    to: i32,
+    physical_layers: &'a [String],
+    allowed_layers: &[String],
+) -> Option<&'a str> {
+    if from < 0 || to < 0 || from > to || to as usize >= physical_layers.len() {
+        return Some("invalid span");
+    }
+    (from..=to).find_map(|index| {
+        let name = &physical_layers[index as usize];
+        (!allowed_layers.contains(name)).then_some(name.as_str())
+    })
+}
+
 pub fn verify_requested(
     board: &BoardAdapter,
     spec: &RouteSpec,
@@ -670,6 +685,21 @@ pub fn verify_requested(
                 let pad = item
                     .padstack(&board.board)
                     .ok_or("native via without padstack")?;
+                let physical_layers: Vec<_> = board
+                    .board
+                    .layer_structure
+                    .layers
+                    .iter()
+                    .map(|layer| layer.name.clone())
+                    .collect();
+                if let Some(layer) = disallowed_via_span_layer(
+                    pad.from_layer(),
+                    pad.to_layer(),
+                    &physical_layers,
+                    &rule.allowed_layers,
+                ) {
+                    return Err(format!("net {name}: realized via spans disallowed layer {layer}"));
+                }
                 let mut radius = 0f64;
                 for layer in pad.from_layer()..=pad.to_layer() {
                     if let Some(shape) = item.drill_shape_on_layer(&board.board, layer) {
@@ -707,4 +737,31 @@ pub fn verify_requested(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod verify_requested_tests {
+    use super::disallowed_via_span_layer;
+
+    #[test]
+    fn via_span_checks_intermediate_physical_layers() {
+        let physical = vec!["F.Cu".into(), "In1.Cu".into(), "In2.Cu".into(), "B.Cu".into()];
+        let allowed = vec!["F.Cu".into(), "B.Cu".into()];
+        assert_eq!(
+            disallowed_via_span_layer(0, 3, &physical, &allowed),
+            Some("In1.Cu")
+        );
+        assert_eq!(
+            disallowed_via_span_layer(0, 3, &physical, &physical),
+            None
+        );
+        assert_eq!(
+            disallowed_via_span_layer(0, 4, &physical, &physical),
+            Some("invalid span")
+        );
+        assert_eq!(
+            disallowed_via_span_layer(-1, 3, &physical, &physical),
+            Some("invalid span")
+        );
+    }
 }

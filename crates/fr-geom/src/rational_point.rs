@@ -89,6 +89,22 @@ impl RationalPoint {
         result.wrapping_mul(31).wrapping_add(bigint_hash_code(&rz))
     }
 
+    /// Returns the gcd-reduced homogeneous coordinates used by the exact
+    /// projective representation. Scaled tuples therefore share one key.
+    pub fn normalized_homogeneous_coordinates(&self) -> (BigInt, BigInt, BigInt) {
+        let (x, y, z) = if self.z.is_negative() {
+            (-self.x.clone(), -self.y.clone(), -self.z.clone())
+        } else {
+            (self.x.clone(), self.y.clone(), self.z.clone())
+        };
+        let gcd = x.abs().gcd(&y.abs()).gcd(&z.abs());
+        if gcd > BigInt::one() {
+            (&x / &gcd, &y / &gcd, &z / &gcd)
+        } else {
+            (x, y, z)
+        }
+    }
+
     pub fn is_infinite(&self) -> bool {
         bigint_signum(&self.z) == 0
     }

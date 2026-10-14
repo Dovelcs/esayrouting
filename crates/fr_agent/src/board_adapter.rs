@@ -12,6 +12,49 @@ use fr_settings::RouterSettings;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) fn canonical_point_key(point: &fr_geom::Point) -> String {
+    match point {
+        fr_geom::Point::Int(point) => format!("{},{},1", point.x, point.y),
+        fr_geom::Point::Rational(point) => {
+            let (x, y, z) = point.normalized_homogeneous_coordinates();
+            format!("{x},{y},{z}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_point_key_tests {
+    use super::canonical_point_key;
+    use fr_geom::{IntPoint, Point, RationalPoint};
+
+    #[test]
+    fn equivalent_homogeneous_points_share_a_key() {
+        let integer = Point::Int(IntPoint::new(1, 2));
+        let rational = Point::Rational(Box::new(RationalPoint::new(
+            2.into(),
+            4.into(),
+            2.into(),
+        )));
+        let scaled = Point::Rational(Box::new(RationalPoint::new(
+            3.into(),
+            6.into(),
+            3.into(),
+        )));
+        assert_eq!(canonical_point_key(&integer), canonical_point_key(&rational));
+        assert_eq!(canonical_point_key(&rational), canonical_point_key(&scaled));
+    }
+}
+
+fn canonical_polyline_key(points: &[fr_geom::Point]) -> String {
+    let forward: Vec<_> = points.iter().map(canonical_point_key).collect();
+    let reverse: Vec<_> = forward.iter().rev().cloned().collect();
+    if forward <= reverse {
+        forward.join(";")
+    } else {
+        reverse.join(";")
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Pad {
     pub reference: String,
@@ -27,6 +70,8 @@ pub struct Pad {
 pub struct BoardAdapter {
     pub board: RoutingBoard,
     pub units_per_mm: f64,
+    source_protected_copper: BTreeSet<i32>,
+    authorized_explicit_drills: BTreeMap<(String, String), u64>,
     /// Board-outline rings retained by the native DSN loader, in board units.
     pub board_outline_polygons: Vec<Vec<[i32; 2]>>,
     /// True nested DSN outline rings which enclose fewer than two pad centers.
@@ -51,13 +96,73 @@ impl BoardAdapter {
         bytes: &[u8], session: &[u8], candidates: &[(String, f64, f64)],
     ) -> Result<Self, String> {
         let mut loaded = Self::load(bytes)?;
+        let known_explicit_drills: BTreeMap<_, _> = loaded
+            .board
+            .library
+            .padstacks
+            .iter()
+            .map(|stack| {
+                (
+                    stack.name.clone(),
+                    stack.get_explicit_drill_radius().map(f64::to_bits),
+                )
+            })
+            .collect();
         let mut authorized_vias = BTreeMap::new();
+        let mut authorized_explicit_drills = BTreeMap::new();
         for (net, diameter, drill) in candidates {
-            let info=crate::awx::native_execution::ensure_via_candidate(&mut loaded, net, *diameter, *drill)?;
-            authorized_vias.insert((loaded.net_number(net)?, loaded.board.rules.via_infos[info].get_padstack()),info);
+            let info = crate::awx::native_execution::ensure_via_candidate(
+                &mut loaded,
+                net,
+                *diameter,
+                *drill,
+            )?;
+            let padstack_no = loaded.board.rules.via_infos[info].get_padstack();
+            let padstack = loaded
+                .board
+                .library
+                .padstacks
+                .get(padstack_no)
+                .ok_or("authorized SES via padstack missing")?;
+            let explicit_drill = padstack
+                .get_explicit_drill_radius()
+                .ok_or("authorized SES via has no explicit drill metadata")?
+                .to_bits();
+            if known_explicit_drills
+                .iter()
+                .find(|(name, _)| name.as_str().eq_ignore_ascii_case(&padstack.name))
+                .and_then(|(_, radius)| *radius)
+                .is_some_and(|radius| radius != explicit_drill)
+            {
+                return Err(format!(
+                    "authorized via candidate changes known drill metadata for {}",
+                    padstack.name
+                ));
+            }
+            authorized_explicit_drills.insert((net.clone(), padstack.name.clone()), explicit_drill);
+            authorized_vias.insert((loaded.net_number(net)?, padstack_no), info);
         }
+        loaded.authorized_explicit_drills = authorized_explicit_drills;
+        let mut source_protected = source_protected_copper_counts(&loaded.board)?;
 
         replay_full_session(&mut loaded.board, session, &authorized_vias)?;
+        loaded.source_protected_copper.clear();
+        for key in loaded.board.item_repository().iter() {
+            let item = loaded.board.item(key);
+            if !(item.is_trace() || item.is_via()) {
+                continue;
+            }
+            let signature = source_copper_signature(&loaded.board, item)?;
+            if let Some(count) = source_protected.get_mut(&signature) {
+                if *count > 0 {
+                    loaded.source_protected_copper.insert(item.id().0);
+                    *count -= 1;
+                }
+            }
+        }
+        if source_protected.values().any(|&count| count != 0) {
+            return Err("SES replay removed source-fixed copper".into());
+        }
         let nested = std::mem::take(&mut loaded.board_cutouts)
             .into_iter()
             .chain(std::mem::take(&mut loaded.board_edge_contours))
@@ -120,9 +225,27 @@ impl BoardAdapter {
         }
         let (board_outline_polygons, board_cutouts, board_edge_contours) =
             board_contour_metadata(bytes, &board)?;
+        let source_protected_copper = source_protected_copper_counts(&board)?;
+        let mut protected_ids = BTreeSet::new();
+        let mut remaining = source_protected_copper;
+        for key in board.item_repository().iter() {
+            let item = board.item(key);
+            if !(item.is_trace() || item.is_via()) {
+                continue;
+            }
+            let signature = source_copper_signature(&board, item)?;
+            if let Some(count) = remaining.get_mut(&signature) {
+                if *count > 0 {
+                    protected_ids.insert(item.id().0);
+                    *count -= 1;
+                }
+            }
+        }
         Ok(Self {
             board,
             units_per_mm,
+            source_protected_copper: protected_ids,
+            authorized_explicit_drills: BTreeMap::new(),
             board_outline_polygons,
             board_cutouts,
             board_edge_contours,
@@ -160,6 +283,31 @@ impl BoardAdapter {
                 })
             })
             .collect()
+    }
+    /// True only for source copper that was fixed when the DSN was loaded.
+    /// Generated copper remains transaction-owned even if later fixed.
+    pub fn is_source_protected_copper(&self, key: ItemKey) -> bool {
+        let item = self.board.item(key);
+        (item.is_trace() || item.is_via()) && self.source_protected_copper.contains(&item.id().0)
+    }
+    fn authorized_drill_upgrade(
+        &self,
+        source: &BoardAdapter,
+        item: &fr_engine::board::Item,
+    ) -> Option<u64> {
+        let via = item.as_via()?;
+        let padstack = source.board.library.padstacks.get(via.padstack_no())?;
+        if padstack.get_explicit_drill_radius().is_some() || item.net_numbers().len() != 1 {
+            return None;
+        }
+        let net = source
+            .board
+            .rules
+            .nets
+            .get(item.net_numbers()[0])?;
+        self.authorized_explicit_drills
+            .get(&(net.name.clone(), padstack.name.clone()))
+            .copied()
     }
     pub fn net_number(&self, name: &str) -> Result<NetNo, String> {
         let nets: Vec<_> = self
@@ -538,6 +686,71 @@ impl BoardAdapter {
             })
             .collect()
     }
+    /// Clearance violations with item identity replaced by canonical geometry
+    /// signatures, so SES replay can compare inherited violations after re-ID.
+    pub fn session_violations(&self) -> BTreeSet<String> {
+        self.session_violations_for(self, false)
+    }
+    /// Stable clearance violations newly introduced since a source snapshot,
+    /// applying only this replay's explicitly authorized drill enrichment.
+    pub fn new_session_violations_since(&self, before: &BoardAdapter) -> BTreeSet<String> {
+        self.session_violations()
+            .difference(&self.session_violations_for(before, true))
+            .cloned()
+            .collect()
+    }
+    fn session_violations_for(
+        &self,
+        source: &BoardAdapter,
+        allow_trusted_drill_upgrade: bool,
+    ) -> BTreeSet<String> {
+        source
+            .board
+            .item_repository()
+            .iter()
+            .flat_map(|key| clearance_violations(&source.board, key))
+            .map(|violation| {
+                let mut items = [
+                    session_item_signature(
+                        &source.board,
+                        source.board.item(violation.first_item),
+                        allow_trusted_drill_upgrade
+                            .then(|| {
+                                self.authorized_drill_upgrade(
+                                    source,
+                                    source.board.item(violation.first_item),
+                                )
+                            })
+                            .flatten(),
+                    ),
+                    session_item_signature(
+                        &source.board,
+                        source.board.item(violation.second_item),
+                        allow_trusted_drill_upgrade
+                            .then(|| {
+                                self.authorized_drill_upgrade(
+                                    source,
+                                    source.board.item(violation.second_item),
+                                )
+                            })
+                            .flatten(),
+                    ),
+                ];
+                items.sort();
+                let layer = source.board.layer_structure.layers[violation.layer as usize]
+                    .name
+                    .clone();
+                format!(
+                    "{}|{}|{}|{:016x}|{:016x}",
+                    items[0],
+                    items[1],
+                    layer,
+                    violation.expected_clearance.to_bits(),
+                    violation.actual_clearance.to_bits()
+                )
+            })
+            .collect()
+    }
     pub fn connectivity(&self) -> BTreeMap<String, Vec<Vec<i32>>> {
         self.board
             .rules
@@ -566,6 +779,166 @@ impl BoardAdapter {
     }
     pub fn assert_preserved(&self, before: &Self) -> Result<(), String> {
         self.assert_invariants(before, &BTreeSet::new(), true)
+    }
+    /// Validate a fully replayed SES while allowing its routing copper item IDs
+    /// to differ from the source board. Required original copper is compared as
+    /// an exact multiset so duplicate segments cannot disappear unnoticed.
+    pub fn assert_session_invariants(
+        &self,
+        before: &Self,
+        protected: &BTreeSet<String>,
+        strict: bool,
+    ) -> Result<(), String> {
+        fn copper_signature(
+            adapter: &BoardAdapter,
+            item: &fr_engine::board::Item,
+            authorized_drill_upgrade: Option<u64>,
+        ) -> Result<String, String> {
+            let board = &adapter.board;
+            let nets: Vec<_> = item
+                .net_numbers()
+                .iter()
+                .map(|&n| {
+                    board
+                        .rules
+                        .nets
+                        .get(n)
+                        .map(|net| net.name.clone())
+                        .ok_or_else(|| format!("routing copper references unknown net {n:?}"))
+                })
+                .collect::<Result<_, _>>()?;
+            let layers: Vec<_> = (item.first_layer(board)..=item.last_layer(board))
+                .map(|l| board.layer_structure.layers[l as usize].name.as_str())
+                .collect();
+            let geometry = if item.is_trace() {
+                let trace = item.trace();
+                format!(
+                    "trace:{}:{:?}",
+                    canonical_polyline_key(&trace.polyline().corners()),
+                    trace.half_width()
+                )
+            } else {
+                let _ = item.as_via().expect("routing copper is trace or via");
+                format!(
+                    "via:{}:{}",
+                    via_physical_signature(board, item, authorized_drill_upgrade)?,
+                    canonical_point_key(&item.center(board))
+                )
+            };
+            Ok(format!(
+                "{nets:?}|{layers:?}|{geometry}|{:?}|{:?}",
+                item.fixed_state(),
+                item.clearance_class()
+            ))
+        }
+        fn is_protected(
+            adapter: &BoardAdapter,
+            item: &fr_engine::board::Item,
+            protected: &BTreeSet<String>,
+        ) -> Result<bool, String> {
+            for &n in item.net_numbers() {
+                let net = adapter
+                    .board
+                    .rules
+                    .nets
+                    .get(n)
+                    .ok_or_else(|| format!("routing copper references unknown net {n:?}"))?;
+                if protected.contains(&net.name) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        fn add_count(counts: &mut BTreeMap<String, usize>, signature: String) {
+            *counts.entry(signature).or_default() += 1;
+        }
+
+        let mut required = BTreeMap::new();
+        let mut protected_original = BTreeMap::new();
+        for key in before.board.item_repository().iter() {
+            let item = before.board.item(key);
+            if item.is_trace() || item.is_via() {
+                let protected_item = is_protected(before, item, protected)?;
+                if strict || item.fixed_state() != FixedState::Unfixed || protected_item {
+                    add_count(
+                        &mut required,
+                        copper_signature(before, item, self.authorized_drill_upgrade(before, item))?,
+                    );
+                }
+                if protected_item {
+                    add_count(
+                        &mut protected_original,
+                        copper_signature(
+                            before,
+                            item,
+                            self.authorized_drill_upgrade(before, item),
+                        )?,
+                    );
+                }
+                continue;
+            }
+
+            let now_key = self
+                .board
+                .item_repository()
+                .iter()
+                .find(|&candidate| self.board.item(candidate).id() == item.id())
+                .ok_or("original non-routing item removed")?;
+            let now = self.board.item(now_key);
+            if item.board_item_type() != now.board_item_type()
+                || item.component_no() != now.component_no()
+                || item.first_layer(&before.board) != now.first_layer(&self.board)
+                || item.last_layer(&before.board) != now.last_layer(&self.board)
+                || format!("{:?}", before.board.item_tile_shapes(item))
+                    != format!("{:?}", self.board.item_tile_shapes(now))
+                || format!("{:?}", item.kind) != format!("{:?}", now.kind)
+                || item.net_numbers() != now.net_numbers()
+                || item.fixed_state() != now.fixed_state()
+                || item.clearance_class() != now.clearance_class()
+            {
+                return Err("original non-routing entity properties changed".into());
+            }
+        }
+
+        let mut actual_required = BTreeMap::new();
+        let mut protected_actual = BTreeMap::new();
+        for key in self.board.item_repository().iter() {
+            let item = self.board.item(key);
+            if item.is_trace() || item.is_via() {
+                let signature = copper_signature(self, item, None)?;
+                if required.contains_key(&signature) {
+                    add_count(&mut actual_required, signature.clone());
+                }
+                if is_protected(self, item, protected)? {
+                    add_count(&mut protected_actual, signature);
+                }
+            }
+        }
+        if required != actual_required {
+            return Err("required original copper geometry/classification changed".into());
+        }
+        if protected_original != protected_actual {
+            return Err("protected copper changed or acquired new geometry".into());
+        }
+        if !self
+            .session_violations()
+            .is_subset(&self.session_violations_for(before, true))
+        {
+            return Err("new full-board clearance violation".into());
+        }
+        let previous = before.connectivity();
+        let current = self.connectivity();
+        for (net, groups) in previous {
+            for connected in groups {
+                if !current.get(&net).is_some_and(|sets| {
+                    sets.iter()
+                        .any(|set| connected.iter().all(|id| set.contains(id)))
+                }) {
+                    return Err(format!("existing {net} connectivity split"));
+                }
+            }
+        }
+        Ok(())
     }
     pub fn assert_invariants(
         &self,
@@ -958,6 +1331,127 @@ fn checked_size(value: f64) -> Result<i32, String> {
     }
     Ok(v as i32)
 }
+fn source_protected_copper_counts(
+    board: &RoutingBoard,
+) -> Result<BTreeMap<String, usize>, String> {
+    let mut counts = BTreeMap::new();
+    for key in board.item_repository().iter() {
+        let item = board.item(key);
+        if (item.is_trace() || item.is_via())
+            && matches!(item.fixed_state(), FixedState::UserFixed | FixedState::SystemFixed)
+        {
+            *counts
+                .entry(source_copper_signature(board, item)?)
+                .or_default() += 1;
+        }
+    }
+    Ok(counts)
+}
+fn source_copper_signature(
+    board: &RoutingBoard,
+    item: &fr_engine::board::Item,
+) -> Result<String, String> {
+    let nets: Vec<_> = item
+        .net_numbers()
+        .iter()
+        .map(|&net_no| {
+            board
+                .rules
+                .nets
+                .get(net_no)
+                .map(|net| net.name.clone())
+                .ok_or_else(|| format!("routing copper references unknown net {net_no:?}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let layers: Vec<_> = (item.first_layer(board)..=item.last_layer(board))
+        .map(|layer| board.layer_structure.layers[layer as usize].name.as_str())
+        .collect();
+    let geometry = if item.is_trace() {
+        format!(
+            "trace:{}:{:?}",
+            canonical_polyline_key(&item.trace().polyline().corners()),
+            item.trace().half_width()
+        )
+    } else {
+        format!(
+            "via:{}:{}",
+            via_physical_signature(board, item, None)?,
+            canonical_point_key(&item.center(board))
+        )
+    };
+    Ok(format!(
+        "{:?}|{nets:?}|{layers:?}|{geometry}|{:?}|{:?}",
+        item.board_item_type(),
+        item.fixed_state(),
+        item.clearance_class()
+    ))
+}
+fn session_item_signature(
+    board: &RoutingBoard,
+    item: &fr_engine::board::Item,
+    authorized_drill_upgrade: Option<u64>,
+) -> String {
+    let nets: Vec<_> = item
+        .net_numbers()
+        .iter()
+        .map(|&net_no| {
+            board
+                .rules
+                .nets
+                .get(net_no)
+                .map(|net| net.name.clone())
+                .unwrap_or_else(|| format!("unknown:{net_no:?}"))
+        })
+        .collect();
+    let layers: Vec<_> = (item.first_layer(board)..=item.last_layer(board))
+        .map(|layer| board.layer_structure.layers[layer as usize].name.as_str())
+        .collect();
+    let geometry = if item.is_trace() {
+        format!(
+            "trace:{}:{:?}",
+            canonical_polyline_key(&item.trace().polyline().corners()),
+            item.trace().half_width()
+        )
+    } else if item.is_via() {
+        format!(
+            "via:{}:{}",
+            via_physical_signature(board, item, authorized_drill_upgrade)
+                .unwrap_or_else(|_| "invalid-via".into()),
+            canonical_point_key(&item.center(board))
+        )
+    } else {
+        format!("{:?}", board.item_tile_shapes(item))
+    };
+    format!(
+        "{:?}|{nets:?}|{layers:?}|{geometry}|{:?}|{:?}",
+        item.board_item_type(),
+        item.fixed_state(),
+        item.clearance_class()
+    )
+}
+fn via_physical_signature(
+    board: &RoutingBoard,
+    item: &fr_engine::board::Item,
+    authorized_drill_upgrade: Option<u64>,
+) -> Result<String, String> {
+    let via = item.as_via().ok_or("routing item is not a via")?;
+    let padstack = board
+        .library
+        .padstacks
+        .get(via.padstack_no())
+        .ok_or_else(|| format!("via references unknown padstack {}", via.padstack_no()))?;
+    let copper_shapes: Vec<_> = (0..padstack.board_layer_count())
+        .map(|layer| padstack.get_shape(layer).map(|shape| format!("{shape:?}")))
+        .collect();
+    let explicit_drill = padstack
+        .get_explicit_drill_radius()
+        .map(f64::to_bits)
+        .or(authorized_drill_upgrade);
+    Ok(format!(
+        "{}|copper={copper_shapes:?}|explicit_drill_radius={explicit_drill:?}",
+        padstack.name,
+    ))
+}
 fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
@@ -1139,10 +1633,13 @@ fn replay_full_session(board: &mut RoutingBoard, src: &[u8], authorized_vias: &B
         }
     }
     fn trace_signature(net: i32, layer: i32, half: i32, poly: &Polyline) -> String {
-        format!("trace:{net}:{layer}:{half}:{:?}", poly.corners())
+        format!(
+            "trace:{net}:{layer}:{half}:{}",
+            canonical_polyline_key(&poly.corners())
+        )
     }
     fn via_signature(net: i32, pad: i32, point: &Point) -> String {
-        format!("via:{net}:{pad}:{point:?}")
+        format!("via:{net}:{pad}:{}", canonical_point_key(point))
     }
     let mut source_attributes: BTreeMap<String, (i32, FixedState)> = BTreeMap::new();
     let mut purge = Vec::new();

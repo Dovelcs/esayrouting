@@ -216,16 +216,19 @@ fn import_board(
     ses_path: Option<&Path>,
     base: &Path,
     label: &str,
+    native_vias: &[super::evolution_export::NativeViaDrill],
 ) -> Result<BoardAdapter, String> {
     let dsn_path = resolve_manifest_path(base, dsn_path);
     let dsn = read_required(&dsn_path, &format!("{label} DSN"))?;
+    let source_board = BoardAdapter::load(&dsn)
+        .map_err(|e| format!("native seed {label} {}: {e}", dsn_path.display()))?;
+    let via_candidates = native_via_candidates(&source_board, native_vias)?;
     let Some(ses_path) = ses_path else {
-        return BoardAdapter::load(&dsn)
-            .map_err(|e| format!("native seed {label} {}: {e}", dsn_path.display()));
+        return Ok(source_board);
     };
     let ses_path = resolve_manifest_path(base, ses_path);
     let ses = read_required(&ses_path, &format!("{label} session"))?;
-    BoardAdapter::load_session(&dsn, &ses)
+    BoardAdapter::load_session_with_via_candidates(&dsn, &ses, &via_candidates)
         .map_err(|e| format!("native seed {label} {}: {e}", ses_path.display()))
 }
 
@@ -273,15 +276,140 @@ fn restore_native_via_drills(
             ));
         }
         let drill_radius = via.drill_mm * board.units_per_mm / 2.0;
-        board
-            .board
-            .library_mut()
-            .padstacks
-            .get_mut(id)
-            .ok_or("native seed explicit drill padstack mutation failed")?
-            .set_explicit_drill_radius(Some(drill_radius))?;
+        let actual_drill = stack.get_explicit_drill_radius();
+        if actual_drill.is_some_and(|actual| (actual - drill_radius).abs() > 1.0) {
+            return Err(format!(
+                "native seed {label} padstack {} drill differs from explicit metadata",
+                via.padstack
+            ));
+        }
+        if actual_drill.is_none() {
+            board
+                .board
+                .library_mut()
+                .padstacks
+                .get_mut(id)
+                .ok_or("native seed explicit drill padstack mutation failed")?
+                .set_explicit_drill_radius(Some(drill_radius))?;
+        }
     }
     Ok(())
+}
+
+fn native_via_candidates(
+    board: &BoardAdapter,
+    vias: &[super::evolution_export::NativeViaDrill],
+) -> Result<Vec<(String, f64, f64)>, String> {
+    let mut candidates = Vec::new();
+    let mut padstacks = std::collections::BTreeSet::new();
+    for via in vias {
+        if !padstacks.insert(via.padstack.as_str()) {
+            return Err(format!("native seed repeats via padstack metadata for {}", via.padstack));
+        }
+        if !via.diameter_mm.is_finite()
+            || !via.drill_mm.is_finite()
+            || via.diameter_mm <= via.drill_mm
+            || via.drill_mm <= 0.0
+        {
+            return Err(format!("native seed has invalid explicit drill metadata for {}", via.padstack));
+        }
+        if via.nets.is_empty() {
+            return Err("legacy native seed via metadata lacks verified per-net authorization".into());
+        }
+        let radius = (via.diameter_mm * board.units_per_mm / 2.0).round();
+        let drill_diameter = (via.drill_mm * board.units_per_mm).round();
+        if !radius.is_finite()
+            || !drill_diameter.is_finite()
+            || radius <= 0.0
+            || radius > (i32::MAX / 2) as f64
+            || drill_diameter <= 0.0
+            || drill_diameter > i32::MAX as f64
+            || 2.0 * radius <= drill_diameter
+        {
+            return Err(format!("native seed via {} dimensions exceed board resolution", via.padstack));
+        }
+        let generated_name = format!("awx_via_r{}_d{}", radius as i32, drill_diameter as i32);
+        let existing = board.board.library.padstacks.get_by_name(&via.padstack);
+        if via.padstack != generated_name {
+            let Some(stack) = existing else {
+                return Err(format!(
+                    "native seed via padstack {} does not match its verified native dimensions",
+                    via.padstack
+                ));
+            };
+            let stack = board.board.library.padstacks.get(stack.id)
+                .ok_or("native seed source via padstack lookup failed")?;
+            let actual_diameter = (stack.from_layer()..=stack.to_layer())
+                .filter_map(|layer| stack.get_shape(layer))
+                .map(|shape| shape.max_width())
+                .fold(0.0_f64, f64::max) / board.units_per_mm;
+            let actual_drill = stack.get_explicit_drill_radius()
+                .ok_or_else(|| format!("native seed source via {} has no verified drill", via.padstack))?
+                * 2.0 / board.units_per_mm;
+            if (actual_diameter - via.diameter_mm).abs() > 1.0 / board.units_per_mm
+                || (actual_drill - via.drill_mm).abs() > 1.0 / board.units_per_mm
+            {
+                return Err(format!("native seed source padstack {} differs from explicit metadata", via.padstack));
+            }
+            continue;
+        }
+        if let Some(id) = existing {
+            let stack = board.board.library.padstacks.get(id.id)
+                .ok_or("native seed native via padstack lookup failed")?;
+            if let Some(actual) = stack.get_explicit_drill_radius() {
+                let expected = via.drill_mm * board.units_per_mm / 2.0;
+                if (actual - expected).abs() > 1.0 {
+                    return Err(format!("native seed native padstack {} has a conflicting drill", via.padstack));
+                }
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for net in &via.nets {
+            if net.trim().is_empty() || !seen.insert(net) {
+                return Err(format!("native seed via {} has invalid net authorization", via.padstack));
+            }
+            candidates.push((net.clone(), via.diameter_mm, via.drill_mm));
+        }
+    }
+    Ok(candidates)
+}
+
+#[cfg(test)]
+mod seed_scope_regression {
+    use super::native_via_candidates;
+    use crate::board_adapter::BoardAdapter;
+    use crate::awx::evolution_export::NativeViaDrill;
+
+    fn source_board() -> BoardAdapter {
+        BoardAdapter::load(include_bytes!("../../tests/fixtures/two_chip.dsn")).unwrap()
+    }
+
+    #[test]
+    fn prior_inactive_bus_via_is_authorized_only_for_its_exported_net() {
+        let via: NativeViaDrill = toml::from_str(
+            r#"padstack = "awx_via_r300_d300"
+diameter_mm = 0.6
+drill_mm = 0.3
+nets = ["BUS_A"]"#,
+        )
+        .unwrap();
+        let candidates = native_via_candidates(&source_board(), &[via]).unwrap();
+        assert_eq!(candidates, vec![("BUS_A".into(), 0.6, 0.3)]);
+        assert!(!candidates.iter().any(|(net, _, _)| net == "BUS_B"));
+    }
+
+    #[test]
+    fn legacy_drill_only_manifest_does_not_authorize_any_net() {
+        let legacy: NativeViaDrill = toml::from_str(
+            r#"padstack = "awx_via_r300_d300"
+diameter_mm = 0.6
+drill_mm = 0.3"#,
+        )
+        .unwrap();
+        assert!(native_via_candidates(&source_board(), &[legacy])
+            .unwrap_err()
+            .contains("lacks verified per-net authorization"));
+    }
 }
 
 fn parse_pack(path: &Path) -> Result<Value, String> {
@@ -1069,17 +1197,23 @@ impl<B: NativeEvolutionBackend> EvolutionOperators<NativeWorld> for NativeEvolut
             .map_err(|e| format!("native seed routed DSN {}: {e}", routed_dsn.display()))?;
         let fanout_source_dsn = fs::canonicalize(&fanout_dsn)
             .map_err(|e| format!("native seed fanout DSN {}: {e}", fanout_dsn.display()))?;
+        // Authorize only net/padstack associations captured from the complete
+        // exported routed/fanout boards. Legacy drill metadata without these
+        // associations remains parseable, but cannot authorize new SES copper.
+        let native_vias = manifest.native_vias.as_deref().unwrap_or(&[]);
         let mut routed = import_board(
             &routed_dsn,
             manifest.routed_ses.as_deref(),
             manifest_dir,
             "routed",
+            native_vias,
         )?;
         let mut fanout = import_board(
             &fanout_dsn,
             manifest.fanout_ses.as_deref(),
             manifest_dir,
             "fanout",
+            native_vias,
         )?;
         if let Some(native_vias) = manifest.native_vias.as_deref() {
             restore_native_via_drills(&mut routed, native_vias, "routed")?;

@@ -157,6 +157,22 @@ fn names(groups: &[&RouteGroup]) -> BTreeSet<String> {
     groups.iter().flat_map(|g| g.nets.iter().cloned()).collect()
 }
 
+fn effective_chain_round_limit(fanout_rounds: &[usize], route_ladder_rounds: usize) -> usize {
+    // These are two caps on the original route_bus -> whole_route.chain outer
+    // fanout loop. The per-group value and global ladder setting both apply.
+    fanout_rounds
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .min(route_ladder_rounds)
+        .max(1)
+}
+
+fn effective_geometry_round_limit(geometry_rounds: &[usize]) -> usize {
+    geometry_rounds.iter().copied().max().unwrap_or(1).max(1)
+}
+
 fn filter_groups_to_nets(groups: &[&RouteGroup], selected: &BTreeSet<String>) -> Vec<RouteGroup> {
     let selected_short: BTreeSet<_> = selected
         .iter()
@@ -597,12 +613,19 @@ pub fn execute(
             let allow_unproved = groups
                 .iter()
                 .all(|g| g.awx.as_ref().is_some_and(|a| a.allow_unproved));
-            let max_rounds = groups
+            let fanout_rounds: Vec<_> = groups
                 .iter()
                 .filter_map(|g| g.awx.as_ref().map(|a| a.fanout_rounds))
-                .max()
-                .unwrap_or(1)
-                .max(1);
+                .collect();
+            let max_rounds = effective_chain_round_limit(
+                &fanout_rounds,
+                runtime_spec
+                    .awx
+                    .as_ref()
+                    .ok_or("missing AWX configuration")?
+                    .route_ladder
+                    .rounds,
+            );
             let mut feedback = EndsFeedback::default();
             let mut previous: Option<(JointPlan, JointPlan)> = None;
             let mut best: Option<(
@@ -792,6 +815,11 @@ pub fn execute(
                 }
                 let routed_groups_owned = filter_groups_to_nets(&groups, &selected_requested);
                 let routed_groups: Vec<_> = routed_groups_owned.iter().collect();
+                let geometry_rounds: Vec<_> = routed_groups
+                    .iter()
+                    .filter_map(|group| group.awx.as_ref().map(|awx| awx.geometry_rounds))
+                    .collect();
+                let geometry_round_limit = effective_geometry_round_limit(&geometry_rounds);
                 if selected_requested.is_empty() {
                     let grade =
                         native_execution::grade(&transaction_base, &fanout, &selected_requested)?;
@@ -863,7 +891,7 @@ pub fn execute(
                     &source_menus,
                     &destination_menus,
                     &round_drills,
-                    ladder.rounds(),
+                    geometry_round_limit,
                     deadline,
                 )?;
                 runtime_events.whole_rounds = Some(
@@ -1283,4 +1311,19 @@ pub fn execute(
         deferred_nets,
         seed_captures,
     })
+}
+
+#[cfg(test)]
+mod round_budget_tests {
+    use super::{effective_chain_round_limit, effective_geometry_round_limit};
+
+    #[test]
+    fn chain_cap_and_geometry_budget_control_distinct_loops() {
+        let fanout_rounds = [5, 4];
+        let geometry_rounds = [2, 7];
+
+        assert_eq!(effective_chain_round_limit(&fanout_rounds, 3), 3);
+        assert_eq!(effective_geometry_round_limit(&geometry_rounds), 7);
+        assert_eq!(effective_chain_round_limit(&fanout_rounds, 8), 5);
+    }
 }

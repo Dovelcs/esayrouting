@@ -53,6 +53,7 @@ impl BasicBoard {
             crate::ids::LayerNo,
             crate::ids::LayerNo,
         )],
+        transaction_owned: &std::collections::BTreeSet<ItemKey>,
     ) -> Result<(), String> {
         let mut found = vec![0usize; moves.len()];
         let keys = self.get_traces();
@@ -96,8 +97,11 @@ impl BasicBoard {
                 pieces.push((a, b, target));
             }
             if any_change {
-                if fixed == crate::ids::FixedState::SystemFixed {
-                    return Err("AWX relayer: cannot split a system-fixed trace".into());
+                if fixed == crate::ids::FixedState::SystemFixed || self.item(key).component_no() > 0 {
+                    return Err("AWX relayer: cannot split source-protected trace".into());
+                }
+                if fixed >= crate::ids::FixedState::UserFixed && !transaction_owned.contains(&key) {
+                    return Err("AWX relayer: UserFixed trace lacks transaction ownership".into());
                 }
                 replacements.push((key, pieces, width, nets, clearance, fixed));
             }
@@ -109,6 +113,11 @@ impl BasicBoard {
             );
         }
         for (key, pieces, width, nets, clearance, fixed) in replacements {
+            // Only exact items authorized by the caller can have UserFixed lowered.
+            if self.item(key).is_user_fixed() && transaction_owned.contains(&key) {
+                self.item_mut(key)
+                    .set_fixed_state(crate::ids::FixedState::Unfixed);
+            }
             self.remove_item(key);
             if self.item(key).is_on_board() {
                 return Err("AWX relayer: native trace could not be removed".into());
@@ -159,6 +168,7 @@ impl BasicBoard {
     pub fn remove_relayer_vias(
         &mut self,
         vias: &[(crate::ids::NetNo, fr_geom::Point)],
+        transaction_owned: &std::collections::BTreeSet<ItemKey>,
     ) -> Result<(), String> {
         let mut keys = Vec::new();
         for (net, point) in vias {
@@ -173,10 +183,24 @@ impl BasicBoard {
             if matches.len() != 1 {
                 return Err("AWX relayer: via identity at selected net/center is ambiguous".into());
             }
+            if !transaction_owned.contains(&matches[0]) {
+                return Err("AWX relayer: selected via lacks transaction ownership".into());
+            }
             keys.push(matches[0]);
         }
-        if !self.remove_items(keys.iter().copied()) {
-            return Err("AWX relayer: native via could not be removed".into());
+        for &key in &keys {
+            let item = self.item(key);
+            if item.component_no() > 0 || item.fixed_state() == crate::ids::FixedState::SystemFixed {
+                return Err("AWX relayer: selected via is source-protected".into());
+            }
+            if item.is_user_fixed() && transaction_owned.contains(&key) {
+                self.item_mut(key)
+                    .set_fixed_state(crate::ids::FixedState::Unfixed);
+            }
+            self.remove_item(key);
+            if self.item(key).is_on_board() {
+                return Err("AWX relayer: native via could not be removed".into());
+            }
         }
         if keys.iter().any(|key| self.item(*key).is_on_board()) {
             return Err("AWX relayer: native via remains on board after removal".into());

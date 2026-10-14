@@ -877,7 +877,7 @@ fn route_remaining(
     Ok((rejected, false))
 }
 
-fn route_remaining_parallel(
+fn route_remaining_unconstrained_parallel(
     trial: &mut BoardAdapter,
     spec: &RouteSpec,
     protected: &BTreeSet<String>,
@@ -896,44 +896,21 @@ fn route_remaining_parallel(
         }
     });
     for pass in 1..=8 {
-        if stop.is_stop_requested() || Instant::now() >= deadline {
-            break;
-        }
+        if stop.is_stop_requested() || Instant::now() >= deadline { break; }
         let mut attempt = best.clone();
-        let frozen: Vec<_> = attempt
-            .board
-            .item_repository()
-            .iter()
-            .filter(|&k| {
-                let i = attempt.board.item(k);
-                (i.is_trace() || i.is_via())
-                    && i.net_numbers().iter().any(|&n| {
-                        attempt
-                            .board
-                            .rules
-                            .nets
-                            .get(n)
-                            .is_some_and(|net| protected.contains(&net.name))
-                    })
+        let frozen: Vec<_> = attempt.board.item_repository().iter()
+            .filter(|&key| {
+                let item = attempt.board.item(key);
+                (item.is_trace() || item.is_via()) && item.net_numbers().iter().any(|&n| {
+                    attempt.board.rules.nets.get(n).is_some_and(|net| protected.contains(&net.name))
+                })
             })
-            .map(|k| {
-                (
-                    attempt.board.item(k).id(),
-                    attempt.board.item(k).fixed_state(),
-                )
-            })
+            .map(|key| (attempt.board.item(key).id(), attempt.board.item(key).fixed_state()))
             .collect();
         for (id, previous_state) in &frozen {
-            let key = attempt
-                .board
-                .item_repository()
-                .iter()
-                .find(|&k| attempt.board.item(k).id() == *id);
-            if let Some(k) = key {
-                attempt
-                    .board
-                    .item_mut(k)
-                    .set_fixed_state((*previous_state).max(fr_engine::ids::FixedState::UserFixed));
+            let key = { attempt.board.item_repository().iter().find(|&key| attempt.board.item(key).id() == *id) };
+            if let Some(key) = key {
+                attempt.board.item_mut(key).set_fixed_state((*previous_state).max(fr_engine::ids::FixedState::UserFixed));
             }
         }
         let mut settings = RouterSettings::default();
@@ -944,51 +921,263 @@ fn route_remaining_parallel(
         router.enhancements = true;
         router.suppress_net_rip = true;
         router.skip_items = Some(
-            attempt
-                .board
-                .item_repository()
-                .iter()
-                .filter(|&k| {
-                    attempt.board.item(k).net_numbers().iter().any(|&n| {
-                        attempt
-                            .board
-                            .rules
-                            .nets
-                            .get(n)
-                            .is_some_and(|net| protected.contains(&net.name))
-                    })
-                })
-                .map(|k| attempt.board.item(k).id().0)
+            attempt.board.item_repository().iter()
+                .filter(|&key| attempt.board.item(key).net_numbers().iter().any(|&n| {
+                    attempt.board.rules.nets.get(n).is_some_and(|net| protected.contains(&net.name))
+                }))
+                .map(|key| attempt.board.item(key).id().0)
                 .collect(),
         );
         let (attempted, _) = router.autoroute_pass(&mut attempt.board, &settings, pass, &stop);
         for (id, state) in &frozen {
-            let key = attempt
-                .board
-                .item_repository()
-                .iter()
-                .find(|&k| attempt.board.item(k).id() == *id);
-            if let Some(k) = key {
-                attempt.board.item_mut(k).set_fixed_state(*state);
-            }
+            let key = { attempt.board.item_repository().iter().find(|&key| attempt.board.item(key).id() == *id) };
+            if let Some(key) = key { attempt.board.item_mut(key).set_fixed_state(*state); }
         }
-        let exhausted = Instant::now() >= deadline;
         match attempt.assert_invariants(&before, protected, false) {
             Ok(()) => {
                 if routing_snapshot(&attempt) == routing_snapshot(&best) {
-                    rejected.push(format!(
-                        "parallel_pass_{pass}: validated attempt contained no routing increment"
-                    ));
+                    rejected.push(format!("parallel_pass_{pass}: validated attempt contained no routing increment"));
                 }
                 best = attempt;
             }
-            Err(e) => rejected.push(format!("parallel_pass_{pass}: {e}")),
+            Err(error) => rejected.push(format!("parallel_pass_{pass}: {error}")),
         }
-        if exhausted
-            || !attempted
-            || fr_engine::pipeline::stats::incomplete_count(&best.board, None) == 0
-        {
-            break;
+        if !attempted || fr_engine::pipeline::stats::incomplete_count(&best.board, None) == 0 { break; }
+    }
+    let _ = tx.send(());
+    let _ = timer.join();
+    let exhausted = Instant::now() >= deadline;
+    best.assert_invariants(&before, protected, false)?;
+    *trial = best;
+    Ok((rejected, exhausted))
+}
+
+fn remaining_channel_areas(board: &BoardAdapter, region: &crate::spec::ChannelRegion) -> Result<Vec<fr_geom::Area>, String> {
+    match region {
+        crate::spec::ChannelRegion::Rectangle { min, max } => {
+            let lo = board.point(*min)?.to_float();
+            let hi = board.point(*max)?.to_float();
+            Ok(vec![fr_geom::Area::Shape(fr_geom::Shape::Tile(fr_geom::TileShape::IntBox(
+                fr_geom::IntBox::new(lo.x.floor() as i32, lo.y.floor() as i32, hi.x.ceil() as i32, hi.y.ceil() as i32),
+            )))])
+        }
+        crate::spec::ChannelRegion::Polyline { points, width_mm } => {
+            let half_width = width_mm / 2.0;
+            if points.len() < 2 || !half_width.is_finite() || half_width <= 0.0 {
+                return Err("reserved polyline channel has insufficient geometry".into());
+            }
+            let mut areas = Vec::new();
+            let radius = (half_width * board.units_per_mm).ceil() as i32;
+            for point in points {
+                let center = match board.point(*point)? {
+                    fr_geom::Point::Int(point) => point,
+                    _ => return Err("reserved polyline channel point is not native integer geometry".into()),
+                };
+                areas.push(fr_geom::Area::Shape(fr_geom::Shape::Circle(fr_geom::Circle::new(center, radius))));
+            }
+            for segment in points.windows(2) {
+                let mut left = crate::awx::pairs::offset_polyline(segment, half_width);
+                let mut right = crate::awx::pairs::offset_polyline(segment, -half_width);
+                right.reverse();
+                left.extend(right);
+                let corners: Vec<_> = left.into_iter().map(|point| board.point(point)).collect::<Result<_, _>>()?;
+                let polygon = fr_geom::PolygonShape::from_points(&corners);
+                if fr_geom::PolylineShapeImpl::dimension(&polygon) >= 2 {
+                    areas.push(fr_geom::Area::Shape(fr_geom::Shape::Polygon(polygon)));
+                }
+            }
+            Ok(areas)
+        }
+    }
+}
+
+fn route_remaining_parallel(
+    trial: &mut BoardAdapter,
+    spec: &RouteSpec,
+    protected: &BTreeSet<String>,
+    deadline: Instant,
+) -> Result<(Vec<String>, bool), String> {
+    let eligible: BTreeSet<_> = trial.board.rules.nets.iter()
+        .filter(|net| !protected.contains(&net.name))
+        .map(|net| net.name.clone())
+        .collect();
+    let has_net_rules = spec.nets.iter().any(|rule| eligible.contains(&rule.name));
+    let has_foreign_channels = spec.groups.iter().any(|owner| {
+        owner.channels.iter().any(|channel| eligible.iter().any(|net| {
+            !owner.nets.contains(net)
+                && !spec.groups.iter().any(|group| group.nets.contains(net) && group.channels.contains(channel))
+        }))
+    });
+    if !has_net_rules && !has_foreign_channels {
+        return route_remaining_unconstrained_parallel(trial, spec, protected, deadline);
+    }
+    let before = trial.clone();
+    let mut best = trial.clone();
+    let mut rejected = Vec::new();
+    let stop = StopToken::new();
+    let token = stop.clone();
+    let (tx, rx) = mpsc::channel();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timer = std::thread::spawn(move || {
+        if rx.recv_timeout(remaining).is_err() {
+            token.request_stop();
+        }
+    });
+    let nets: Vec<_> = best.board.rules.nets.iter()
+        .filter(|net| !protected.contains(&net.name))
+        .map(|net| (net.net_number, net.name.clone()))
+        .collect();
+    for pass in 1..=8 {
+      if stop.is_stop_requested() || Instant::now() >= deadline { break; }
+      let mut attempted_any = false;
+      for (net_no, name) in &nets {
+        if stop.is_stop_requested() || Instant::now() >= deadline { break; }
+        let connectable = best.board.get_connectable_items(*net_no);
+        if fr_engine::drc::NetIncompletes::new(&best.board, *net_no, &connectable).count() == 0 {
+            continue;
+        }
+        let rule = spec.nets.iter().find(|rule| rule.name == *name);
+        let mut settings = RouterSettings::default();
+        settings.set_layer_count(best.board.layer_count() as usize);
+        settings.strict_drc = Some(true);
+        if let Some(rule) = rule {
+            settings.vias_allowed = Some(rule.via_budget != Some(0));
+            for (index, layer) in best.board.layer_structure.layers.iter().enumerate() {
+                settings.set_layer_active(index, rule.allowed_layers.contains(&layer.name));
+            }
+        }
+            let mut attempt = best.clone();
+            let frozen: Vec<_> = attempt.board.item_repository().iter()
+                .filter(|&key| {
+                    let item = attempt.board.item(key);
+                    (item.is_trace() || item.is_via()) && item.net_numbers().iter().any(|&number| {
+                        attempt.board.rules.nets.get(number)
+                            .is_some_and(|net| protected.contains(&net.name))
+                    })
+                })
+                .map(|key| (attempt.board.item(key).id(), attempt.board.item(key).fixed_state()))
+                .collect();
+            for (id, state) in &frozen {
+                let key = {
+                    attempt.board.item_repository().iter()
+                        .find(|&key| attempt.board.item(key).id() == *id)
+                };
+                if let Some(key) = key {
+                    attempt.board.item_mut(key)
+                        .set_fixed_state((*state).max(fr_engine::ids::FixedState::UserFixed));
+                }
+            }
+            let class_id = attempt.board.rules.nets.get(*net_no)
+                .ok_or_else(|| format!("remaining net {name} disappeared from board rules"))?
+                .get_net_class();
+            let original_class = attempt.board.rules.net_classes[class_id].clone();
+            if let Some(rule) = rule {
+                let half_width = (rule.width_mm * attempt.units_per_mm / 2.0).ceil();
+                if !half_width.is_finite() || half_width <= 0.0 || half_width > 10_000_000.0 {
+                    return Err(format!("invalid deferred trace width for net {name}"));
+                }
+                let net_class = &mut attempt.board.rules_mut().net_classes[class_id];
+                net_class.set_trace_half_width(half_width as i32);
+                net_class.no_neckdown = true;
+                let desired = (rule.clearance_mm * attempt.units_per_mm).ceil() as i32;
+                let base = net_class.get_trace_clearance_class();
+                let class_name = format!("fr_agent_remaining_{net_no}_{desired}");
+                let layer_count = attempt.board.layer_count();
+                let matrix = &mut attempt.board.rules_mut().clearance_matrix;
+                let clearance_class = if matrix.get_no(&class_name) >= 0 {
+                    matrix.get_no(&class_name)
+                } else {
+                    matrix.append_class(&class_name);
+                    let created = matrix.get_no(&class_name);
+                    for layer in 0..layer_count {
+                        for other in 0..created {
+                            let old = matrix.get_value(base, other, layer, false)
+                                .max(matrix.get_value(other, base, layer, false));
+                            matrix.set_value(created, other, layer, old.max(desired));
+                            matrix.set_value(other, created, layer, old.max(desired));
+                        }
+                    }
+                    created
+                };
+                attempt.board.rules_mut().net_classes[class_id].set_trace_clearance_class(clearance_class);
+            }
+            let channel_ids: BTreeSet<_> = spec.groups.iter()
+                .filter(|group| group.nets.contains(name))
+                .flat_map(|group| group.channels.iter().cloned())
+                .collect();
+            let mut channel_obstacles = Vec::new();
+            for channel in spec.channels.iter().filter(|channel| {
+                !channel_ids.contains(&channel.id)
+                    && spec.groups.iter().any(|group| {
+                        !group.nets.contains(name) && group.channels.contains(&channel.id)
+                    })
+            }) {
+                let areas = remaining_channel_areas(&attempt, &channel.region)?;
+                for area in areas {
+                    for layer in 0..attempt.board.layer_count() {
+                        channel_obstacles.push(attempt.board.insert_obstacle(
+                            area.clone(), layer, 1, fr_engine::ids::FixedState::UserFixed,
+                        ));
+                    }
+                }
+            }
+            let mut router = BatchAutorouter::for_job(&attempt.board, &settings);
+            router.net_filter = Some([*net_no].into_iter().collect());
+            router.pass_threads = spec.execution.threads;
+            router.enhancements = true;
+            router.suppress_net_rip = true;
+            router.skip_items = Some(
+                attempt.board.item_repository().iter()
+                    .filter(|&key| attempt.board.item(key).net_numbers().iter().any(|&number| {
+                        attempt.board.rules.nets.get(number)
+                            .is_some_and(|net| protected.contains(&net.name))
+                    }))
+                    .map(|key| attempt.board.item(key).id().0)
+                    .collect(),
+            );
+            let (attempted, _) = router.autoroute_pass(&mut attempt.board, &settings, pass, &stop);
+            attempted_any |= attempted;
+            for key in channel_obstacles {
+                attempt.board.item_mut(key).unfix();
+                attempt.board.remove_item(key);
+            }
+            for (id, state) in &frozen {
+                let key = {
+                    attempt.board.item_repository().iter()
+                        .find(|&key| attempt.board.item(key).id() == *id)
+                };
+                if let Some(key) = key {
+                    attempt.board.item_mut(key).set_fixed_state(*state);
+                }
+            }
+            attempt.board.rules_mut().net_classes[class_id] = original_class;
+            if let Some(limit) = rule.and_then(|rule| rule.via_budget) {
+                let via_count = attempt.board.get_vias().into_iter()
+                    .filter(|&key| attempt.board.item(key).contains_net(*net_no)).count();
+                if via_count > limit as usize {
+                    rejected.push(format!("{name}: constrained attempt exceeded via budget {limit}"));
+                    continue;
+                }
+            }
+            match attempt.assert_invariants(&before, protected, false) {
+                Ok(()) => {
+                    if routing_snapshot(&attempt) == routing_snapshot(&best) {
+                        rejected.push(format!("{name}: validated attempt contained no routing increment"));
+                    } else {
+                        best = attempt;
+                    }
+                }
+                Err(error) => rejected.push(format!("{name}: {error}")),
+            }
+      }
+      if !attempted_any || fr_engine::pipeline::stats::incomplete_count(&best.board, None) == 0 {
+          break;
+      }
+    }
+    for (net_no, name) in &nets {
+        let connectable = best.board.get_connectable_items(*net_no);
+        if fr_engine::drc::NetIncompletes::new(&best.board, *net_no, &connectable).count() > 0 {
+            rejected.push(format!("{name}: remains incomplete after eight constrained autoroute passes"));
         }
     }
     let _ = tx.send(());
@@ -998,6 +1187,124 @@ fn route_remaining_parallel(
     *trial = best;
     Ok((rejected, exhausted))
 }
+
+fn merge_requested_scope(seed: &RouteSpec, requested: &RouteSpec) -> Result<RouteSpec, String> {
+    let mut merged = seed.clone();
+    for requested_rule in &requested.nets {
+        if let Some(seed_rule) = merged.nets.iter().find(|rule| rule.name == requested_rule.name) {
+            if seed_rule.width_mm.to_bits() != requested_rule.width_mm.to_bits()
+                || seed_rule.clearance_mm.to_bits() != requested_rule.clearance_mm.to_bits()
+                || seed_rule.allowed_layers.iter().collect::<BTreeSet<_>>()
+                    != requested_rule.allowed_layers.iter().collect::<BTreeSet<_>>()
+                || seed_rule.via_budget != requested_rule.via_budget
+                || seed_rule.max_length_mm.map(f64::to_bits) != requested_rule.max_length_mm.map(f64::to_bits)
+                || seed_rule.protected != requested_rule.protected
+            {
+                return Err(format!("seed and controller hard rules conflict for net {}", requested_rule.name));
+            }
+        } else {
+            merged.nets.push(requested_rule.clone());
+        }
+    }
+    for requested_group in &requested.groups {
+        if let Some(seed_group) = merged.groups.iter_mut().find(|group| group.id == requested_group.id) {
+            if seed_group.priority != requested_group.priority || seed_group.joint_escape != requested_group.joint_escape {
+                return Err(format!("seed and controller group settings conflict for {}", requested_group.id));
+            }
+            let mut awx_pairs_to_add = Vec::new();
+            if let (Some(seed_awx), Some(requested_awx)) = (&seed_group.awx, &requested_group.awx) {
+                if seed_awx.source != requested_awx.source
+                    || seed_awx.destination != requested_awx.destination
+                    || seed_awx.routing_layers != requested_awx.routing_layers
+                    || seed_awx.fanout_rounds != requested_awx.fanout_rounds
+                    || seed_awx.geometry_rounds != requested_awx.geometry_rounds
+                    || seed_awx.allow_unproved != requested_awx.allow_unproved
+                {
+                    return Err(format!("seed and controller AWX settings conflict for group {}", requested_group.id));
+                }
+                for requested_pair in &requested_awx.pairs {
+                    if let Some(seed_pair) = seed_awx.pairs.iter().find(|pair| pair.base == requested_pair.base) {
+                        if seed_pair.p != requested_pair.p || seed_pair.n != requested_pair.n {
+                            return Err(format!("seed and controller AWX pair conflicts for {}", requested_pair.base));
+                        }
+                    } else {
+                        awx_pairs_to_add.push(requested_pair.clone());
+                    }
+                }
+            } else if seed_group.awx.is_none() {
+                seed_group.awx = requested_group.awx.clone();
+            }
+            if let Some(seed_awx) = seed_group.awx.as_mut() {
+                seed_awx.pairs.extend(awx_pairs_to_add);
+            }
+            for name in &requested_group.nets {
+                if !seed_group.nets.contains(name) { seed_group.nets.push(name.clone()); }
+            }
+            for id in &requested_group.endpoint_groups {
+                if !seed_group.endpoint_groups.contains(id) { seed_group.endpoint_groups.push(id.clone()); }
+            }
+            for id in &requested_group.channels {
+                if !seed_group.channels.contains(id) { seed_group.channels.push(id.clone()); }
+            }
+            for id in &requested_group.depends_on {
+                if !seed_group.depends_on.contains(id) { seed_group.depends_on.push(id.clone()); }
+            }
+        } else {
+            merged.groups.push(requested_group.clone());
+        }
+    }
+    for requested_channel in &requested.channels {
+        if let Some(seed_channel) = merged.channels.iter().find(|channel| channel.id == requested_channel.id) {
+            if serde_json::to_value(&seed_channel.region).ok() != serde_json::to_value(&requested_channel.region).ok() {
+                return Err(format!("seed and controller channel rules conflict for {}", requested_channel.id));
+            }
+        } else {
+            merged.channels.push(requested_channel.clone());
+        }
+    }
+    for requested_endpoints in &requested.endpoint_groups {
+        if let Some(seed_endpoints) = merged.endpoint_groups.iter_mut().find(|group| group.id == requested_endpoints.id) {
+            for endpoint in &requested_endpoints.endpoints {
+                if let Some(existing) = seed_endpoints.endpoints.iter().find(|known| known.chip == endpoint.chip && known.pad == endpoint.pad) {
+                    if existing.net != endpoint.net {
+                        return Err(format!("seed and controller endpoint rules conflict for {}.{}", endpoint.chip, endpoint.pad));
+                    }
+                } else {
+                    seed_endpoints.endpoints.push(endpoint.clone());
+                }
+            }
+        } else {
+            merged.endpoint_groups.push(requested_endpoints.clone());
+        }
+    }
+    for protected in &requested.protected_nets {
+        if !merged.protected_nets.contains(protected) { merged.protected_nets.push(protected.clone()); }
+    }
+    Ok(merged)
+}
+
+fn verify_all_requested_rules(board: &BoardAdapter, spec: &RouteSpec) -> Result<(), String> {
+    let groups = ordered_groups(spec)?;
+    if !groups.is_empty() {
+        crate::awx::integration::verify_requested(board, spec, &groups)?;
+    }
+    let grouped_nets: BTreeSet<_> = spec.groups.iter().flat_map(|group| group.nets.iter().cloned()).collect();
+    for rule in spec.nets.iter().filter(|rule| !grouped_nets.contains(&rule.name)) {
+        let group = crate::spec::RouteGroup {
+            id: format!("__net_rule_verification__{}", rule.name),
+            nets: vec![rule.name.clone()],
+            endpoint_groups: Vec::new(),
+            channels: Vec::new(),
+            priority: 0,
+            depends_on: Vec::new(),
+            joint_escape: false,
+            awx: None,
+        };
+        crate::awx::integration::verify_requested(board, spec, &[&group])?;
+    }
+    Ok(())
+}
+
 pub fn run(loaded: &LoadedSpec, dry_run: bool) -> Result<ExecutionReport, String> {
     loaded.spec.validate().map_err(|e| e.to_string())?;
     let evolve_enabled = loaded
@@ -1248,10 +1555,6 @@ fn run_awx(loaded: &LoadedSpec, dry_run: bool) -> Result<ExecutionReport, String
         remaining_spec.protected_nets = awx.protected.iter().cloned().collect();
         // The whole transaction has already certified every requested net.
         // Remaining native routing freezes that copper and never substitutes it.
-        remaining_spec.groups.clear();
-        remaining_spec.nets.clear();
-        remaining_spec.channels.clear();
-        remaining_spec.endpoint_groups.clear();
         let result = route_remaining_parallel(&mut trial, &remaining_spec, &awx.protected, deadline)?;
         rejected = result.0;
         exhausted = result.1;
@@ -1259,6 +1562,9 @@ fn run_awx(loaded: &LoadedSpec, dry_run: bool) -> Result<ExecutionReport, String
     trial.assert_invariants_with_moved_components(
         &board, &loaded.spec.protected_names(), false, &awx.moved_components,
     )?;
+    if !discovery_only {
+        verify_all_requested_rules(&trial, &loaded.spec)?;
+    }
     if !awx.moved_components.is_empty() {
         verify_placement_session_replay(&source_dsn, &trial, &awx.moved_components)?;
     }
@@ -1390,6 +1696,7 @@ fn run_awx_evolution(loaded: &LoadedSpec, dry_run: bool, start: Instant) -> Resu
     // The seed manifest carries the actual route scope. A source-compatible
     // evolve job can therefore leave groups/nets empty in its input TOML.
     let route_spec = &evolution.best.data.spec;
+    let requested_spec = merge_requested_scope(route_spec, spec)?;
     let mut trial = evolution.best.data.routed.clone();
     let selected: BTreeSet<_> = route_spec.nets.iter().map(|net|net.name.clone()).collect();
     let mut protected_for_remaining = spec.protected_names();
@@ -1399,26 +1706,19 @@ fn run_awx_evolution(loaded: &LoadedSpec, dry_run: bool, start: Instant) -> Resu
     let mut deadline_exhausted = Instant::now() >= start + Duration::from_millis(spec.execution.budget_ms);
     let mut remaining_ran = false;
     if spec.route_remaining && !deadline_exhausted {
-        let mut remaining_spec=route_spec.clone();
+        let mut remaining_spec=requested_spec.clone();
         remaining_spec.route_remaining=spec.route_remaining;
         remaining_spec.allow_partial_output=spec.allow_partial_output;
         remaining_spec.execution=spec.execution.clone();
         remaining_spec.protected_nets=protected.iter().cloned().collect();
-        remaining_spec.groups.clear();
-        remaining_spec.nets.clear();
-        remaining_spec.channels.clear();
-        remaining_spec.endpoint_groups.clear();
         let result=route_remaining_parallel(&mut trial,&remaining_spec,&protected,start+Duration::from_millis(spec.execution.budget_ms))?;
         rejected_net_attempts=result.0;
         deadline_exhausted=result.1;
         remaining_ran=true;
     }
     trial.assert_invariants(&base_board,&protected_for_remaining,false)?;
-    if !route_spec.groups.is_empty() {
-        let groups=ordered_groups(route_spec)?;
-        crate::awx::integration::verify_requested(&trial,route_spec,&groups)?;
-    }
-    let grade=evolution_native::grade_board(&trial,route_spec)?;
+    verify_all_requested_rules(&trial, &requested_spec)?;
+    let grade=evolution_native::grade_board(&trial,&requested_spec)?;
     let remaining_incomplete=fr_engine::pipeline::stats::incomplete_count(&trial.board,None);
     let success=grade.opens.is_empty() && grade.drc==0 && !deadline_exhausted
         && (!remaining_ran || remaining_incomplete==0);
@@ -1508,7 +1808,7 @@ fn run_awx_evolution(loaded: &LoadedSpec, dry_run: bool, start: Instant) -> Resu
         }
     }
 
-    let mut rules=route_spec.structure_reports();
+    let mut rules=requested_spec.structure_reports();
     for rule in &mut rules {
         if rule.rule=="route_remaining" && !remaining_ran {
             rule.status=crate::spec::RuleStatus::Supported;
@@ -1530,7 +1830,7 @@ fn run_awx_evolution(loaded: &LoadedSpec, dry_run: bool, start: Instant) -> Resu
         drc_violations:grade.drc,
         vias:grade.vias,
     };
-    let routed_groups=if success {ordered_groups(route_spec)?.iter().map(|group|group.id.clone()).collect()} else {Vec::new()};
+    let routed_groups=if success {ordered_groups(&requested_spec)?.iter().map(|group|group.id.clone()).collect()} else {Vec::new()};
     Ok(ExecutionReport {
         success,
         output_committed:committed,
@@ -1575,7 +1875,23 @@ fn verify_placement_session_replay(
     expected: &BoardAdapter,
     moved_components: &std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
-    let replay = BoardAdapter::load_session(source_dsn, &expected.ses())?;
+    // Recover only true, explicit physical dimensions from the expected native board.
+    // These candidates authorize SES padstacks before replay; the serialized SES itself
+    // never supplies trusted via dimensions or net authorization.
+    let mut via_candidates = Vec::new();
+    for key in expected.board.get_vias() {
+        let item = expected.board.item(key);
+        let net = item.net_numbers().iter().find_map(|&n| expected.board.rules.nets.get(n).map(|rule| rule.name.clone()))
+            .ok_or("placement replay via has no net")?;
+        let pad = item.padstack(&expected.board).ok_or("placement replay via has no padstack")?;
+        // Source-DSN vias are already authorized by their native net-class rule;
+        // only explicitly drilled native additions can be registered as candidates.
+        let Some(drill) = pad.get_explicit_drill_radius() else { continue };
+        let diameter = (pad.from_layer()..=pad.to_layer()).filter_map(|layer| pad.get_shape(layer))
+            .map(|shape| shape.max_width()).fold(0.0_f64, f64::max);
+        via_candidates.push((net, diameter / expected.units_per_mm, 2.0 * drill / expected.units_per_mm));
+    }
+    let replay = BoardAdapter::load_session_with_via_candidates(source_dsn, &expected.ses(), &via_candidates)?;
     let scale = expected.units_per_mm;
     for reference in moved_components {
         let a = expected.board.components.get_by_name(reference)
@@ -1770,4 +2086,116 @@ pub fn two_terminal_path_length(board: &BoardAdapter, name: &str) -> Result<f64,
         return Err("max_length_mm endpoint path disconnected".into());
     }
     Ok(distance[end])
+}
+
+#[cfg(test)]
+mod execution_seed_regression_tests {
+    use super::*;
+    use crate::spec::{Channel, ChannelRegion, Execution, RouteGroup};
+
+    #[test]
+    fn swept_l_channel_obstacle_leaves_its_bounding_box_corner_free() {
+        let board = BoardAdapter::load(include_bytes!("../tests/fixtures/two_chip.dsn"))
+            .expect("fixture loads");
+        let areas = remaining_channel_areas(
+            &board,
+            &ChannelRegion::Polyline {
+                points: vec![[2.0, 2.0], [8.0, 2.0], [8.0, 8.0]],
+                width_mm: 2.0,
+            },
+        )
+        .expect("native swept polyline area");
+        let inside_arm = board.point([5.0, 2.0]).unwrap().to_float();
+        let rounded_cap = board.point([8.5, 2.0]).unwrap().to_float();
+        let free_corner = board.point([3.0, 7.0]).unwrap().to_float();
+        assert!(areas.iter().any(|area| area.contains_float(&inside_arm)));
+        assert!(areas.iter().any(|area| area.contains_float(&rounded_cap)));
+        assert!(areas.iter().all(|area| !area.contains_float(&free_corner)));
+    }
+
+    #[test]
+    fn deferred_unrelated_net_avoids_another_groups_reserved_channel() {
+        let mut board = BoardAdapter::load(include_bytes!("../tests/fixtures/two_chip.dsn"))
+            .expect("fixture loads");
+        let rule = |name: &str, width_mm: f64| NetRule {
+            name: name.into(),
+            width_mm,
+            clearance_mm: 0.1,
+            allowed_layers: vec!["Top".into()],
+            via_budget: Some(0),
+            max_length_mm: None,
+            protected: false,
+        };
+        let seed_spec = RouteSpec {
+            version: 1,
+            route_remaining: true,
+            allow_partial_output: false,
+            protected_nets: vec![],
+            input: "board.dsn".into(),
+            output: "routed.ses".into(),
+            nets: vec![rule("BUS", 0.15)],
+            endpoint_groups: vec![],
+            channels: vec![Channel {
+                id: "bus_reserved".into(),
+                region: ChannelRegion::Rectangle { min: [9.0, 2.0], max: [11.0, 7.0] },
+            }],
+            groups: vec![
+                RouteGroup {
+                    id: "bus".into(),
+                    nets: vec!["BUS".into()],
+                    endpoint_groups: vec![],
+                    channels: vec![],
+                    priority: 0,
+                    depends_on: vec![],
+                    joint_escape: false,
+                    awx: None,
+                },
+                RouteGroup {
+                    id: "channel_owner".into(),
+                    nets: vec!["BUS".into()],
+                    endpoint_groups: vec![],
+                    channels: vec!["bus_reserved".into()],
+                    priority: 0,
+                    depends_on: vec![],
+                    joint_escape: false,
+                    awx: None,
+                },
+            ],
+            execution: Execution::default(),
+            advanced: None,
+            awx: None,
+        };
+        let mut controller_spec = seed_spec.clone();
+        controller_spec.nets.push(rule("OTHER", 0.3));
+        controller_spec.groups[0].nets.push("OTHER".into());
+        let spec = merge_requested_scope(&seed_spec, &controller_spec)
+            .expect("controller K-prefix extends the captured seed group");
+        assert!(spec.groups[0].nets.contains(&"OTHER".to_owned()));
+        let (rejected, exhausted) = route_remaining_parallel(
+            &mut board,
+            &spec,
+            &BTreeSet::from(["BUS".to_owned()]),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("deferred autorouter runs");
+        assert!(!exhausted, "deferred route exhausted its budget: {rejected:?}");
+        let other = board.net_number("OTHER").unwrap();
+        let connectable = board.board.get_connectable_items(other);
+        assert_eq!(fr_engine::drc::NetIncompletes::new(&board.board, other, &connectable).count(), 0);
+        for key in board.board.get_traces().into_iter().filter(|&key| board.board.item(key).contains_net(other)) {
+            let trace = board.board.item(key).trace();
+            assert!(2.0 * trace.half_width() as f64 / board.units_per_mm >= 0.3 - 1e-9,
+                "deferred OTHER trace ignored its configured width");
+            let points = trace.polyline().corner_approx_arr();
+            for segment in points.windows(2) {
+                for step in 0..=20 {
+                    let t = step as f64 / 20.0;
+                    let x = (segment[0].x + (segment[1].x - segment[0].x) * t) / board.units_per_mm;
+                    let y = (segment[0].y + (segment[1].y - segment[0].y) * t) / board.units_per_mm;
+                    assert!(!(9.0..=11.0).contains(&x) || !(2.0..=7.0).contains(&y),
+                        "unrelated OTHER trace entered BUS reserved channel at ({x}, {y})");
+                }
+            }
+        }
+    }
 }

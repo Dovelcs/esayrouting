@@ -167,6 +167,10 @@ fn in_box(box_: &IntBox, x: i32, y: i32) -> bool {
     x >= box_.ll.x && x <= box_.ur.x && y >= box_.ll.y && y <= box_.ur.y
 }
 
+fn blocks_track_search(kind: BoardItemType) -> bool {
+    kind != BoardItemType::ViaObstacleArea
+}
+
 /// Source `build_base_obstacle_map(..., static_base=True)` for the immutable copper body.
 /// Window fencing, reusable same-net vias and source-owned via keep-outs are composed by the
 /// sibling native_grid_window/native_same_net modules immediately after this base pass.
@@ -337,6 +341,12 @@ fn build_obstacle_map_from_config(
             }
             continue;
         }
+        // Via-only keep-outs are stamped with each candidate's physical via
+        // span by native_via_obstacles. They must not enter the copper-cell
+        // map used by same-layer track searches.
+        if !blocks_track_search(kind) {
+            continue;
+        }
         let shapes = board.board.item_tile_shapes(item);
         for (shape_index, shape) in shapes.iter().enumerate() {
             let Some(shape) = shape else { continue };
@@ -456,6 +466,28 @@ fn build_obstacle_map_from_config(
         layer_numbers: config.layer_numbers.clone(),
         config,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blocks_track_search;
+    use awx_grid::obstacle_map::GridObstacleMap;
+    use fr_engine::board::BoardItemType;
+
+    #[test]
+    fn via_obstacle_area_allows_tracks_but_keeps_via_cell_blocked() {
+        let kind = BoardItemType::ViaObstacleArea;
+        let mut map = GridObstacleMap::new(1);
+        // Model the two independent maps composed by build_obstacle_map_from_config:
+        // a via-only area contributes to the via map, never the track map.
+        if blocks_track_search(kind) {
+            map.add_static_blocked_cell(0, 0, 0);
+        }
+        map.add_static_blocked_via(0, 0);
+
+        assert!(!map.is_blocked(0, 0, 0), "same-layer trace must pass");
+        assert!(map.is_via_blocked(0, 0), "via placement must remain forbidden");
+    }
 }
 
 /// The ordinary source `connect()` path has no extra pair-centreline expansion.

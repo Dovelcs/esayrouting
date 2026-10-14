@@ -156,15 +156,14 @@ impl Simplex {
             return false;
         }
         let prev_no = if no == 0 { len - 1 } else { no - 1 };
-        let prev_dir = self.lines[prev_no as usize]
-            .direction()
-            .get_vector()
-            .as_int();
-        let current_direction = self.lines[no as usize]
-            .direction()
-            .get_vector()
-            .as_int();
-        prev_dir.determinant(&current_direction) > 0
+        let prev_dir = self.lines[prev_no as usize].direction();
+        let current_direction = self.lines[no as usize].direction();
+        if matches!((&prev_dir, &current_direction), (Direction::Int(_), Direction::Int(_))) {
+            let prev_vector = prev_dir.get_vector().as_int();
+            let current_vector = current_direction.get_vector().as_int();
+            return prev_vector.determinant(&current_vector) > 0;
+        }
+        direction_determinant_sign(&prev_dir, &current_direction) > 0
     }
 
     /// Returns true, if the shape of this simplex is contained in a sufficiently large box.
@@ -1124,6 +1123,27 @@ fn intersection_nonempty<'a>(a: &'a [Line], b_len: usize, b: impl Fn(usize) -> &
 /// Capacity of the stack buffers used for small simplices.
 const SMALL: usize = 32;
 
+/// Sign of `first × second`; Rational directions use the existing exact Vector/Direction
+/// side calculation, while IntDirection keeps its original floating determinant fast path.
+#[inline]
+fn direction_determinant_sign(first: &Direction, second: &Direction) -> i32 {
+    if let (Direction::Int(a), Direction::Int(b)) = (first, second) {
+        let determinant = a.determinant(b);
+        return if determinant > 0.0 {
+            1
+        } else if determinant < 0.0 {
+            -1
+        } else {
+            0
+        };
+    }
+    match first.side_of(second).negate() {
+        Side::OnTheLeft => 1,
+        Side::OnTheRight => -1,
+        Side::Collinear => 0,
+    }
+}
+
 /// The algorithm of Java `Simplex.removeRedundantLines` on `arr_len` lines given by `line(i)`
 /// (in the order of the array). Leaves the indices of the remaining lines in
 /// `lines[..result]`; `lines` and `sides` must hold at least `arr_len` entries.
@@ -1133,26 +1153,21 @@ fn redundant_lines_core<'a, F: Fn(usize) -> &'a Line>(
     lines: &mut [usize],
     sides: &mut [Option<Side>],
 ) -> usize {
-    // the int directions of the lines (computed once; `None` for other directions, where
-    // `int_direction` panics like the Java cast)
-    let mut dir_buf = [None; SMALL];
+    // Cache each direction once; determinants below use the exact direction variant when a
+    // Rational line cannot be represented as an IntDirection.
+    let mut dir_buf: [Option<Direction>; SMALL] = std::array::from_fn(|_| None);
     let mut dir_vec;
-    let dirs: &mut [Option<IntDirection>] = if arr_len <= SMALL {
+    let dirs: &mut [Option<Direction>] = if arr_len <= SMALL {
         &mut dir_buf[..arr_len]
     } else {
         dir_vec = vec![None; arr_len];
         &mut dir_vec[..]
     };
     for (i, d) in dirs.iter_mut().enumerate() {
-        if let Direction::Int(v) = line(i).direction() {
-            *d = Some(v);
-        }
+        *d = Some(line(i).direction());
     }
-    let int_dir = |i: usize| -> IntDirection {
-        match dirs[i] {
-            Some(d) => d,
-            None => line(i).int_direction(),
-        }
+    let direction = |i: usize| -> Direction {
+        dirs[i].clone().unwrap_or_else(|| line(i).direction())
     };
     // `lines` holds indices (Java holds object references)
     // copy the sorted lines while skipping multiple lines
@@ -1186,10 +1201,10 @@ fn redundant_lines_core<'a, F: Fn(usize) -> &'a Line>(
             let next_line = lines[next_ind as usize];
 
             let mut remove_line = false;
-            let prev_dir = int_dir(prev_line);
-            let next_dir = int_dir(next_line);
-            let det = prev_dir.determinant(&next_dir);
-            if det != 0.0 {
+            let prev_dir = direction(prev_line);
+            let next_dir = direction(next_line);
+            let det = direction_determinant_sign(&prev_dir, &next_dir);
+            if det != 0 {
                 // prev_line and next_line are not parallel
                 let side = match intersection_sides[ind as usize] {
                     Some(s) => s,
@@ -1200,15 +1215,15 @@ fn redundant_lines_core<'a, F: Fn(usize) -> &'a Line>(
                         s
                     }
                 };
-                if det > 0.0 {
+                if det > 0 {
                     // direction of next_line is bigger than direction of prev_line: if the
                     // intersection of prev_line and next_line is on the left of current_line,
                     // current_line does not contribute to the shape of the simplex
                     remove_line = side != Side::OnTheLeft;
                 } else if side == Side::OnTheLeft {
                     // direction of next_line is smaller than direction of prev_line
-                    let current_direction = int_dir(current_line);
-                    if prev_dir.determinant(&current_direction) > 0.0 {
+                    let current_direction = direction(current_line);
+                    if direction_determinant_sign(&prev_dir, &current_direction) > 0 {
                         // the halfplane defined by current_line does not intersect with the
                         // simplex defined by prev_line and next_line: the simplex is empty
                         new_length = 0;

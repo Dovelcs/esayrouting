@@ -675,8 +675,16 @@ impl BasicBoard {
     /// width, nets, clearance class and fixed state; inside the convex pad shape). Returns the
     /// number of traces added.
     pub fn bridge_trace_ends_to_drill_centers(&mut self) -> usize {
+        let keys = self.get_traces();
+        self.bridge_trace_ends_to_drill_centers_for(&keys)
+    }
+
+    /// Same as [`Self::bridge_trace_ends_to_drill_centers`] but considers only the supplied trace
+    /// keys, so a caller holding newly materialized trace keys can adapt them without rescanning
+    /// or mutating previously existing source/trial traces.
+    pub fn bridge_trace_ends_to_drill_centers_for(&mut self, keys: &[ItemKey]) -> usize {
         let mut bridges: Vec<(Point, Point, LayerNo, i32, Vec<NetNo>, crate::ids::ClearanceClassNo, FixedState)> = Vec::new();
-        for key in self.get_traces() {
+        for &key in keys {
             let t = self.item(key);
             let layer = t.trace().layer;
             for end in [t.first_corner(), t.last_corner()] {

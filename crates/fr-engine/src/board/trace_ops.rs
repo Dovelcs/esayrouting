@@ -597,7 +597,7 @@ impl BasicBoard {
     }
 
     /// Java private `PolylineTrace.split(lineIndex, newEndLine)`.
-    pub(crate) fn split_trace_at_line(
+    pub fn split_trace_at_line(
         &mut self,
         key: ItemKey,
         line_index: i32,

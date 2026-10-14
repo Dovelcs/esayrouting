@@ -347,6 +347,77 @@ fn build_obstacle_map_from_config(
         if !blocks_track_search(kind) {
             continue;
         }
+        // Source `obstacle_map._add_pad_obstacle` (lines 4131..4270): a foreign
+        // pin blocks the candidate track on every physical copper layer it
+        // occupies, using the transformed *pad copper* shape (Java
+        // `DrillItem.getShapeOnLayer`, not the drill hole) and the source
+        // `routing_utils.iter_pad_blocked_cells` corner buffer. The current
+        // `item_tile_shapes` offset sampler dropped that buffer, so Circle and
+        // rectangle pads are rasterized by `native_pad_raster::source_pad_cells`
+        // with the .5/.75 grid fraction; unsupported custom polygons fall back
+        // to the exact native polygon offset raster below.
+        if kind == BoardItemType::Pin {
+            let clearance_class = item.clearance_class();
+            let corner_buffer_fraction = if config.extra_clearance > 0.0 {
+                0.75
+            } else {
+                0.5
+            };
+            let from = item.first_layer(&board.board);
+            let to = item.last_layer(&board.board);
+            for layer_no in from..=to {
+                let Some(&layer_index) = route_layer_to_index.get(&layer_no) else {
+                    // Copper outside the searched stack only needs via keep-outs,
+                    // which native_via_obstacles stamps from the pad copper.
+                    continue;
+                };
+                let Some(shape) = item.drill_shape_on_layer(&board.board, layer_no) else {
+                    continue;
+                };
+                let layer_clearance = board
+                    .board
+                    .clearance_value(route_clearance, clearance_class, layer_no)
+                    .max(config.clearance)
+                    .max(0);
+                // Source pair clearance + candidate track half-width + run extra.
+                let margin = layer_clearance as f64
+                    + config.track_width as f64 / 2.0
+                    + config.extra_clearance;
+                match crate::awx::native_pad_raster::source_pad_cells(
+                    &shape,
+                    grid_step_board,
+                    board.units_per_mm,
+                    margin,
+                    corner_buffer_fraction,
+                ) {
+                    Some(cells) => {
+                        for [gx, gy] in cells {
+                            let (x, y) = cell_center(gx, gy, step);
+                            if in_box(&window, x, y) {
+                                obstacles.add_static_blocked_cell(gx, gy, layer_index);
+                            }
+                        }
+                    }
+                    None => {
+                        // Source custom polygons use point-in-polygon plus exact
+                        // Euclidean distance to the nearest original edge.
+                        let cells = crate::awx::native_pad_raster::source_polygon_cells(
+                            &shape.corner_approx_arr(),
+                            grid_step_board,
+                            margin,
+                            board.units_per_mm,
+                        );
+                        for [gx, gy] in cells {
+                            let (x, y) = cell_center(gx, gy, step);
+                            if in_box(&window, x, y) {
+                                obstacles.add_static_blocked_cell(gx, gy, layer_index);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         let shapes = board.board.item_tile_shapes(item);
         for (shape_index, shape) in shapes.iter().enumerate() {
             let Some(shape) = shape else { continue };

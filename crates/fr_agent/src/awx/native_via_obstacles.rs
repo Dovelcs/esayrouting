@@ -13,11 +13,16 @@ use fr_engine::{
     board::{ItemKey, BoardItemType},
     ids::{ClearanceClassNo, NetNo},
 };
-use fr_geom::{IntPoint, Point, TileShape};
+use fr_geom::{Shape, TileShape};
 use std::collections::BTreeSet;
 
 const VIA_DIAGONAL_MARGIN_CELLS: f64 = 0.25;
 const GRID_TIE_EPS_MM: f64 = 1e-6;
+
+/// The regular source pad corner buffer is half a grid step; an active extra
+/// clearance uses three quarters of a grid step.
+const REGULAR_CORNER_BUFFER_FRACTION: f64 = 0.5;
+const EXTRA_CORNER_BUFFER_FRACTION: f64 = 0.75;
 
 #[derive(Clone, Copy)]
 struct ViaGeometry {
@@ -302,7 +307,12 @@ fn stamp_foreign_trace_vias(
     }
 }
 
-fn item_copper_shapes(board: &BoardAdapter, key: ItemKey) -> Vec<(i32, TileShape)> {
+/// Copper (layer, tile raster, real PadCu primitive) tuples of an item.
+///
+/// The tile raster is the clearance-compensated default-tree shape used for the
+/// exact polygon fallback; the primitive is the source `drill_shape` in board
+/// coordinates (real circle/rect for pads, `None` for non-drill items).
+fn item_copper_shapes(board: &BoardAdapter, key: ItemKey) -> Vec<(i32, TileShape, Option<Shape>)> {
     let item = board.board.item(key);
     if item
         .padstack(&board.board)
@@ -312,7 +322,7 @@ fn item_copper_shapes(board: &BoardAdapter, key: ItemKey) -> Vec<(i32, TileShape
     }
     board
         .board
-        .item_tile_shapes(board.board.item(key))
+        .item_tile_shapes(item)
         .into_iter()
         .enumerate()
         .filter_map(|(index, shape)| {
@@ -325,7 +335,8 @@ fn item_copper_shapes(board: &BoardAdapter, key: ItemKey) -> Vec<(i32, TileShape
                 .get(layer as usize)?
                 .name
                 .as_str();
-            is_copper_layer(board, name).then_some((layer, shape))
+            let primitive = item.drill_shape(&board.board, index as i32);
+            is_copper_layer(board, name).then_some((layer, shape, primitive))
         })
         .collect()
 }
@@ -346,7 +357,7 @@ fn stamp_item_via_cells(
     }
     let clearance = shapes
         .iter()
-        .map(|(layer, _)| {
+        .map(|(layer, _, _)| {
             resolved_clearance(
                 board,
                 config,
@@ -359,27 +370,46 @@ fn stamp_item_via_cells(
         .unwrap_or(config.clearance);
     let margin = new_diameter as f64 / 2.0 + clearance as f64 + config.extra_clearance as f64;
     let step = config.grid_step;
+    // Source `_add_pad_obstacle`/`_pad_via_keepout_cells` buffers the pad corners
+    // by half a grid step (three quarters once an extra clearance is in force).
+    let corner_buffer_fraction = if config.extra_clearance > 0.0 {
+        EXTRA_CORNER_BUFFER_FRACTION
+    } else {
+        REGULAR_CORNER_BUFFER_FRACTION
+    };
     let mut cells = BTreeSet::<(i32, i32)>::new();
-    for (_, shape) in shapes {
-        // Offset the native convex tile shape itself; this preserves its exact
-        // pad outline and clearance distance instead of substituting a bbox.
-        let expanded = shape.offset(margin);
-        let bounds = expanded.bounding_box();
-        let gx0 = (bounds.ll.x as f64 / step as f64).floor() as i32 - 1;
-        let gy0 = (bounds.ll.y as f64 / step as f64).floor() as i32 - 1;
-        let gx1 = (bounds.ur.x as f64 / step as f64).ceil() as i32 + 1;
-        let gy1 = (bounds.ur.y as f64 / step as f64).ceil() as i32 + 1;
-        for gx in gx0..=gx1 {
-            for gy in gy0..=gy1 {
-                let p = Point::Int(IntPoint::new(
-                    gx.saturating_mul(step),
-                    gy.saturating_mul(step),
-                ));
-                if expanded.contains(&p) {
-                    cells.insert((gx, gy));
-                }
+    for (_, shape, primitive) in shapes {
+        // Real PadCu circle/rect primitive: use the source-exact raster, which
+        // includes the corner buffer the offset-tile raster omits (the
+        // TracePin8 corner grazes).
+        if let Some(primitive) = primitive.as_ref() {
+            if let Some(source_cells) = super::native_pad_raster::source_pad_cells(
+                primitive,
+                step,
+                board.units_per_mm,
+                margin,
+                corner_buffer_fraction,
+            ) {
+                cells.extend(source_cells.into_iter().map(|[x, y]| (x, y)));
+                continue;
             }
         }
+        // Custom polygon fallback shares the source's point-in-polygon and
+        // Euclidean nearest-edge predicate with the track raster.
+        let corners = primitive
+            .as_ref()
+            .map(Shape::corner_approx_arr)
+            .unwrap_or_else(|| shape.corner_approx_arr());
+        cells.extend(
+            super::native_pad_raster::source_polygon_cells(
+                &corners,
+                step,
+                margin,
+                board.units_per_mm,
+            )
+            .into_iter()
+            .map(|[x, y]| (x, y)),
+        );
     }
     let cells: Vec<_> = cells.into_iter().map(|(x, y)| [x, y]).collect();
     stamp_via_cells(map, &cells, rung, static_base);

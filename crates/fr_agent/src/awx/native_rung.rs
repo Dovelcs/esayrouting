@@ -18,6 +18,9 @@ use std::{
     time::Instant,
 };
 
+/// An exact native endpoint that must survive geometry materialization verbatim.
+type ExactEndpointOverride = ([f64; 2], String, EnginePoint);
+
 #[derive(Clone)]
 pub struct NativeRungRoute {
     /// The request board plus the landed copper, still isolated from the caller.
@@ -291,6 +294,10 @@ struct GridSearchResult {
     path: Option<Vec<(i32, i32, u8)>>,
     iterations: usize,
     frontier: Vec<(i32, i32, u8)>,
+    forward_frontier: Vec<(i32, i32, u8)>,
+    backward_frontier: Vec<(i32, i32, u8)>,
+    forward_iterations: usize,
+    backward_iterations: usize,
     window: IntBox,
     grid_step_board: i32,
     layer_numbers: Vec<i32>,
@@ -305,12 +312,30 @@ struct GridSearchResult {
     native_config: super::native_obstacles::NativeGridConfig,
     source_cells: Vec<(i32, i32, u8)>,
     target_cells: Vec<(i32, i32, u8)>,
+    /// #479 blocked-terminal seeding: each seeded free on-pad grid cell mapped
+    /// to the pad's exact native Pin-centre endpoint. The route lands on the
+    /// cell (source semantics, geometry unchanged); the centre is the ONLY
+    /// extra same-net connector materialized so native trace contact holds.
+    landing_aliases: BTreeMap<(i32, i32, u8), RungEndpoint>,
+    /// Source `pcb_data._via_unblock_blame` keystone (single_ended_routing
+    /// `2850..2859`): the exact foreign net whose mature Trace/Via copper boxes a
+    /// pad when the in-pad tap DECLINED and nothing was in flight yet. Populated
+    /// only from the `awx::via_blocker` helper (a mature nearest foreign
+    /// Trace/Via net only -- never a Pin, never invented). Private working state:
+    /// surfaced on the no-path report under the private `_via_unblock_blame` key
+    /// so the endpoint owner can hand it to `RecoveryState` and strip it before
+    /// public logging; the user-facing report schema is unchanged.
+    via_unblock_blame: BTreeSet<NetNo>,
 }
 
 struct SourceRouteAttempt {
     path: Option<Vec<(i32, i32, u8)>>,
     iterations: usize,
     frontier: Vec<(i32, i32, u8)>,
+    forward_frontier: Vec<(i32, i32, u8)>,
+    backward_frontier: Vec<(i32, i32, u8)>,
+    forward_iterations: usize,
+    backward_iterations: usize,
     forward_probe_iterations: usize,
     backward_probe_iterations: usize,
 }
@@ -392,10 +417,15 @@ fn source_route_attempt(
                 path: forward,
                 iterations: fi,
                 frontier: Vec::new(),
+                forward_frontier: Vec::new(),
+                backward_frontier: Vec::new(),
+                forward_iterations: fi,
+                backward_iterations: 0,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: 0,
             };
         }
+        let forward_frontier = frontier.clone();
         let (backward, bi, back_frontier) = route_core(
             router,
             obstacles,
@@ -406,13 +436,17 @@ fn source_route_attempt(
             via_rung,
             false,
         );
-        frontier.extend(back_frontier);
+        frontier.extend(back_frontier.iter().copied());
         if let Some(mut path) = backward {
             path.reverse();
             return SourceRouteAttempt {
                 path: Some(path),
                 iterations: fi + bi,
                 frontier: Vec::new(),
+                forward_frontier,
+                backward_frontier: Vec::new(),
+                forward_iterations: fi,
+                backward_iterations: bi,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: bi,
             };
@@ -422,6 +456,10 @@ fn source_route_attempt(
                 path: None,
                 iterations: fi + bi,
                 frontier,
+                forward_frontier,
+                backward_frontier: back_frontier,
+                forward_iterations: fi,
+                backward_iterations: bi,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: bi,
             };
@@ -441,10 +479,15 @@ fn source_route_attempt(
                 path: full_forward,
                 iterations: fi + bi + ff,
                 frontier: Vec::new(),
+                forward_frontier: Vec::new(),
+                backward_frontier: Vec::new(),
+                forward_iterations: fi + ff,
+                backward_iterations: bi,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: bi,
             };
         }
+        let forward_frontier = full_frontier.clone();
         let (full_backward, fb, back_frontier) = route_core(
             router,
             obstacles,
@@ -455,13 +498,17 @@ fn source_route_attempt(
             via_rung,
             dynamic,
         );
-        full_frontier.extend(back_frontier);
+        full_frontier.extend(back_frontier.iter().copied());
         if let Some(mut path) = full_backward {
             path.reverse();
             SourceRouteAttempt {
                 path: Some(path),
                 iterations: fi + bi + ff + fb,
                 frontier: Vec::new(),
+                forward_frontier,
+                backward_frontier: Vec::new(),
+                forward_iterations: fi + ff,
+                backward_iterations: bi + fb,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: bi,
             }
@@ -470,6 +517,10 @@ fn source_route_attempt(
                 path: None,
                 iterations: fi + bi + ff + fb,
                 frontier: full_frontier,
+                forward_frontier,
+                backward_frontier: back_frontier,
+                forward_iterations: fi + ff,
+                backward_iterations: bi + fb,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: bi,
             }
@@ -602,6 +653,303 @@ fn source_grid_search(
     )
 }
 
+/// The pad's RAW copper cross-section on one native layer, straight from the
+/// endpoint metadata (`copper_shapes`), never a bounding box or a shape-name
+/// guess. Endpoint metadata frequently carries an empty `shape` with
+/// `rect_rotation == 0`, which must NOT make a circle or custom pad masquerade
+/// as a rectangle.
+fn pad_layer_copper<'a>(
+    pad: &'a super::whole_context::ContextPad,
+    layer: &str,
+) -> Vec<&'a super::whole_context::CopperShape> {
+    pad.copper_shapes
+        .iter()
+        .filter(|copper| copper.layer == layer)
+        .map(|copper| &copper.shape)
+        .collect()
+}
+
+/// Source `net_queries.pad_landing_extent` over the ACTUAL layer copper: the
+/// copper inset by `track_width/2` so a whole track cross-section stays inside,
+/// expressed as the region the track centre may occupy. A circle becomes an
+/// inset disc and a non-rotated rounded rectangle an inset rectangle. Rotated
+/// rectangles and custom polygons keep the source EXCLUDE semantics (`None`) and
+/// are never reinterpreted from a bounding box.
+enum PadLanding {
+    Disc { center: [f64; 2], radius: f64 },
+    Rect { center: [f64; 2], half: [f64; 2] },
+}
+
+fn pad_landing(
+    pad: &super::whole_context::ContextPad,
+    layer: &str,
+    track_width_mm: f64,
+) -> Option<PadLanding> {
+    let inset = track_width_mm / 2.0;
+    match pad_layer_copper(pad, layer).as_slice() {
+        [super::whole_context::CopperShape::Circle { center, radius }] => {
+            let radius = radius - inset;
+            (radius > 0.0).then_some(PadLanding::Disc {
+                center: *center,
+                radius,
+            })
+        }
+        [super::whole_context::CopperShape::RoundedRectangle {
+            center,
+            half_size,
+            rotation,
+            ..
+        }] => {
+            if *rotation != 0.0 {
+                return None;
+            }
+            let half = [half_size[0] - inset, half_size[1] - inset];
+            (half[0] > 0.0 && half[1] > 0.0).then_some(PadLanding::Rect {
+                center: *center,
+                half,
+            })
+        }
+        // Custom polygons and ambiguous/multi-shape metadata are excluded
+        // rather than guessed from a bounding box.
+        _ => None,
+    }
+}
+
+/// A same-net bridge from a seeded landing cell to the pad's exact Pin centre is
+/// only emitted when the whole segment stays inside the pad's own layer copper
+/// (`copper_shapes`). This is the source bridge qualification and avoids a fake
+/// contact riding outside the real copper.
+fn bridge_inside_copper(
+    copper: &[&super::whole_context::CopperShape],
+    from_mm: [f64; 2],
+    to_mm: [f64; 2],
+) -> bool {
+    if copper.is_empty() {
+        return false;
+    }
+    for step in 0..=8 {
+        let t = step as f64 / 8.0;
+        let p = [
+            from_mm[0] + (to_mm[0] - from_mm[0]) * t,
+            from_mm[1] + (to_mm[1] - from_mm[1]) * t,
+        ];
+        if !copper.iter().any(|shape| shape.signed_distance(p) <= 0.0) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Source `single_ended_routing._free_on_pad_cells` (#479): grid cells on a
+/// pad's own LAYER copper that are FREE for a track on `layer`, keeping the
+/// whole track cross-section inside the real copper. Cell indices are global
+/// board grid cells so the skip cell and obstacle indices match the search map.
+/// `bounds` is the source `bounds` window: seeded cells outside it are dropped.
+#[allow(clippy::too_many_arguments)]
+fn free_on_pad_cells(
+    pad: &super::whole_context::ContextPad,
+    layer: &str,
+    layer_index: usize,
+    obstacles: &GridObstacleMap,
+    grid_step_board: i32,
+    units_per_mm: f64,
+    skip_cell: Option<(i32, i32)>,
+    track_width_mm: f64,
+    bounds: (i32, i32, i32, i32),
+) -> Vec<(i32, i32)> {
+    let Some(landing) = pad_landing(pad, layer, track_width_mm) else {
+        return Vec::new();
+    };
+    let (center, extent) = match &landing {
+        PadLanding::Disc { center, radius } => (*center, [*radius, *radius]),
+        PadLanding::Rect { center, half } => (*center, *half),
+    };
+    let step_mm = grid_step_board as f64 / units_per_mm;
+    let to_grid = |value_mm: f64| -> i32 { (value_mm / step_mm).round_ties_even() as i32 };
+    let gx0 = to_grid(center[0] - extent[0]);
+    let gy0 = to_grid(center[1] - extent[1]);
+    let gx1 = to_grid(center[0] + extent[0]);
+    let gy1 = to_grid(center[1] + extent[1]);
+    let (bx0, by0, bx1, by1) = bounds;
+    let mut cells = Vec::new();
+    for cgx in gx0..=gx1 {
+        let cx = cgx as f64 * step_mm;
+        if (cx - center[0]).abs() > extent[0] {
+            continue;
+        }
+        for cgy in gy0..=gy1 {
+            if skip_cell == Some((cgx, cgy)) {
+                continue;
+            }
+            let cy = cgy as f64 * step_mm;
+            if (cy - center[1]).abs() > extent[1] {
+                continue;
+            }
+            if let PadLanding::Disc { center, radius } = &landing {
+                if (cx - center[0]).powi(2) + (cy - center[1]).powi(2) > radius * radius {
+                    continue;
+                }
+            }
+            if obstacles.is_blocked(cgx, cgy, layer_index) {
+                continue;
+            }
+            if cgx < bx0 || cgx > bx1 || cgy < by0 || cgy > by1 {
+                continue;
+            }
+            cells.push((cgx, cgy));
+        }
+    }
+    cells
+}
+
+/// Exact native Pin centre for `net` nearest `near_mm`, in board millimetres.
+/// The native trace-contact rule is `*point == other.center(self)`, so a seeded
+/// landing must bridge to the pin's real centre, not a rounded pad snapshot.
+fn native_pin_center_mm(board: &BoardAdapter, net: NetNo, near_mm: [f64; 2]) -> Option<[f64; 2]> {
+    let upm = board.units_per_mm;
+    let mut best: Option<(f64, [f64; 2])> = None;
+    for key in board.board.get_pins() {
+        let item = board.board.item(key);
+        if !item.contains_net(net) {
+            continue;
+        }
+        let center = item.center(&board.board).to_float();
+        let center_mm = [center.x / upm, center.y / upm];
+        let d = (center_mm[0] - near_mm[0]).hypot(center_mm[1] - near_mm[1]);
+        if d <= 1e-3 && best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+            best = Some((d, center_mm));
+        }
+    }
+    best.map(|(_, point)| point)
+}
+
+/// Source `single_ended_routing._augment_blocked_pad_terminals` (#479): when a
+/// PAD endpoint's grid cell is hard-blocked -- a foreign keep-out reaching over
+/// the pad centre -- seed the pad's FREE on-copper cells on that layer as extra
+/// endpoint cells, so the route terminates on pad copper instead of failing at
+/// an unsteppable start. No-op for the overwhelmingly common free-cell case.
+/// Returns the extra `(gx, gy, layer)` cells and the landing alias mapping each
+/// seeded cell to the pad's exact native Pin-centre endpoint.
+#[allow(clippy::too_many_arguments)]
+fn augment_blocked_pad_terminals(
+    endpoints: &[RungEndpoint],
+    pads: &[super::whole_context::ContextPad],
+    net: NetNo,
+    obstacles: &GridObstacleMap,
+    board: &BoardAdapter,
+    route_layers: &[String],
+    track_width_mm: f64,
+    grid_step_board: i32,
+    bounds: (i32, i32, i32, i32),
+) -> Result<(Vec<(i32, i32, u8)>, BTreeMap<(i32, i32, u8), RungEndpoint>), String> {
+    let upm = board.units_per_mm;
+    let mut extra = Vec::new();
+    let mut aliases = BTreeMap::new();
+    let mut seen = BTreeSet::<(i64, i64, u8)>::new();
+    for endpoint in endpoints {
+        let Some(layer_index) = route_layers.iter().position(|name| name == &endpoint.layer) else {
+            continue;
+        };
+        let point = match board.point(endpoint.point)? {
+            EnginePoint::Int(point) => point,
+            _ => continue,
+        };
+        let gx = super::native_obstacles::grid_round(point.x, grid_step_board);
+        let gy = super::native_obstacles::grid_round(point.y, grid_step_board);
+        if !obstacles.is_blocked(gx, gy, layer_index) {
+            continue;
+        }
+        for pad in pads {
+            if pad.net_id != net
+                || (pad.point[0] - endpoint.point[0]).abs() > 1e-3
+                || (pad.point[1] - endpoint.point[1]).abs() > 1e-3
+            {
+                continue;
+            }
+            let key = (
+                (pad.point[0] * 10_000.0).round_ties_even() as i64,
+                (pad.point[1] * 10_000.0).round_ties_even() as i64,
+                layer_index as u8,
+            );
+            if seen.insert(key) {
+                let free = free_on_pad_cells(
+                    pad,
+                    &endpoint.layer,
+                    layer_index,
+                    obstacles,
+                    grid_step_board,
+                    upm,
+                    Some((gx, gy)),
+                    track_width_mm,
+                    bounds,
+                );
+                if !free.is_empty() {
+                    let center = RungEndpoint {
+                        point: native_pin_center_mm(board, net, pad.point)
+                            .unwrap_or(pad.point),
+                        layer: endpoint.layer.clone(),
+                    };
+                    // #479 bridge qualification: a seeded landing only counts
+                    // when the same-net connector to the pad's exact Pin centre
+                    // stays inside the pad's own LAYER copper.
+                    let copper = pad_layer_copper(pad, &endpoint.layer);
+                    let step_mm = grid_step_board as f64 / upm;
+                    for (cgx, cgy) in free {
+                        let cell_mm = [cgx as f64 * step_mm, cgy as f64 * step_mm];
+                        if !bridge_inside_copper(&copper, cell_mm, center.point) {
+                            continue;
+                        }
+                        let cell = (cgx, cgy, layer_index as u8);
+                        extra.push(cell);
+                        aliases.entry(cell).or_insert_with(|| center.clone());
+                    }
+                }
+            }
+            break;
+        }
+    }
+    Ok((extra, aliases))
+}
+
+/// Materialize the ONLY extra copper a #479 seeded landing needs: a same-net
+/// full-width connector, strictly inside the pad copper, from the landed grid
+/// cell to the pad's exact native Pin centre (the native trace-contact point).
+/// The grid path geometry itself stays untouched at the landing.
+fn push_landing_connector(
+    geometry: &mut super::grid_path::GridPathGeometry,
+    landing: &RungEndpoint,
+    center: &RungEndpoint,
+    board: &BoardAdapter,
+    net: NetNo,
+) -> Result<(), String> {
+    if (landing.point[0] - center.point[0]).abs() <= 1e-9
+        && (landing.point[1] - center.point[1]).abs() <= 1e-9
+    {
+        return Ok(());
+    }
+    if landing.layer != center.layer {
+        return Err("blocked-pad landing connector layer differs from the pad layer".into());
+    }
+    let layer_no = board.board.layer_structure.get_no(&landing.layer);
+    if layer_no < 0 {
+        return Err("blocked-pad landing connector uses an unknown layer".into());
+    }
+    let width_mm =
+        2.0 * board.board.rules.get_trace_half_width(net, layer_no) as f64 / board.units_per_mm;
+    if !width_mm.is_finite() || width_mm <= 0.0 {
+        return Err("blocked-pad landing connector has an invalid trace width".into());
+    }
+    geometry
+        .segments
+        .push(super::grid_path::GridPathSegment {
+            start_mm: landing.point,
+            end_mm: center.point,
+            layer: landing.layer.clone(),
+            width_mm,
+        });
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn source_grid_search_with_endpoints(
     request: &RungRequest,
@@ -672,7 +1020,7 @@ fn source_grid_search_with_endpoints(
         gy1,
         request.route_layers.len(),
     );
-    let source_cells = source_endpoints
+    let mut source_cells = source_endpoints
         .iter()
         .zip(source_points)
         .filter_map(|(endpoint, point)| {
@@ -689,7 +1037,7 @@ fn source_grid_search_with_endpoints(
                 })
         })
         .collect::<Vec<_>>();
-    let targets = target_endpoints
+    let mut targets = target_endpoints
         .iter()
         .zip(target_points)
         .filter_map(|(endpoint, point)| {
@@ -708,9 +1056,6 @@ fn source_grid_search_with_endpoints(
         .collect::<Vec<_>>();
     if source_cells.is_empty() || targets.is_empty() {
         return Err("native AWX endpoint candidates have no active route layer".into());
-    }
-    for &(x, y, l) in source_cells.iter().chain(&targets) {
-        obstacles.add_source_target_cell(x, y, l as usize);
     }
     if let Some(band) = request.band.as_deref() {
         for (layer_index, layer_name) in request.route_layers.iter().enumerate() {
@@ -800,6 +1145,56 @@ fn source_grid_search_with_endpoints(
             cost,
         );
     }
+    // #479 blocked-terminal seeding followed by the source C5 endpoint
+    // exemptions and the ±10 allowed block -- all BEFORE the search, over the
+    // fully stamped map, in source `route_net_with_obstacles` order: augment
+    // endpoints -> endpoint_exempt -> allowed rects -> source/target override.
+    let bounds = (gx0, gy0, gx1, gy1);
+    let (extra_sources, mut landing_aliases) = augment_blocked_pad_terminals(
+        source_endpoints,
+        &request.same_net_pads,
+        request.net_id,
+        &obstacles,
+        board,
+        &request.route_layers,
+        request.rules.track_width,
+        grid_step_board,
+        bounds,
+    )?;
+    source_cells.extend(extra_sources);
+    let (extra_targets, target_aliases) = augment_blocked_pad_terminals(
+        target_endpoints,
+        &request.same_net_pads,
+        request.net_id,
+        &obstacles,
+        board,
+        &request.route_layers,
+        request.rules.track_width,
+        grid_step_board,
+        bounds,
+    )?;
+    targets.extend(extra_targets);
+    landing_aliases.extend(target_aliases);
+    let exempt_radius = (((request.rules.track_width + request.rules.clearance) * upm)
+        / grid_step_board as f64) as i32;
+    let exempt_positions = source_cells
+        .iter()
+        .chain(targets.iter())
+        .map(|&(x, y, _)| (x, y))
+        .collect::<Vec<_>>();
+    obstacles.set_endpoint_exempt(exempt_positions, exempt_radius);
+    let allow_radius = 10;
+    for &(x, y, _) in source_cells.iter().chain(targets.iter()) {
+        obstacles.add_allowed_rect(
+            x.saturating_sub(allow_radius).max(gx0),
+            y.saturating_sub(allow_radius).max(gy0),
+            x.saturating_add(allow_radius).min(gx1),
+            y.saturating_add(allow_radius).min(gy1),
+        );
+    }
+    for &(x, y, l) in source_cells.iter().chain(targets.iter()) {
+        obstacles.add_source_target_cell(x, y, l as usize);
+    }
     let route_indices = (0..request.route_layers.len()).collect::<Vec<_>>();
     let config = fr_engine::autoroute::point_router::SourceGridConfig::from_source(
         grid_step_board as f64 / upm,
@@ -870,6 +1265,10 @@ fn source_grid_search_with_endpoints(
         path: attempt.path,
         iterations,
         frontier: attempt.frontier,
+        forward_frontier: attempt.forward_frontier,
+        backward_frontier: attempt.backward_frontier,
+        forward_iterations: attempt.forward_iterations,
+        backward_iterations: attempt.backward_iterations,
         window,
         grid_step_board,
         layer_numbers,
@@ -882,6 +1281,8 @@ fn source_grid_search_with_endpoints(
         native_config,
         source_cells,
         target_cells: targets,
+        landing_aliases,
+        via_unblock_blame: BTreeSet::new(),
     })
 }
 
@@ -908,6 +1309,65 @@ fn small_via_rung(
     Some((index, candidate.0 as f64 / upm, candidate.1 as f64 / upm))
 }
 
+/// Source `single_ended_routing:2850..2859` declined-tap blame keystone: when the
+/// in-pad via tap DECLINED and NOTHING was in flight yet, ask the `awx::via_blocker`
+/// helper for the EXACT foreign net whose mature Trace/Via copper boxes the pad
+/// (queried at the pad's copper centre). The helper returns a mature nearest
+/// foreign Trace/Via net only, so no Pin blocker is ever claimed from code and no
+/// blame is fabricated when it finds nothing.
+fn record_via_unblock_blame(
+    request: &RungRequest,
+    outcome: &mut GridSearchResult,
+    pad: &super::whole_context::ContextPad,
+    inflight_vias: &[super::whole_context::CopperVia],
+    inflight_segments: &[super::whole_context::CopperSegment],
+) {
+    // Source guard: blame is only attributable before any in-flight via/segment
+    // existed, since a later decline may be caused by the in-flight copper itself.
+    if !inflight_vias.is_empty() || !inflight_segments.is_empty() {
+        return;
+    }
+    if let Some(blocker) = super::via_blocker::find_via_position_blocker(
+        &request.board,
+        pad.point,
+        &request.rules,
+        request.net_id,
+        &BTreeSet::from([0]),
+    ) {
+        outcome.via_unblock_blame.insert(blocker);
+    }
+}
+
+/// The via-pad tap backend returns placement geometry, while the native source
+/// must retain which exact ContextPad caused that placement. `ContextPad.key`
+/// is the native pad reference used by `BoardSnapshot`; `BoardAdapter::pads`
+/// exposes that same reference with its actual Pin ItemKey.
+#[derive(Clone)]
+struct OwnedTapResult {
+    tap: super::via_pad_tap::TapResult,
+    pad_owner: fr_engine::board::ItemKey,
+}
+
+fn native_context_pad_owner(
+    board: &BoardAdapter,
+    pad: &super::whole_context::ContextPad,
+) -> Result<fr_engine::board::ItemKey, String> {
+    let mut owners = board
+        .pads()
+        .into_iter()
+        .filter(|native| {
+            native.reference == pad.key && native.net == pad.net && native.point == pad.point
+        })
+        .filter_map(|native| native.key)
+        .collect::<Vec<_>>();
+    owners.sort_unstable();
+    owners.dedup();
+    match owners.as_slice() {
+        [owner] => Ok(*owner),
+        _ => Err("via-pad tap ContextPad has no unique native Pin owner".into()),
+    }
+}
+
 /// Place one source `_place_shrunk_via_in_pad` tap against a specific pad and,
 /// on success, apply its `_register_unblock_via` effect to the retained working
 /// map: free-via, source/target override on every route layer, and the 11x11
@@ -922,12 +1382,19 @@ fn place_unblock_tap(
     edge_clearance: f64,
     inflight_vias: &mut Vec<super::whole_context::CopperVia>,
     inflight_segments: &mut Vec<super::whole_context::CopperSegment>,
-) -> Result<Option<super::via_pad_tap::TapResult>, String> {
+) -> Result<Option<OwnedTapResult>, String> {
     let Some(pad_layer) = pad.layers.iter().find(|layer| {
         !layer.starts_with('*')
             && request.board.board.layer_structure.get_no(layer) >= 0
             && request.route_layers.contains(layer)
     }) else {
+        record_via_unblock_blame(
+            request,
+            outcome,
+            pad,
+            inflight_vias.as_slice(),
+            inflight_segments.as_slice(),
+        );
         return Ok(None);
     };
     let Some(layer_index) = request
@@ -935,12 +1402,21 @@ fn place_unblock_tap(
         .iter()
         .position(|layer| layer == pad_layer)
     else {
+        record_via_unblock_blame(
+            request,
+            outcome,
+            pad,
+            inflight_vias.as_slice(),
+            inflight_segments.as_slice(),
+        );
         return Ok(None);
     };
     let mut backend = NativeTapBackend {
         board: &request.board,
     };
-    let Some(tap) = super::via_pad_tap::place_shrunk_via_in_pad(super::via_pad_tap::TapRequest {
+    // Evaluate the tap into an owned result first so no immutable borrow of
+    // `outcome` survives into the decline branch, where blame needs `&mut outcome`.
+    let tap_result = super::via_pad_tap::place_shrunk_via_in_pad(super::via_pad_tap::TapRequest {
         board: &request.board,
         rung: request,
         pad,
@@ -962,10 +1438,18 @@ fn place_unblock_tap(
         inflight_vias: inflight_vias.as_slice(),
         inflight_segments: inflight_segments.as_slice(),
         backend: &mut backend,
-    })?
-    else {
+    })?;
+    let Some(tap) = tap_result else {
+        record_via_unblock_blame(
+            request,
+            outcome,
+            pad,
+            inflight_vias.as_slice(),
+            inflight_segments.as_slice(),
+        );
         return Ok(None);
     };
+    let pad_owner = native_context_pad_owner(&request.board, pad)?;
     for release in &tap.map_releases {
         outcome
             .obstacles
@@ -984,16 +1468,16 @@ fn place_unblock_tap(
     }
     inflight_vias.push(tap.via.clone());
     inflight_segments.extend(tap.stub_segments.clone());
-    Ok(Some(tap))
+    Ok(Some(OwnedTapResult { tap, pad_owner }))
 }
 
 /// Seed a placed tap's escape-via cell as a source/target on EVERY route layer,
 /// matching source `new_sources = list(sources) + [(vgx, vgy, li) for li in
 /// range(len(layer_names))]`. Without this the retried A* can never terminate
 /// on the via and the whole unblock is inert.
-fn extend_with_tap_cells(cells: &mut Vec<(i32, i32, u8)>, tap: &super::via_pad_tap::TapResult, layers: usize) {
+fn extend_with_tap_cells(cells: &mut Vec<(i32, i32, u8)>, tap: &OwnedTapResult, layers: usize) {
     for layer in 0..layers {
-        cells.push((tap.grid_cell.0, tap.grid_cell.1, layer as u8));
+        cells.push((tap.tap.grid_cell.0, tap.tap.grid_cell.1, layer as u8));
     }
 }
 
@@ -1005,7 +1489,7 @@ fn extend_with_tap_cells(cells: &mut Vec<(i32, i32, u8)>, tap: &super::via_pad_t
 fn try_via_pad_unblock(
     request: &RungRequest,
     outcome: &mut GridSearchResult,
-) -> Result<Option<(Vec<(i32, i32, u8)>, Vec<super::via_pad_tap::TapResult>)>, String> {
+) -> Result<Option<(Vec<(i32, i32, u8)>, Vec<OwnedTapResult>)>, String> {
     let lim = 5_000usize;
     let target_stuck =
         outcome.backward_probe_iterations > 0 && outcome.backward_probe_iterations < lim;
@@ -1057,7 +1541,7 @@ fn try_via_pad_unblock(
     let mut router = outcome.router_config.router();
     let mut new_sources = source_cells.clone();
     let mut new_targets = target_cells.clone();
-    let mut placed = Vec::<super::via_pad_tap::TapResult>::new();
+    let mut placed = Vec::<OwnedTapResult>::new();
     let mut source_tapped = false;
     let mut target_tapped = false;
 
@@ -1186,7 +1670,7 @@ fn try_via_pad_unblock(
     // floating copper.
     let used = placed
         .into_iter()
-        .filter(|tap| path_uses_tap(&path, tap))
+        .filter(|tap| path_uses_tap(&path, tap, &request.route_layers, &request.board))
         .collect::<Vec<_>>();
     Ok(Some((path, used)))
 }
@@ -1248,17 +1732,74 @@ fn pads_near_grid_cells<'a>(
     ordered.into_iter().map(|(_, pad)| pad).collect()
 }
 
-fn path_uses_tap(path: &[(i32, i32, u8)], tap: &super::via_pad_tap::TapResult) -> bool {
-    // Source `ends = (p2[0], p2[-1])`: the retry reached the via iff the path
-    // terminates on the via cell at a NON-pad layer (it arrived through the
-    // barrel) or through an off-pad escape stub.
+fn tap_reaches_terminal_cell(
+    tap: &OwnedTapResult,
+    cell: (i32, i32, u8),
+    route_layers: &[String],
+    board: &BoardAdapter,
+) -> bool {
+    if (cell.0, cell.1) != tap.tap.grid_cell {
+        return false;
+    }
+    let Some(layer_name) = route_layers.get(cell.2 as usize) else {
+        return false;
+    };
+    let layer_no = board.board.layer_structure.get_no(layer_name);
+    let first = tap
+        .tap
+        .via
+        .layers
+        .first()
+        .map(|layer| board.board.layer_structure.get_no(layer));
+    let last = tap
+        .tap
+        .via
+        .layers
+        .last()
+        .map(|layer| board.board.layer_structure.get_no(layer));
+    let through_barrel = matches!((first, last), (Some(a), Some(b)) if a >= 0 && b >= 0 && layer_no >= a.min(b) && layer_no <= a.max(b));
+    let stub_access = tap
+        .tap
+        .stub_segments
+        .iter()
+        .any(|segment| segment.layer == *layer_name);
+    let on_pad_layer = cell.2 as usize == tap.tap.pad_layer_index;
+    (through_barrel || stub_access) && (!on_pad_layer || stub_access)
+}
+
+fn tap_for_path_terminal<'a>(
+    taps: &'a [OwnedTapResult],
+    cell: (i32, i32, u8),
+    route_layers: &[String],
+    board: &BoardAdapter,
+    net: NetNo,
+) -> Result<Option<&'a OwnedTapResult>, String> {
+    let mut matching = taps
+        .iter()
+        .filter(|tap| tap_reaches_terminal_cell(tap, cell, route_layers, board));
+    let Some(first) = matching.next() else {
+        return Ok(None);
+    };
+    let group = board.board.connected_set(first.pad_owner, net, false);
+    if matching.any(|tap| !group.contains(board.board.item(tap.pad_owner).id())) {
+        return Err("path terminal cell aliases taps from disconnected native pads".into());
+    }
+    Ok(Some(first))
+}
+
+fn path_uses_tap(
+    path: &[(i32, i32, u8)],
+    tap: &OwnedTapResult,
+    route_layers: &[String],
+    board: &BoardAdapter,
+) -> bool {
+    // Source `ends = (p2[0], p2[-1])`: retain a via iff an actual terminal
+    // lands on its exact cell and route layer, through the physical barrel or
+    // the pad-layer escape stub. Pads sharing the XY grid cell are not aliases.
     path.first()
         .into_iter()
         .chain(path.last())
-        .any(|&(x, y, l)| {
-            (x, y) == tap.grid_cell
-                && (l as usize != tap.pad_layer_index || !tap.stub_segments.is_empty())
-        })
+        .any(|&cell| tap_reaches_terminal_cell(tap, cell, route_layers, board))
 }
 
 fn materialize_tap(
@@ -1596,21 +2137,25 @@ fn execute_single(
     // tap's via cell, which is not an original endpoint; resolving it here keeps
     // the exact physical tap point and its actual arrival layer attached.
     let start = endpoint_for_path_terminal(
+        request.net_id,
         &start_candidates,
         path_start,
         &request.route_layers,
         &trial,
         outcome.grid_step_board,
         &tap_results,
+        &outcome.landing_aliases,
     )?
     .ok_or("awx_grid started at a cell without a source endpoint")?;
     let target = endpoint_for_path_terminal(
+        request.net_id,
         &target_candidates,
         path_end,
         &request.route_layers,
         &trial,
         outcome.grid_step_board,
         &tap_results,
+        &outcome.landing_aliases,
     )?
     .ok_or("awx_grid ended at a cell without a source endpoint")?;
     let mut through_hole_positions = super::native_grid_window::same_net_through_hole_positions(
@@ -1621,9 +2166,9 @@ fn execute_single(
     )?;
     let mut registered_via_sizes = outcome.registered_via_sizes.clone();
     for tap in &tap_results {
-        through_hole_positions.insert(tap.grid_cell);
+        through_hole_positions.insert(tap.tap.grid_cell);
         registered_via_sizes.extend(
-            tap.registered_via_sizes
+            tap.tap.registered_via_sizes
                 .iter()
                 .map(|(&cell, &size)| (cell, size)),
         );
@@ -1635,7 +2180,7 @@ fn execute_single(
         .get(&(request.net_id as i32))
         .copied()
         .unwrap_or([request.rules.via_size, request.rules.via_drill]);
-    let geometry = super::grid_path::path_to_geometry(super::grid_path::GridPathRequest {
+    let mut geometry = super::grid_path::path_to_geometry(super::grid_path::GridPathRequest {
         path: &path,
         grid_step_board: outcome.grid_step_board,
         route_layers: &request.route_layers,
@@ -1652,10 +2197,41 @@ fn execute_single(
         via_refit_rungs: &via_refit_rungs,
         through_hole_positions: &through_hole_positions,
     })?;
-    for tap in &tap_results {
-        materialize_tap(&mut trial, tap, request.net_id)?;
+    // #479: for a seeded blocked-pad landing, bridge the landed cell to the
+    // pad's exact native Pin centre with a same-net full-width connector that
+    // stays inside the pad copper. The grid geometry itself stays land-exact.
+    if let Some(center) = outcome.landing_aliases.get(&path_start) {
+        push_landing_connector(&mut geometry, &start, center, &trial, request.net_id)?;
     }
-    materialize_grid_geometry(&mut trial, &geometry, request.net_id)?;
+    if let Some(center) = outcome.landing_aliases.get(&path_end) {
+        push_landing_connector(&mut geometry, &target, center, &trial, request.net_id)?;
+    }
+    let source_trace_ids = request
+        .board
+        .board
+        .get_traces()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for tap in &tap_results {
+        materialize_tap(&mut trial, &tap.tap, request.net_id)?;
+    }
+    materialize_grid_geometry(&mut trial, &geometry, request.net_id, &[])?;
+    // Native trace contact is `*point == other.center(self)`: a newly materialized
+    // trace end that sits in the same-net pin/via copper but not exactly at the
+    // centre is physically connected yet not contact-connected. Bridge only the
+    // traces this transaction just added (difference against the source board),
+    // to the exact drill centre, width clamped to the room inside the pad's
+    // copper. Previously existing source/runtime traces are never rescanned or
+    // modified.
+    let new_trace_ids = trial
+        .board
+        .get_traces()
+        .into_iter()
+        .filter(|key| !source_trace_ids.contains(key))
+        .collect::<Vec<_>>();
+    let _bridges = trial
+        .board
+        .bridge_trace_ends_to_drill_centers_for(&new_trace_ids);
     if let Err(e) = trial.assert_invariants(&request.board, &BTreeSet::new(), true) {
         return Ok(refused(&format!("native rung board delta invalid: {e}")));
     }
@@ -1709,7 +2285,7 @@ fn execute_single(
         .collect();
     for tap in &tap_results {
         segments.extend(
-            tap.stub_segments
+            tap.tap.stub_segments
                 .iter()
                 .map(|s| super::pair_connection::PairPiece {
                     a: s.a,
@@ -1720,10 +2296,10 @@ fn execute_single(
                 }),
         );
         vias.push(super::pair_connection::PairVia {
-            point: tap.via.point,
-            diameter: tap.via.diameter,
-            drill: tap.via.drill,
-            layers: tap.via.layers.clone(),
+            point: tap.tap.via.point,
+            diameter: tap.tap.via.diameter,
+            drill: tap.tap.via.drill,
+            layers: tap.tap.via.layers.clone(),
             net_id: request.net_id,
         });
     }
@@ -1768,38 +2344,47 @@ fn endpoint_for_grid_cell(
 
 /// Resolve a path terminal first against the ordinary candidate set, then
 /// against any materialized unblock tap whose escape-via cell the retry
-/// terminated on. A tap is a same-net pad via, so the honest endpoint is the
-/// via's physical point on the path's actual arrival layer; the existing tap
-/// materialization and stub copper complete the pad connection.
+/// terminated on, then against a #479 seeded blocked-pad landing. A tap is a
+/// same-net pad via, so the honest endpoint is the via's physical point on the
+/// path's actual arrival layer; the existing tap materialization and stub
+/// copper complete the pad connection. A seeded landing resolves to the ACTUAL
+/// landing endpoint at the selected grid cell (NOT the pad centre -- that would
+/// drag source geometry); its native Pin-centre bridge is materialized later.
 fn endpoint_for_path_terminal(
+    net: NetNo,
     candidates: &[RungEndpoint],
     cell: (i32, i32, u8),
     route_layers: &[String],
     board: &BoardAdapter,
     step: i32,
-    taps: &[super::via_pad_tap::TapResult],
+    taps: &[OwnedTapResult],
+    landing_aliases: &BTreeMap<(i32, i32, u8), RungEndpoint>,
 ) -> Result<Option<RungEndpoint>, String> {
     if let Some(endpoint) = endpoint_for_grid_cell(candidates, cell, route_layers, board, step)? {
         return Ok(Some(endpoint));
     }
-    for tap in taps {
-        if tap.grid_cell == (cell.0, cell.1) {
-            // Return the tap's exact physical via point on the path's ACTUAL
-            // arrival layer (`cell.2`), not the pad's own layer. When the retry
-            // arrives on an inner/source-escape layer the pad layer differs, and
-            // `terminal_copper_on_layer`'s half-cell `round()` ties-even can miss
-            // the through-hole cell, silently dropping the connector. Naming the
-            // arrival layer makes the connector's layer equal the path layer, so
-            // it is emitted without touching grid round policy.
-            let layer = route_layers
-                .get(cell.2 as usize)
-                .cloned()
-                .ok_or("via-pad tap arrival layer is outside the route layers")?;
-            return Ok(Some(RungEndpoint {
-                point: tap.via.point,
-                layer,
-            }));
-        }
+    if let Some(tap) = tap_for_path_terminal(taps, cell, route_layers, board, net)? {
+        // Return the chosen tap's exact physical via point on the path's ACTUAL
+        // arrival layer, retaining that same tap's native Pad owner.
+        let layer = route_layers
+            .get(cell.2 as usize)
+            .cloned()
+            .ok_or("via-pad tap arrival layer is outside the route layers")?;
+        return Ok(Some(RungEndpoint {
+            point: tap.tap.via.point,
+            layer,
+        }));
+    }
+    if landing_aliases.contains_key(&cell) {
+        let layer = route_layers
+            .get(cell.2 as usize)
+            .cloned()
+            .ok_or("blocked-pad landing layer is outside the route layers")?;
+        let step_mm = step as f64 / board.units_per_mm;
+        return Ok(Some(RungEndpoint {
+            point: [cell.0 as f64 * step_mm, cell.1 as f64 * step_mm],
+            layer,
+        }));
     }
     Ok(None)
 }
@@ -1808,6 +2393,7 @@ fn materialize_grid_geometry(
     board: &mut BoardAdapter,
     geometry: &super::grid_path::GridPathGeometry,
     net: NetNo,
+    exact_endpoints: &[ExactEndpointOverride],
 ) -> Result<(), String> {
     for via in &geometry.vias {
         let info = board.board.rules.via_infos[via.via_info].clone();
@@ -1827,8 +2413,8 @@ fn materialize_grid_geometry(
         if layer < 0 {
             return Err(format!("grid path uses invalid stack layer {}", seg.layer));
         }
-        let start = board.point(seg.start_mm)?;
-        let end = board.point(seg.end_mm)?;
+        let start = geometry_endpoint(board, seg.start_mm, &seg.layer, exact_endpoints)?;
+        let end = geometry_endpoint(board, seg.end_mm, &seg.layer, exact_endpoints)?;
         let width = size_in_units(seg.width_mm / 2.0, board.units_per_mm)?;
         let class = board
             .board
@@ -1848,6 +2434,27 @@ fn materialize_grid_geometry(
             .ok_or("grid path trace insertion failed")?;
     }
     Ok(())
+}
+
+/// Resolve a geometry endpoint to its native `Point`. An island-tap weld hands
+/// over the engine's EXACT projected point; using it verbatim keeps the new
+/// trace in exact contact with the split copper instead of quantizing the
+/// millimetres back through `BoardAdapter::point` to an `Int`.
+fn geometry_endpoint(
+    board: &BoardAdapter,
+    point_mm: [f64; 2],
+    layer: &str,
+    exact_endpoints: &[ExactEndpointOverride],
+) -> Result<EnginePoint, String> {
+    for (mm, exact_layer, exact) in exact_endpoints {
+        if exact_layer == layer
+            && (mm[0] - point_mm[0]).abs() <= 1e-9
+            && (mm[1] - point_mm[1]).abs() <= 1e-9
+        {
+            return Ok(exact.clone());
+        }
+    }
+    board.point(point_mm)
 }
 
 fn refused(reason: &str) -> RungExecution<NativeRungRoute> {
@@ -2221,13 +2828,36 @@ pub fn route_multilayer_endpoints(
     route_multilayer_endpoint_sets(request, from_item, to_item, &starts, &targets)
 }
 
-pub fn route_multilayer_endpoint_sets(
+/// Minimal policy binding the old public wrapper to the in-run entry of the
+/// shared endpoint-set routing core. The core itself is identical for both; the
+/// only differences are which board is the frozen baseline, which nets are
+/// protected, and whether the SOURCE-required split of a same-net THIS-RUN
+/// trace at the selected island-tap endpoint is authorised.
+struct EndpointSetPolicy<'a> {
+    /// Actual captured input board. Imported copper/pins/rules/boundary must be
+    /// preserved against it and it is never mutated.
+    baseline: &'a BoardAdapter,
+    protected: &'a BTreeSet<String>,
+    /// In-run entry only: allow the authorised split of a same-net trace that
+    /// belongs to this run (id absent from `baseline`) and is not protected.
+    split_this_run_trace: bool,
+}
+
+fn route_multilayer_endpoint_sets_core(
     mut request: RungRequest,
     from_item: fr_engine::board::ItemKey,
     to_item: fr_engine::board::ItemKey,
     start_candidates: &[RungEndpoint],
     target_candidates: &[RungEndpoint],
-) -> Result<(Option<BoardAdapter>, serde_json::Value), String> {
+    policy: EndpointSetPolicy<'_>,
+) -> Result<
+    (
+        Option<BoardAdapter>,
+        serde_json::Value,
+        Option<super::braid_connect::RungReport>,
+    ),
+    String,
+> {
     if request.route_layers.is_empty() || request.pair.is_some() || request.band.is_some() {
         return Err("endpoint adapter requires active layers and a single-ended request".into());
     }
@@ -2245,7 +2875,7 @@ pub fn route_multilayer_endpoint_sets(
         return Ok((None, serde_json::json!({
             "accepted": false,
             "reason": "endpoint candidate set has no active route layer"
-        })));
+        }), None));
     }
     request.start = starts[0].clone();
     request.end = targets[0].clone();
@@ -2279,7 +2909,7 @@ pub fn route_multilayer_endpoint_sets(
         // before reporting no-path; only then is the failure honest.
         if request.deadline.is_some_and(|d| Instant::now() >= d) {
             report["reason"] = "deadline elapsed before via-pad unblock".into();
-            return Ok((None, report));
+            return Ok((None, report, None));
         }
         match try_via_pad_unblock(&request, &mut outcome)? {
             Some((path, taps)) => {
@@ -2293,7 +2923,20 @@ pub fn route_multilayer_endpoint_sets(
                 report["path_cells"] = outcome.path.as_ref().map_or(0, Vec::len).into();
                 report["reason"] =
                     "source GridRouter and via-pad unblocking returned no path".into();
-                return Ok((None, report));
+                // PRIVATE keystone, not user schema: the exact foreign net(s)
+                // whose mature Trace/Via copper boxed a pad while the in-pad tap
+                // declined with nothing in flight (source `_via_unblock_blame`).
+                // The endpoint owner strips this before public logging and hands
+                // it to `RecoveryState`; existing report keys are unchanged.
+                report["_via_unblock_blame"] = serde_json::json!(
+                    outcome
+                        .via_unblock_blame
+                        .iter()
+                        .copied()
+                        .collect::<Vec<NetNo>>()
+                );
+                let frontier = frontier_report(&request, &outcome, trial.units_per_mm);
+                return Ok((None, report, Some(frontier)));
             }
         }
     };
@@ -2303,33 +2946,38 @@ pub fn route_multilayer_endpoint_sets(
     report["path_cells"] = path.len().into();
     if request.deadline.is_some_and(|d|Instant::now()>=d) {
         report["reason"] = "deadline elapsed during source GridRouter search".into();
-        return Ok((None,report));
+        return Ok((None,report,None));
     }
     let (Some(&path_start), Some(&path_end)) = (path.first(), path.last()) else {
         report["reason"] = "source GridRouter returned an empty path".into();
-        return Ok((None, report));
+        let frontier = frontier_report(&request, &outcome, trial.units_per_mm);
+        return Ok((None, report, Some(frontier)));
     };
-    let Some(start) = endpoint_for_path_terminal(
+    let Some(mut start) = endpoint_for_path_terminal(
+        net,
         &starts,
         path_start,
         &request.route_layers,
         &trial,
         outcome.grid_step_board,
         &tap_results,
+        &outcome.landing_aliases,
     )? else {
         report["reason"] = "GridRouter path starts outside the source endpoint set".into();
-        return Ok((None, report));
+        return Ok((None, report, None));
     };
-    let Some(target) = endpoint_for_path_terminal(
+    let Some(mut target) = endpoint_for_path_terminal(
+        net,
         &targets,
         path_end,
         &request.route_layers,
         &trial,
         outcome.grid_step_board,
         &tap_results,
+        &outcome.landing_aliases,
     )? else {
         report["reason"] = "GridRouter path ends outside the target endpoint set".into();
-        return Ok((None, report));
+        return Ok((None, report, None));
     };
     report["start_endpoint"] = serde_json::json!({
         "point": start.point,
@@ -2339,28 +2987,321 @@ pub fn route_multilayer_endpoint_sets(
         "point": target.point,
         "layer": target.layer,
     });
+    // In-run only: the selected start/target endpoint may land on the interior
+    // centreline of a same-net THIS-RUN trace (the island tap). The SOURCE-
+    // required weld splits that trace at the EXACTLY projected native point and
+    // relocates the route endpoint onto the real split contact so the new trace
+    // physically connects. Baseline/protected copper is never split; the stable
+    // before-split Pin/Via group identities are snapshotted here so the merge
+    // proof does not depend on the possibly-removed representative key.
+    let mut stable_from = None;
+    let mut stable_to = None;
+    let mut welded_pieces = Vec::new();
+    let mut exact_endpoints: Vec<ExactEndpointOverride> = Vec::new();
+    if policy.split_this_run_trace {
+        // A via-pad retry may start or land on a newly created, not-yet-
+        // materialized via. Its pad representative remains the only native
+        // owner in the working board; ordinary routed terminals resolve to
+        // the exact Pin/Via/Trace candidate selected by the search.
+        let source_is_candidate = endpoint_for_grid_cell(
+            &starts,
+            path_start,
+            &request.route_layers,
+            &trial,
+            outcome.grid_step_board,
+        )?
+        .is_some();
+        let target_is_candidate = endpoint_for_grid_cell(
+            &targets,
+            path_end,
+            &request.route_layers,
+            &trial,
+            outcome.grid_step_board,
+        )?
+        .is_some();
+        // Match the same first tap that endpoint_for_path_terminal resolves
+        // after exhausting ordinary candidates. Keep its real Pad ItemKey;
+        // source/target side alone does not identify the SMD pad selected from
+        // the nearby-cell rescue search.
+        let source_tap = if source_is_candidate {
+            None
+        } else {
+            tap_for_path_terminal(
+                &tap_results,
+                path_start,
+                &request.route_layers,
+                &trial,
+                net,
+            )?
+        };
+        let target_tap = if target_is_candidate {
+            None
+        } else {
+            tap_for_path_terminal(
+                &tap_results,
+                path_end,
+                &request.route_layers,
+                &trial,
+                net,
+            )?
+        };
+        let source_is_tap = source_tap.is_some();
+        let target_is_tap = target_tap.is_some();
+        let source_landing = (!source_is_candidate && !source_is_tap)
+            .then(|| outcome.landing_aliases.get(&path_start))
+            .flatten();
+        let target_landing = (!target_is_candidate && !target_is_tap)
+            .then(|| outcome.landing_aliases.get(&path_end))
+            .flatten();
+        let source_owner_endpoint = source_landing.unwrap_or(&start);
+        let target_owner_endpoint = target_landing.unwrap_or(&target);
+        let source_owner = if let Some(tap) = source_tap {
+            SelectedEndpointOwner {
+                item: tap.pad_owner,
+                exact_point: None,
+            }
+        } else {
+            selected_endpoint_owner(
+                &trial,
+                policy.baseline,
+                net,
+                source_owner_endpoint,
+                request.rules.grid_step,
+            )?.ok_or(
+                "selected source endpoint has no exact native owner",
+            )?
+        };
+        let target_owner = if let Some(tap) = target_tap {
+            SelectedEndpointOwner {
+                item: tap.pad_owner,
+                exact_point: None,
+            }
+        } else {
+            selected_endpoint_owner(
+                &trial,
+                policy.baseline,
+                net,
+                target_owner_endpoint,
+                request.rules.grid_step,
+            )?.ok_or(
+                "selected target endpoint has no exact native owner",
+            )?
+        };
+        stable_from = Some(stable_group_members(&trial, source_owner.item, net));
+        stable_to = Some(stable_group_members(&trial, target_owner.item, net));
+        let source_weld = if source_is_tap
+            || source_landing.is_some()
+            || source_owner.exact_point.is_some()
+        {
+            Ok(None)
+        } else {
+            weld_island_tap_endpoint(
+                &mut trial,
+                policy.baseline,
+                policy.protected,
+                net,
+                source_owner.item,
+                &start,
+                &mut welded_pieces,
+            )
+        };
+        match source_weld {
+            Ok(Some((welded, exact))) => {
+                report["start_endpoint"] = serde_json::json!({
+                    "point": welded.point,
+                    "layer": welded.layer,
+                });
+                if let Some(exact) = exact {
+                    exact_endpoints.push((welded.point, welded.layer.clone(), exact));
+                }
+                start = welded;
+            }
+            Ok(None) => {
+                if let Some(exact) = source_owner.exact_point {
+                    let endpoint = source_owner_endpoint;
+                    exact_endpoints.push((endpoint.point, endpoint.layer.clone(), exact));
+                }
+            }
+            Err(reason) => {
+                report["reason"] = reason.into();
+                return Ok((None, report, None));
+            }
+        }
+        let target_weld = if target_is_tap
+            || target_landing.is_some()
+            || target_owner.exact_point.is_some()
+        {
+            Ok(None)
+        } else {
+            weld_island_tap_endpoint(
+                &mut trial,
+                policy.baseline,
+                policy.protected,
+                net,
+                target_owner.item,
+                &target,
+                &mut welded_pieces,
+            )
+        };
+        match target_weld {
+            Ok(Some((welded, exact))) => {
+                report["end_endpoint"] = serde_json::json!({
+                    "point": welded.point,
+                    "layer": welded.layer,
+                });
+                if let Some(exact) = exact {
+                    exact_endpoints.push((welded.point, welded.layer.clone(), exact));
+                }
+                target = welded;
+            }
+            Ok(None) => {
+                if let Some(exact) = target_owner.exact_point {
+                    let endpoint = target_owner_endpoint;
+                    exact_endpoints.push((endpoint.point, endpoint.layer.clone(), exact));
+                }
+            }
+            Err(reason) => {
+                report["reason"] = reason.into();
+                return Ok((None, report, None));
+            }
+        }
+    }
     let mut through_holes = super::native_grid_window::same_net_through_hole_positions(&trial, &[net], &request.free_via_pads, outcome.grid_step_board)?;
     // A tapped via is a same-net through-hole barrel: skip it in the emitted
     // path's via-through-hole checks and carry its registered physical size.
     let mut registered_via_sizes = outcome.registered_via_sizes.clone();
     for tap in &tap_results {
-        through_holes.insert(tap.grid_cell);
-        registered_via_sizes.extend(tap.registered_via_sizes.iter().map(|(&cell, &size)| (cell, size)));
+        through_holes.insert(tap.tap.grid_cell);
+        registered_via_sizes.extend(
+            tap.tap
+                .registered_via_sizes
+                .iter()
+                .map(|(&cell, &size)| (cell, size)),
+        );
     }
-    let geometry = super::grid_path::path_to_geometry(super::grid_path::GridPathRequest {
+    let mut geometry = super::grid_path::path_to_geometry(super::grid_path::GridPathRequest {
         path:&path,grid_step_board:outcome.grid_step_board,route_layers:&request.route_layers,
         start:&start,target:&target,board:&trial,net,
         via_candidates:control.via_rule.vias(),via_size_mm:request.rules.via_size,via_drill_mm:request.rules.via_drill,
         hole_to_hole_clearance_mm:request.rules.hole_to_hole_clearance,via_refit_rungs:&outcome.via_refit_rungs,
         registered_via_sizes:&registered_via_sizes,existing_vias:&request.existing_vias,through_hole_positions:&through_holes,
     })?;
+    // #479: bridge a seeded blocked-pad landing to the pad's exact native Pin
+    // centre (same-net, inside the pad copper); grid geometry stays land-exact.
+    if let Some(center) = outcome.landing_aliases.get(&path_start) {
+        push_landing_connector(&mut geometry, &start, center, &trial, net)?;
+    }
+    if let Some(center) = outcome.landing_aliases.get(&path_end) {
+        push_landing_connector(&mut geometry, &target, center, &trial, net)?;
+    }
     // Commit the kept unblock copper, then the grid geometry, so the landed
     // board carries the tapped vias the retry actually reached (#803).
+    let source_trace_ids = request
+        .board
+        .board
+        .get_traces()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     for tap in &tap_results {
-        materialize_tap(&mut trial, tap, net)?;
+        materialize_tap(&mut trial, &tap.tap, net)?;
     }
-    materialize_grid_geometry(&mut trial,&geometry,net)?;
-    if let Err(error)=trial.assert_preserved(&request.board) {
+    materialize_grid_geometry(&mut trial, &geometry, net, &exact_endpoints)?;
+    // Native trace contact is `*point == other.center(self)`: a newly materialized
+    // trace end that sits in the same-net pin/via copper but not exactly at the
+    // centre is physically connected yet not contact-connected. Bridge only the
+    // traces this transaction just added (difference against the source board),
+    // to the exact drill centre, width clamped to the room inside the pad's
+    // copper. Previously existing source/runtime traces are never rescanned or
+    // modified.
+    let new_trace_ids = trial
+        .board
+        .get_traces()
+        .into_iter()
+        .filter(|key| !source_trace_ids.contains(key) && !welded_pieces.contains(key))
+        .collect::<Vec<_>>();
+    let bridges = trial
+        .board
+        .bridge_trace_ends_to_drill_centers_for(&new_trace_ids);
+    // In-run only: the operation must not ADD copper on a foreign working net,
+    // NOR delete or mutate an existing FOREIGN working item (its geometry, net,
+    // clearance class or fixed state). `assert_invariants` only guards the
+    // frozen baseline/protected copper, so the working-board delta is checked
+    // explicitly here.
+    if policy.split_this_run_trace {
+        let working_ids = request
+            .board
+            .board
+            .get_items()
+            .into_iter()
+            .map(|key| request.board.board.item(key).id().0)
+            .collect::<BTreeSet<_>>();
+        if trial.board.get_items().into_iter().any(|key| {
+            let item = trial.board.item(key);
+            !working_ids.contains(&item.id().0)
+                && (item.is_trace() || item.is_via())
+                && !item.contains_net(net)
+        }) {
+            report["reason"] = "in-run route added copper on a foreign working net".into();
+            return Ok((None, report, None));
+        }
+        // Existing foreign WORKING items (added this run by earlier steps) must
+        // survive unchanged.
+        let baseline_ids = policy
+            .baseline
+            .board
+            .get_items()
+            .into_iter()
+            .map(|key| policy.baseline.board.item(key).id().0)
+            .collect::<BTreeSet<_>>();
+        let mut foreign_working = BTreeMap::<i32, String>::new();
+        for key in request.board.board.get_items() {
+            let item = request.board.board.item(key);
+            if !(item.is_trace() || item.is_via()) || item.contains_net(net) {
+                continue;
+            }
+            let id = item.id().0;
+            if baseline_ids.contains(&id) {
+                continue;
+            }
+            foreign_working.insert(id, working_item_signature(&request.board, key));
+        }
+        for (id, signature) in &foreign_working {
+            let Some(key) = trial
+                .board
+                .get_items()
+                .into_iter()
+                .find(|key| trial.board.item(*key).id().0 == *id)
+            else {
+                report["reason"] = "in-run route removed a foreign working item".into();
+                return Ok((None, report, None));
+            };
+            if &working_item_signature(&trial, key) != signature {
+                report["reason"] =
+                    "in-run route changed a foreign working item's geometry, net, class or fixed state"
+                        .into();
+                return Ok((None, report, None));
+            }
+        }
+        // The same-net island-tap split must not disconnect an earlier stable
+        // Pin/Via group: each group snapshotted before the split must still sit
+        // in one connected set.
+        for group in [stable_from.as_ref(), stable_to.as_ref()].into_iter().flatten() {
+            if group.is_empty() {
+                continue;
+            }
+            if !trial
+                .board
+                .get_connected_sets(net)
+                .iter()
+                .any(|set| group.iter().all(|id| set.contains(*id)))
+            {
+                report["reason"] =
+                    "in-run same-net split disconnected a stable pin/via group".into();
+                return Ok((None, report, None));
+            }
+        }
+    }
+    if let Err(error)=trial.assert_invariants(policy.baseline, policy.protected, true) {
         let details: Vec<_>=trial.board.get_items().into_iter().flat_map(|key|fr_engine::drc::clearance_violation::clearance_violations(&trial.board,key)).map(|v| {
             let a=trial.board.item(v.first_item);let b=trial.board.item(v.second_item);
             serde_json::json!({"first_id":a.id().0,"first_type":format!("{:?}",a.board_item_type()),"second_id":b.id().0,"second_type":format!("{:?}",b.board_item_type()),"layer":v.layer,"expected_clearance_mm":v.expected_clearance/trial.units_per_mm,"actual_clearance_mm":v.actual_clearance/trial.units_per_mm,"overlap_bounds":format!("{:?}",v.shape.bounding_box())})
@@ -2369,12 +3310,12 @@ pub fn route_multilayer_endpoint_sets(
         report["candidate_violations"]=serde_json::json!(details);
         report["candidate_vias"]=serde_json::json!(geometry.vias.iter().map(|v|serde_json::json!({"point_mm":v.point_mm,"diameter_mm":v.diameter_mm,"drill_mm":v.drill_mm,"from_layer":v.from_layer,"to_layer":v.to_layer})).collect::<Vec<_>>());
         report["candidate_segments"]=serde_json::json!(geometry.segments.iter().map(|s|serde_json::json!({"start_mm":s.start_mm,"end_mm":s.end_mm,"layer":s.layer,"width_mm":s.width_mm})).collect::<Vec<_>>());
-        return Ok((None,report));
+        return Ok((None,report,None));
     }
 
     let before = fr_engine::drc::NetIncompletes::new(&request.board.board,net,&request.board.board.get_connectable_items(net)).count();
     let after = fr_engine::drc::NetIncompletes::new(&trial.board,net,&trial.board.get_connectable_items(net)).count();
-    // `assert_preserved` above compares the trial's full-board clearance
+    // `assert_invariants` above compares the trial's full-board clearance
     // violations with the baseline and rejects any new violation. The trial
     // is unchanged since that proof, so the accepted route's new-violation
     // count is exactly zero without running the same full-board scan again.
@@ -2382,8 +3323,11 @@ pub fn route_multilayer_endpoint_sets(
     report["incompletes_before"] = before.into();
     report["incompletes_after"] = after.into();
     report["new_violations"] = new_violations.into();
-    let tap_stub_segments: usize = tap_results.iter().map(|tap| tap.stub_segments.len()).sum();
-    report["segments"] = (geometry.segments.len() + tap_stub_segments).into();
+    let tap_stub_segments: usize = tap_results
+        .iter()
+        .map(|tap| tap.tap.stub_segments.len())
+        .sum();
+    report["segments"] = (geometry.segments.len() + tap_stub_segments + bridges).into();
     report["vias"] = (geometry.vias.len() + tap_results.len()).into();
     report["layer_transitions"] = path.windows(2).filter(|w|w[0].2!=w[1].2).count().into();
     let mut via_geometry = geometry.vias.iter().map(|v| {
@@ -2392,18 +3336,646 @@ pub fn route_multilayer_endpoint_sets(
         serde_json::json!({"point_mm":v.point_mm,"diameter_mm":v.diameter_mm,"drill_mm":v.drill_mm,"from_layer":v.from_layer,"to_layer":v.to_layer,"physical_first_layer":pad.from_layer(),"physical_last_layer":pad.to_layer()})
     }).collect::<Vec<_>>();
     for tap in &tap_results {
-        via_geometry.push(serde_json::json!({"point_mm":tap.via.point,"diameter_mm":tap.via.diameter,"drill_mm":tap.via.drill,"from_layer":tap.via.layers.first(),"to_layer":tap.via.layers.last()}));
+        via_geometry.push(serde_json::json!({"point_mm":tap.tap.via.point,"diameter_mm":tap.tap.via.diameter,"drill_mm":tap.tap.via.drill,"from_layer":tap.tap.via.layers.first(),"to_layer":tap.tap.via.layers.last()}));
     }
     report["via_geometry"] = serde_json::json!(via_geometry);
 
-    let merged = trial.board.connected_set(from_item,net,false).contains(trial.board.item(to_item).id());
+    // Merge proof. The in-run entry can split a representative (a this-run
+    // trace) out of the board, so it uses the stable Pin/Via group identities
+    // snapshotted before the split instead of the possibly-removed key. The old
+    // wrapper keeps its exact original key-based check.
+    let merged = match (&stable_from, &stable_to) {
+        (Some(from_ids), Some(to_ids)) => trial.board.get_connected_sets(net).iter().any(|set| {
+            from_ids.iter().any(|id| set.contains(*id))
+                && to_ids.iter().any(|id| set.contains(*id))
+        }),
+        _ => trial
+            .board
+            .connected_set(from_item, net, false)
+            .contains(trial.board.item(to_item).id()),
+    };
     report["target_groups_merged"] = merged.into();
     if !merged || after>=before || new_violations!=0 {
         report["reason"] = "native transaction did not reduce incompletes without new violations".into();
-        return Ok((None,report));
+        return Ok((None,report,None));
     }
     report["accepted"] = true.into();
-    Ok((Some(trial),report))
+    Ok((Some(trial),report,None))
+}
+
+/// Old public entry: strict CURRENT-BOARD immutability with an empty protected
+/// set and no this-run trace splitting. Behaviour, report keys and control
+/// classes are unchanged; only the third tuple element added for the in-run
+/// entry is dropped here.
+pub fn route_multilayer_endpoint_sets(
+    request: RungRequest,
+    from_item: fr_engine::board::ItemKey,
+    to_item: fr_engine::board::ItemKey,
+    start_candidates: &[RungEndpoint],
+    target_candidates: &[RungEndpoint],
+) -> Result<(Option<BoardAdapter>, serde_json::Value), String> {
+    let baseline = request.board.clone();
+    let (board, report, _frontier) = route_multilayer_endpoint_sets_core(
+        request,
+        from_item,
+        to_item,
+        start_candidates,
+        target_candidates,
+        EndpointSetPolicy {
+            baseline: &baseline,
+            protected: &BTreeSet::new(),
+            split_this_run_trace: false,
+        },
+    )?;
+    Ok((board, report))
+}
+
+/// In-run entry. The frozen baseline is the caller's ACTUAL captured input
+/// board (never an empty fabricated board) and `protected` is the authoritative
+/// protected-net set. The shared core proves preservation with
+/// `trial.assert_invariants(baseline, protected, true)`, forbids copper on any
+/// other working net, and -- only for a same-net THIS-RUN trace that is neither
+/// in the baseline nor protected -- performs the SOURCE-required split at the
+/// selected island-tap endpoint, welding the route geometry endpoint to the
+/// real native split/contact point. On a genuine SourceGridSearch no-path
+/// failure the third tuple carries the existing frontier report; non-search
+/// errors return `None` there.
+pub(crate) fn route_multilayer_endpoint_sets_in_run(
+    request: RungRequest,
+    from_item: fr_engine::board::ItemKey,
+    to_item: fr_engine::board::ItemKey,
+    start_candidates: &[RungEndpoint],
+    target_candidates: &[RungEndpoint],
+    baseline: &BoardAdapter,
+    protected: &BTreeSet<String>,
+) -> Result<
+    (
+        Option<BoardAdapter>,
+        serde_json::Value,
+        Option<super::braid_connect::RungReport>,
+    ),
+    String,
+> {
+    route_multilayer_endpoint_sets_core(
+        request,
+        from_item,
+        to_item,
+        start_candidates,
+        target_candidates,
+        EndpointSetPolicy {
+            baseline,
+            protected,
+            split_this_run_trace: true,
+        },
+    )
+}
+
+/// Existing frontier report shape surfaced on a SourceGridSearch failure, built
+/// only from the search outcome's own window/step/layers/iterations/frontier.
+/// No new public telemetry keys are introduced.
+fn frontier_report(
+    request: &RungRequest,
+    outcome: &GridSearchResult,
+    units_per_mm: f64,
+) -> super::braid_connect::RungReport {
+    let (frontier, expanded) = if request.stage == "source_rip_retry" {
+        (&outcome.frontier, outcome.iterations)
+    } else if outcome.forward_iterations > 0
+        && (outcome.backward_iterations == 0
+            || outcome.forward_iterations <= outcome.backward_iterations)
+    {
+        (&outcome.forward_frontier, outcome.forward_iterations)
+    } else if outcome.backward_iterations > 0 {
+        (&outcome.backward_frontier, outcome.backward_iterations)
+    } else {
+        (&outcome.frontier, outcome.iterations)
+    };
+    super::braid_connect::RungReport {
+        blocked_cells: frontier
+            .iter()
+            .map(|&(x, y, layer)| (x, y, layer as usize))
+            .collect(),
+        route_layers: request.route_layers.clone(),
+        window: [
+            outcome.window.ll.x as f64 / units_per_mm,
+            outcome.window.ll.y as f64 / units_per_mm,
+            outcome.window.ur.x as f64 / units_per_mm,
+            outcome.window.ur.y as f64 / units_per_mm,
+        ],
+        grid_step_mm: outcome.grid_step_board as f64 / units_per_mm,
+        expanded,
+        truncated: false,
+    }
+}
+
+#[derive(Clone)]
+struct SelectedEndpointOwner {
+    item: fr_engine::board::ItemKey,
+    exact_point: Option<EnginePoint>,
+}
+
+/// Exact source tap samples used by `this_run_trace_tap_points`: sample each
+/// approximated polyline edge at `max(1, int(length / grid_step))` intervals,
+/// including both ends. This proves that a selected interior coordinate is a
+/// real candidate sample; it does not assign ownership by nearest geometry.
+fn trace_has_source_tap_sample(
+    polyline: &Polyline,
+    selected_mm: [f64; 2],
+    grid_step_mm: f64,
+    units_per_mm: f64,
+) -> bool {
+    if !grid_step_mm.is_finite() || grid_step_mm <= 0.0 || !units_per_mm.is_finite() {
+        return false;
+    }
+    for window in polyline.corner_approx_arr().windows(2) {
+        let x0 = window[0].x as f64 / units_per_mm;
+        let y0 = window[0].y as f64 / units_per_mm;
+        let x1 = window[1].x as f64 / units_per_mm;
+        let y1 = window[1].y as f64 / units_per_mm;
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let length = (dx * dx + dy * dy).sqrt();
+        if length < 0.001 {
+            if [x0, y0] == selected_mm {
+                return true;
+            }
+            continue;
+        }
+        let steps = 1.max((length / grid_step_mm) as i64) as usize;
+        for index in 0..=steps {
+            let t = index as f64 / steps as f64;
+            if [x0 + t * dx, y0 + t * dy] == selected_mm {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve a selected candidate back to the native item that actually owns its
+/// terminal coordinate. Candidate lists in the in-run tap path may contain
+/// copper from more than the planner's nominal `from_item` component, so the
+/// selected coordinate, rather than that nominal representative, owns the
+/// source-side split and merge proof.
+///
+/// Pin/Via centres and Trace endpoints retain their original native Point,
+/// including Rational points. Interior Trace owners are accepted only when the
+/// selected coordinate lies on that real same-net centreline; the caller then
+/// uses the existing exact split/weld path. Coincident items are usable only if
+/// they already belong to one native connected set.
+fn selected_endpoint_owner(
+    board: &BoardAdapter,
+    baseline: &BoardAdapter,
+    net: NetNo,
+    endpoint: &RungEndpoint,
+    grid_step_mm: f64,
+) -> Result<Option<SelectedEndpointOwner>, String> {
+    let layer_no = board.board.layer_structure.get_no(&endpoint.layer);
+    if layer_no < 0 {
+        return Ok(None);
+    }
+    if endpoint.point.iter().any(|value| !value.is_finite()) {
+        return Err("selected endpoint owner has a nonfinite coordinate".into());
+    }
+
+    let mut owners = Vec::<(fr_engine::board::ItemKey, Option<EnginePoint>)>::new();
+    for key in board.board.get_items() {
+        let item = board.board.item(key);
+        if !item.is_on_board()
+            || !item.contains_net(net)
+            || !item.is_on_layer(&board.board, layer_no)
+        {
+            continue;
+        }
+        let mut exact = None;
+        let matches = match item.board_item_type() {
+            fr_engine::board::BoardItemType::Pin | fr_engine::board::BoardItemType::Via => {
+                let center = item.center(&board.board);
+                let p = center.to_float();
+                if [p.x / board.units_per_mm, p.y / board.units_per_mm] == endpoint.point {
+                    exact = Some(center);
+                    true
+                } else {
+                    false
+                }
+            }
+            fr_engine::board::BoardItemType::Trace => {
+                let trace = item.trace();
+                let polyline = trace.polyline();
+                let first = polyline.corner(0);
+                let last = polyline.corner(polyline.lines.len() as i32 - 2);
+                let endpoint_point = [first, last].into_iter().find(|point| {
+                    let p = point.to_float();
+                    [p.x / board.units_per_mm, p.y / board.units_per_mm] == endpoint.point
+                });
+                if let Some(point) = endpoint_point {
+                    exact = Some(point.clone());
+                    true
+                } else {
+                    let baseline_item = baseline
+                        .board
+                        .item_repository()
+                        .iter()
+                        .any(|baseline_key| {
+                            baseline.board.item(baseline_key).id() == item.id()
+                        });
+                    !baseline_item
+                        && trace_has_source_tap_sample(
+                            polyline,
+                            endpoint.point,
+                            grid_step_mm,
+                            board.units_per_mm,
+                        )
+                }
+            }
+            fr_engine::board::BoardItemType::ConductionArea => {
+                board
+                    .board
+                    .ratsnest_corners(key)
+                    .into_iter()
+                    .find(|point| {
+                        let p = point.to_float();
+                        [p.x / board.units_per_mm, p.y / board.units_per_mm] == endpoint.point
+                    })
+                    .filter(|point| {
+                        let first = item.first_layer(&board.board);
+                        let last = item.last_layer(&board.board);
+                        (0..board.board.tile_shape_count(key)).any(|index| {
+                            let layer = board.board.shape_layer(key, index);
+                            layer >= first
+                                && layer <= last
+                                && board
+                                    .board
+                                    .tile_shape(key, index)
+                                    .is_some_and(|shape| shape.contains(point))
+                        })
+                    })
+                    .map(|point| {
+                        exact = Some(point.clone());
+                    })
+                    .is_some()
+            }
+            _ => false,
+        };
+        if matches {
+            owners.push((key, exact));
+        }
+    }
+
+    let Some((first_key, _)) = owners.first() else {
+        return Ok(None);
+    };
+    let group = board.board.connected_set(*first_key, net, false);
+    if owners.iter().skip(1).any(|(key, _)| {
+        !group.contains(board.board.item(*key).id())
+    }) {
+        return Err("selected endpoint has multiple disconnected native owners".into());
+    }
+    let exact_points = owners
+        .iter()
+        .filter_map(|(_, point)| point.as_ref())
+        .collect::<Vec<_>>();
+    if exact_points
+        .iter()
+        .skip(1)
+        .any(|point| *point != exact_points[0])
+    {
+        return Err("selected endpoint aliases distinct native Points".into());
+    }
+    Ok(Some(SelectedEndpointOwner {
+        item: *first_key,
+        exact_point: exact_points.first().map(|point| (*point).clone()),
+    }))
+}
+
+/// Stable Pin/Via identities of the connected group at `key`, captured BEFORE
+/// any in-run split removes the representative. Only real board items are used;
+/// no component info is fabricated. Falls back to the representative's own id
+/// when the group carries no pin/via copper.
+fn stable_group_members(
+    board: &BoardAdapter,
+    key: fr_engine::board::ItemKey,
+    net: NetNo,
+) -> BTreeSet<fr_engine::ids::ItemId> {
+    let mut ids = BTreeSet::new();
+    if board.board.try_item(key).is_none() {
+        return ids;
+    }
+    let group = board.board.connected_set(key, net, false);
+    for member in group.iter() {
+        let item = board.board.item(member);
+        if item.is_pin() || item.is_via() {
+            ids.insert(item.id());
+        }
+    }
+    if ids.is_empty() {
+        if let Some(item) = board.board.try_item(key) {
+            ids.insert(item.id());
+        }
+    }
+    ids
+}
+
+/// Deterministic identity of a working item's type, nets, clearance class,
+/// fixed state and geometry, for the in-run foreign-working-item guard. A
+/// deletion or any change to these fields surfaces as a different signature.
+fn working_item_signature(board: &BoardAdapter, key: fr_engine::board::ItemKey) -> String {
+    let item = board.board.item(key);
+    let mut signature = format!(
+        "{:?}|{:?}|{}|{:?}",
+        item.board_item_type(),
+        item.net_numbers(),
+        item.clearance_class(),
+        item.fixed_state()
+    );
+    if item.is_trace() {
+        let trace = item.trace();
+        signature.push_str(&format!("|L{}W{}", trace.layer(), trace.half_width()));
+        let polyline = trace.polyline();
+        for index in 0..polyline.lines.len() as i32 - 1 {
+            signature.push_str(&format!("|{:?}", polyline.corner(index)));
+        }
+    } else if item.is_via() {
+        signature.push_str(&format!(
+            "|{:?}|{:?}",
+            item.center(&board.board),
+            item.as_via().map(|via| via.padstack_no())
+        ));
+    }
+    signature
+}
+
+/// The chosen route point lies inside this polyline's centreline, away from
+/// both end corners. `Int` corners compare exactly; a `Rational` perpendicular
+/// foot from `projection_line` is interior by construction.
+fn point_is_trace_interior(polyline: &Polyline, point: &EnginePoint) -> bool {
+    let Some(last_index) = polyline.lines.len().checked_sub(2) else {
+        return false;
+    };
+    let first = polyline.corner(0);
+    let last = polyline.corner(last_index as i32);
+    if points_coincide(point, &first) || points_coincide(point, &last) {
+        return false;
+    }
+    if point.is_int_point() {
+        polyline.contains(point)
+    } else {
+        true
+    }
+}
+
+fn points_coincide(a: &EnginePoint, b: &EnginePoint) -> bool {
+    let (fa, fb) = (a.to_float(), b.to_float());
+    (fa.x - fb.x).abs() <= 1e-6 && (fa.y - fb.y).abs() <= 1e-6
+}
+
+/// Resolve the ACTUAL same-net THIS-RUN trace that owns the source-chosen tap
+/// point. `representative` (the caller's from_item/to_item) is usually a Pin or
+/// Via, so the owner is searched inside that representative's OWN connected
+/// group -- never an arbitrary nearest unrelated trace or a virtual pin.
+fn island_tap_owner(
+    board: &BoardAdapter,
+    baseline: &BoardAdapter,
+    protected: &BTreeSet<String>,
+    net: NetNo,
+    representative: fr_engine::board::ItemKey,
+    layer_no: i32,
+    point: &EnginePoint,
+    sample_mm: [f64; 2],
+    units_per_mm: f64,
+) -> Option<fr_engine::board::ItemKey> {
+    board.board.try_item(representative)?;
+    if board
+        .board
+        .rules
+        .nets
+        .get(net)
+        .is_some_and(|name| protected.contains(&name.name))
+    {
+        return None;
+    }
+    let group = board.board.connected_set(representative, net, false);
+    let sample_native = [sample_mm[0] * units_per_mm, sample_mm[1] * units_per_mm];
+    if sample_native.iter().any(|coordinate| !coordinate.is_finite()) {
+        return None;
+    }
+    let mut owner = None;
+    for key in group.iter() {
+        let Some(item) = board.board.try_item(key) else {
+            continue;
+        };
+        if !item.is_trace() || !item.is_on_board() || !item.contains_net(net) {
+            continue;
+        }
+        if item.trace().layer() != layer_no {
+            continue;
+        }
+        // THIS-RUN only: the owner id must be absent from the frozen baseline.
+        if baseline
+            .board
+            .item_repository()
+            .iter()
+            .any(|baseline_key| baseline.board.item(baseline_key).id() == item.id())
+        {
+            continue;
+        }
+        let polyline = item.trace().polyline();
+        // Select the trace from the original sampled coordinate retained by the
+        // endpoint, before Int quantization can make a nearby parallel trace
+        // appear equally plausible.
+        if polyline_sample_distance_squared(polyline, sample_native) > 1e-8 {
+            continue;
+        }
+        let projection_distance = if polyline.contains(point) {
+            if !point_is_trace_interior(polyline, point) {
+                continue;
+            }
+            0.0
+        } else if let Some(projection) = polyline.projection_line(point) {
+            let foot = projection.end_point();
+            let delta = foot.difference_by(point).to_float();
+            let distance_squared = delta.x * delta.x + delta.y * delta.y;
+            // `BoardAdapter::point` rounds each native coordinate to the
+            // nearest Int, so the proven maximum squared displacement is
+            // 0.5 native-unit squared.
+            if distance_squared > 0.5000001
+                || projection_owner_segment_index(polyline, &projection).is_none()
+                || !point_is_trace_interior(polyline, &foot)
+            {
+                continue;
+            }
+            distance_squared
+        } else {
+            continue;
+        };
+        if projection_distance.is_finite() {
+            if owner.is_some() {
+                // More than one trace contains the actual sample coordinate;
+                // without a unique source owner, do not split either trace.
+                return None;
+            }
+            owner = Some(key);
+        }
+    }
+    owner
+}
+
+/// Squared distance from a retained source sample to the actual centreline.
+/// This is ownership validation only; routing and endpoint selection remain in
+/// the source GridRouter path.
+fn polyline_sample_distance_squared(polyline: &Polyline, sample: [f64; 2]) -> f64 {
+    let mut nearest = f64::INFINITY;
+    for index in 0..polyline.lines.len().saturating_sub(2) {
+        let a = polyline.corner(index as i32).to_float();
+        let b = polyline.corner(index as i32 + 1).to_float();
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let length_squared = dx * dx + dy * dy;
+        if length_squared == 0.0 {
+            continue;
+        }
+        let t = (((sample[0] - a.x) * dx + (sample[1] - a.y) * dy) / length_squared)
+            .clamp(0.0, 1.0);
+        let ex = sample[0] - (a.x + t * dx);
+        let ey = sample[1] - (a.y + t * dy);
+        nearest = nearest.min(ex * ex + ey * ey);
+    }
+    nearest
+}
+
+/// The ACTUAL centreline segment index (`1..polyline.lines.len()-1`) that the
+/// engine's `Polyline::projection_line` selected. The returned `projection`
+/// keeps the selected owner line as its END closing line and the
+/// integer-anchored PERPENDICULAR through the query Int point as its MIDDLE
+/// (`get_line()`) line, so the owner index is recovered by EXACT `Line`
+/// identity -- never by an unrelated nearest line or a floating distance
+/// tolerance. `Polyline::projection_line`'s own exact corner-side guard is
+/// re-applied, so a non-adjacent but geometrically equal line cannot be
+/// mistaken for the owner segment.
+fn projection_owner_segment_index(
+    polyline: &Polyline,
+    projection: &fr_geom::LineSegment,
+) -> Option<i32> {
+    let nearest = projection.get_end_closing_line();
+    let last = polyline.lines.len() as i32 - 1;
+    let perpendicular = projection.get_line();
+    for index in 1..last {
+        if &polyline.lines[index as usize] != nearest {
+            continue;
+        }
+        let prev_side = perpendicular.side_of(&polyline.corner(index - 1));
+        let next_side = perpendicular.side_of(&polyline.corner(index));
+        if prev_side == next_side && prev_side != fr_geom::Side::Collinear {
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+/// SOURCE-required island-tap weld for the in-run entry. The owner trace is the
+/// same-net THIS-RUN member of the representative's connected group that owns
+/// the source-chosen point. When the point lies on the trace interior the split
+/// is DIRECT (`projection_line` returns `None` for a collinear point); otherwise
+/// the engine's exact perpendicular foot is used. The returned endpoint is
+/// relocated onto the real split contact and the engine's EXACT native `Point`
+/// (if not an `Int`) is returned for the materializer so no millimetre rounding
+/// can fabricate a fake contact. Baseline/protected copper is never touched;
+/// when no authorised this-run trace interior is found, `Ok(None)` leaves the
+/// endpoint unchanged. A UserFixed this-run trace is temporarily unfixed so the
+/// mature split may replace it, then both pieces are restored -- no baseline
+/// fixed flag is ever modified.
+fn weld_island_tap_endpoint(
+    board: &mut BoardAdapter,
+    baseline: &BoardAdapter,
+    protected: &BTreeSet<String>,
+    net: NetNo,
+    representative: fr_engine::board::ItemKey,
+    endpoint: &RungEndpoint,
+    pieces: &mut Vec<fr_engine::board::ItemKey>,
+) -> Result<Option<(RungEndpoint, Option<EnginePoint>)>, String> {
+    let layer_no = board.board.layer_structure.get_no(&endpoint.layer);
+    if layer_no < 0 {
+        return Ok(None);
+    }
+    let point = match board.point(endpoint.point)? {
+        EnginePoint::Int(point) => point,
+        _ => return Ok(None),
+    };
+    let Some(owner) = island_tap_owner(
+        board,
+        baseline,
+        protected,
+        net,
+        representative,
+        layer_no,
+        &EnginePoint::Int(point),
+        endpoint.point,
+        board.units_per_mm,
+    ) else {
+        return Ok(None);
+    };
+    let fixed = board.board.item(owner).fixed_state();
+    let polyline = board.board.item(owner).trace().polyline().clone();
+    let projection = polyline.projection_line(&EnginePoint::Int(point));
+    let exact = match &projection {
+        Some(projection) => projection.end_point(),
+        // Collinear interior point (a single-segment trace has no perpendicular
+        // foot): split DIRECT at the source-chosen point.
+        None => EnginePoint::Int(point),
+    };
+    if !point_is_trace_interior(&polyline, &exact) {
+        return Ok(None);
+    }
+    let restore = fixed != FixedState::Unfixed;
+    if restore {
+        board
+            .board
+            .item_mut(owner)
+            .set_fixed_state(FixedState::Unfixed);
+    }
+    // Non-collinear tap: reuse the engine's projection line through the query
+    // Int and exact foot, and split on the selected owner's actual centreline
+    // segment with the mature public `split_trace_at_line` API.
+    let mut exact_endpoint = None;
+    let split = match &projection {
+        Some(projection) => match projection_owner_segment_index(&polyline, projection) {
+            Some(line_index) => {
+                let split_line = fr_engine::board::optimize::tracked::TLine::fresh(
+                    projection.get_line().clone(),
+                );
+                let split = board.board.split_trace_at_line(owner, line_index, &split_line);
+                exact_endpoint = Some(exact.clone());
+                split
+            }
+            None => None,
+        },
+        // Already-collinear Int interior source point: the source's own
+        // `split_trace_at_point` path is correct and unchanged.
+        None => board.board.split_trace_at_point(owner, &exact),
+    };
+    let Some([a, b]) = split else {
+        if restore {
+            board.board.item_mut(owner).set_fixed_state(fixed);
+        }
+        return Ok(None);
+    };
+    if restore {
+        for key in [a, b].into_iter().flatten() {
+            board.board.item_mut(key).set_fixed_state(fixed);
+        }
+    }
+    pieces.extend(a);
+    pieces.extend(b);
+    let point_mm = exact.to_float();
+    let upm = board.units_per_mm;
+    Ok(Some((
+        RungEndpoint {
+            point: [point_mm.x / upm, point_mm.y / upm],
+            layer: endpoint.layer.clone(),
+        },
+        exact_endpoint,
+    )))
 }
 
 /// Number of actual source GridRouter calls; endpoint CLI is serial.

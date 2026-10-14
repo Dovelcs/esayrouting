@@ -100,6 +100,14 @@ pub fn route_with_frontier(
     start_direction: Option<(i32, i32)>,
     end_direction: Option<(f64, f64)>,
 ) -> (Option<Vec<(i32, i32, u8)>>, u32, Vec<(i32, i32, u8)>) {
+    // #529 dynamic iterations gate (`single_ended_routing.py::_dynamic_iterations`):
+    // probe-scale budgets at or below 10k keep their static cap (ceiling == base,
+    // i.e. no extension); only larger full-search budgets get the flat 1e7 ceiling.
+    let ceiling = if max_iterations > 10_000 {
+        10_000_000
+    } else {
+        max_iterations
+    };
     router.route_with_frontier(
         obstacles,
         sources,
@@ -111,7 +119,7 @@ pub fn route_with_frontier(
         end_direction,
         8,
         track_margin,
-        10_000_000,
+        ceiling,
         2.0,
         2.0,
         0,

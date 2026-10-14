@@ -214,15 +214,13 @@ fn owned_via_positions(
 
 /// Existing same-net native pins can also be reused as layer transitions when
 /// their native copper proves a conductive site on every physical signal
-/// copper layer. This intentionally does not infer a drill: the free transition
-/// corresponds to the existing native Pin electrical node, not an inferred
-/// fabrication hole, and the route emits no new via.
+/// copper layer. This reuse is the existing native electrical connection: it
+/// fabricates no pad and infers no drill, and the route emits no new via.
 ///
-/// A site is reusable only when the checked integer grid cell equals the actual
-/// native `item.center(&board.board)` exactly, in addition to that cell lying in
-/// the pad copper on every signal layer. Native trace/drill normal contacts
-/// require an exact Pin-center match, so a rounded off-grid cell would be
-/// rejected even though it lies inside the pad copper.
+/// A site is reusable when the checked integer grid cell lies in the actual
+/// transformed pad copper on every physical signal copper layer. A rounded
+/// grid cell need not coincide with the exact native Pin center; after
+/// materialization the new trace ends must bridge to that exact center.
 fn native_stack_pin_positions(
     board: &BoardAdapter,
     own_nets: &[NetNo],
@@ -277,23 +275,17 @@ fn native_stack_pin_positions(
             .checked_mul(grid_step_board)
             .ok_or("native pin-via y coordinate overflow")?;
         let cell = Point::Int(IntPoint::new(cell_x, cell_y));
-        let pin_center = item.center(&board.board);
 
-        // Native trace/drill normal contacts require the checked point to equal
-        // the Pin center exactly (`*point == other.center(self)`), not merely to
-        // lie inside the pad copper. A rounded cell whose coordinates differ
-        // from the actual native center has no center connector, so an
-        // intermediate transition there is rejected by the native contact
-        // check; qualify the site only when the cell equals the native center.
-        // In addition, require actual copper containing the cell on every
-        // physical signal copper layer, since the stack span alone can include
-        // layers with no pad copper.
-        if cell == pin_center
-            && copper_layers.iter().all(|&layer| {
-                item.drill_shape_on_layer(&board.board, layer)
-                    .is_some_and(|shape| shape.contains(&cell))
-            })
-        {
+        // Qualify the site when the rounded cell lies in the actual transformed
+        // pad copper on every physical signal copper layer; the stack span
+        // alone can include layers with no pad copper. This is the existing
+        // native electrical connection, so no pad is fabricated, no drill is
+        // inferred, and no new via is emitted. Materialization must bridge the
+        // new trace ends to the exact native center.
+        if copper_layers.iter().all(|&layer| {
+            item.drill_shape_on_layer(&board.board, layer)
+                .is_some_and(|shape| shape.contains(&cell))
+        }) {
             positions.insert((gx, gy));
         }
     }

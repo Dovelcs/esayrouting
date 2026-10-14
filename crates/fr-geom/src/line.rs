@@ -13,7 +13,7 @@ use crate::java_compat::{
     big, bigint_double_value, bigint_int_value, bigint_signum, math_round_i32, INT_MAX_F64,
 };
 use crate::jmath;
-use crate::limits::CRIT_INT;
+use crate::limits::{crit_int_big, CRIT_INT};
 use crate::point::Point;
 use crate::rational_point::RationalPoint;
 use crate::side::Side;
@@ -22,7 +22,7 @@ use crate::tile_shape::TileShape;
 use crate::vector::Vector;
 
 use num_bigint::BigInt;
-use num_traits::One;
+use num_traits::{One, Signed};
 
 /// A directed line through `a` and `b`.
 ///
@@ -101,9 +101,6 @@ impl std::fmt::Debug for Line {
 impl Line {
     /// Creates a directed Line from two points.
     pub fn new(a: Point, b: Point) -> Line {
-        if !(a.is_int_point() && b.is_int_point()) {
-            log::warn!("Line(a, b) only implemented for IntPoints till now");
-        }
         Line {
             a,
             b,
@@ -131,9 +128,6 @@ impl Line {
     /// which stores `dir` as the cached direction).
     pub fn from_point_direction(a: Point, dir: Direction) -> Line {
         let b = a.translate_by(&dir.get_vector());
-        if !(a.is_int_point() && b.is_int_point()) {
-            log::warn!("Line(a, dir) only implemented for IntPoints till now");
-        }
         Line { a, b, dir: DirCache::with(dir) }
     }
 
@@ -152,9 +146,31 @@ impl Line {
             .wrapping_add(self.b.get_id())
     }
 
-    /// Returns true, if this and other define the same line. Only works for lines consisting of
-    /// IntPoints (panics otherwise, like the Java casts).
+    /// Returns true, if this and other define the same oriented line.
     pub fn fast_equals(&self, other: &Line) -> bool {
+        if !self.a.is_int_point()
+            || !self.b.is_int_point()
+            || !other.a.is_int_point()
+            || !other.b.is_int_point()
+        {
+            if self.side_of(&other.a) != Side::Collinear
+                || self.side_of(&other.b) != Side::Collinear
+            {
+                return false;
+            }
+            let this_direction = self.direction();
+            let other_direction = other.direction();
+            if this_direction.compare_to(&other_direction) != 0 {
+                return false;
+            }
+            let this_vector = this_direction.get_vector();
+            let other_vector = other_direction.get_vector();
+            return if this_vector.is_zero() {
+                other_vector.is_zero()
+            } else {
+                this_vector.projection(&other_vector) == Signum::Positive
+            };
+        }
         let this_a = self.a.as_int();
         let this_b = self.b.as_int();
         let other_a = other.a.as_int();
@@ -204,10 +220,22 @@ impl Line {
     }
 
     /// Returns COLLINEAR, if point is on the line with the given tolerance. Otherwise
-    /// ON_THE_LEFT, if this line is on the left of point, or ON_THE_RIGHT. Only implemented for
-    /// IntPoint lines.
+    /// ON_THE_LEFT, if this line is on the left of point, or ON_THE_RIGHT.
     #[inline]
     pub fn side_of_float_tol(&self, point: &FloatPoint, tolerance: f64) -> Side {
+        if !self.a.is_int_point() || !self.b.is_int_point() {
+            let this_a = self.a.to_float();
+            let this_b = self.b.to_float();
+            let det = (this_b.y - this_a.y) * (point.x - this_a.x)
+                - (this_b.x - this_a.x) * (point.y - this_a.y);
+            if det - tolerance > 0.0 {
+                return Side::OnTheLeft;
+            }
+            if det + tolerance < 0.0 {
+                return Side::OnTheRight;
+            }
+            return Side::Collinear;
+        }
         let this_a = self.a.as_int();
         let this_b = self.b.as_int();
         let det = this_b.y.wrapping_sub(this_a.y) as f64 * (point.x - this_a.x as f64)
@@ -230,6 +258,12 @@ impl Line {
     /// Returns ON_THE_LEFT, if this line is on the left of the intersection of p1 and p2,
     /// ON_THE_RIGHT if on the right, and COLLINEAR, if all 3 lines intersect in exactly 1 point.
     pub fn side_of_intersection(&self, p1: &Line, p2: &Line) -> Side {
+        if [&self.a, &self.b, &p1.a, &p1.b, &p2.a, &p2.b]
+            .iter()
+            .any(|point| !point.is_int_point())
+        {
+            return self.side_of(&p1.intersection(p2));
+        }
         let intersection_approx = p1.intersection_approx(p2);
         let result = self.side_of_float_tol(&intersection_approx, 1.0);
         if result == Side::Collinear {
@@ -262,8 +296,16 @@ impl Line {
     }
 
     /// Returns the signed distance of this line from point. Positive, if the line is on the left
-    /// of point, else negative. Only implemented for IntPoint lines.
+    /// of point, else negative.
     pub fn signed_distance(&self, point: &FloatPoint) -> f64 {
+        if !self.a.is_int_point() || !self.b.is_int_point() {
+            let this_a = self.a.to_float();
+            let this_b = self.b.to_float();
+            let dx = this_b.x - this_a.x;
+            let dy = this_b.y - this_a.y;
+            let det = dy * (point.x - this_a.x) - dx * (point.y - this_a.y);
+            return det / jmath::sqrt(dx * dx + dy * dy);
+        }
         let this_a = self.a.as_int();
         let this_b = self.b.as_int();
         let dx = this_b.x.wrapping_sub(this_a.x) as f64;
@@ -288,8 +330,24 @@ impl Line {
     }
 
     /// Returns the intersection point of the 2 lines. If the lines are parallel
-    /// `result.is_infinite()` will be true. Only implemented for lines of IntPoints.
+    /// `result.is_infinite()` will be true.
     pub fn intersection(&self, other: &Line) -> Point {
+        if !matches!((&self.a, &self.b, &other.a, &other.b),
+            (Point::Int(_), Point::Int(_), Point::Int(_), Point::Int(_)))
+        {
+            // Homogeneous line coefficients are the cross product of their endpoints;
+            // intersecting those lines is the cross product of the coefficients. This is
+            // the exact projective form of the integer branch's determinant equations. The
+            // branch's homogeneous tuple has the opposite sign, which matters for the oriented
+            // point-at-infinity result when the denominator is zero.
+            let (a1, b1, c1) = homogeneous_line(&self.a, &self.b);
+            let (a2, b2, c2) = homogeneous_line(&other.a, &other.b);
+            let x = &b1 * &c2 - &c1 * &b2;
+            let y = &c1 * &a2 - &a1 * &c2;
+            let z = &a1 * &b2 - &b1 * &a2;
+            return point_from_homogeneous(-x, -y, -z);
+        }
+
         let this_a = self.a.as_int();
         let this_b = self.b.as_int();
         let other_a = other.a.as_int();
@@ -452,10 +510,21 @@ impl Line {
     }
 
     /// Returns an approximation of the intersection of the 2 lines by a FloatPoint. If the lines
-    /// are parallel the result coordinates will be Integer.MAX_VALUE. Only implemented for lines
-    /// consisting of IntPoints.
+    /// are parallel the result coordinates will be Integer.MAX_VALUE.
     #[inline]
     pub fn intersection_approx(&self, other: &Line) -> FloatPoint {
+        if !self.a.is_int_point()
+            || !self.b.is_int_point()
+            || !other.a.is_int_point()
+            || !other.b.is_int_point()
+        {
+            let intersection = self.intersection(other);
+            return if intersection.is_infinite() {
+                FloatPoint::new(INT_MAX_F64, INT_MAX_F64)
+            } else {
+                intersection.to_float()
+            };
+        }
         let this_a = self.a.as_int();
         let this_b = self.b.as_int();
         let other_a = other.a.as_int();
@@ -483,10 +552,27 @@ impl Line {
     }
 
     /// Translates the line perpendicular by dist. If dist > 0, the line is translated to the
-    /// left, otherwise to the right. Only implemented for IntPoint lines.
+    /// left, otherwise to the right. Rational lines retain their exact anchor while using the
+    /// same rounded grid displacement as the IntPoint implementation.
     pub fn translate(&self, dist: f64) -> Line {
-        let ai = self.a.as_int();
         let dir = self.direction();
+        if !self.a.is_int_point()
+            || !self.b.is_int_point()
+            || matches!(&dir, Direction::BigInt(_))
+        {
+            let dir_vector = dir.get_vector().to_float();
+            let vxvx = dir_vector.x * dir_vector.x;
+            let vyvy = dir_vector.y * dir_vector.y;
+            let length = jmath::sqrt(vxvx + vyvy);
+            let displacement = if vxvx <= vyvy {
+                IntVector::new(math_round_i32(dist * length / dir_vector.y).wrapping_neg(), 0)
+            } else {
+                IntVector::new(0, math_round_i32(dist * length / dir_vector.x))
+            };
+            let new_a = self.a.translate_by(&Vector::Int(displacement));
+            return Line::get_instance(new_a, &dir);
+        }
+        let ai = self.a.as_int();
         let v = dir.get_vector().as_int();
         let vxvx = v.x as f64 * v.x as f64;
         let vyvy = v.y as f64 * v.y as f64;
@@ -553,9 +639,16 @@ impl Line {
     }
 
     /// A line l1 is bigger than a line l2, if the direction of l1 is bigger than the direction of
-    /// l2 (Java `Comparable<Line>`). Only for lines consisting of IntPoints.
+    /// l2 (Java `Comparable<Line>`).
     #[inline]
     pub fn compare_to(&self, other: &Line) -> i32 {
+        if !self.a.is_int_point()
+            || !self.b.is_int_point()
+            || !other.a.is_int_point()
+            || !other.b.is_int_point()
+        {
+            return self.direction().compare_to(&other.direction());
+        }
         let this_a = self.a.as_int();
         let this_b = self.b.as_int();
         let other_a = other.a.as_int();
@@ -711,6 +804,46 @@ impl Line {
         let b = self.b.as_int();
         IntVector::new(b.x.wrapping_sub(a.x), b.y.wrapping_sub(a.y))
     }
+}
+
+/// Returns the homogeneous line coefficients for two projective points.
+fn homogeneous_line(first: &Point, second: &Point) -> (BigInt, BigInt, BigInt) {
+    let (x1, y1, z1) = homogeneous_point(first);
+    let (x2, y2, z2) = homogeneous_point(second);
+    (
+        &y1 * &z2 - &z1 * &y2,
+        &z1 * &x2 - &x1 * &z2,
+        &x1 * &y2 - &y1 * &x2,
+    )
+}
+
+fn homogeneous_point(point: &Point) -> (BigInt, BigInt, BigInt) {
+    match point {
+        Point::Int(p) => (BigInt::from(p.x), BigInt::from(p.y), BigInt::one()),
+        Point::Rational(p) => (p.x.clone(), p.y.clone(), p.z.clone()),
+    }
+}
+
+/// Normalizes a homogeneous intersection with the same integral-point promotion used by the
+/// Int/Int intersection path. A zero denominator is retained as a point at infinity.
+fn point_from_homogeneous(mut x: BigInt, mut y: BigInt, mut z: BigInt) -> Point {
+    if bigint_signum(&z) < 0 {
+        x = -x;
+        y = -y;
+        z = -z;
+    }
+    if bigint_signum(&z) != 0
+        && bigint_signum(&(&x % &z)) == 0
+        && bigint_signum(&(&y % &z)) == 0
+    {
+        x = &x / &z;
+        y = &y / &z;
+        if x.abs() <= crit_int_big() && y.abs() <= crit_int_big() {
+            return Point::Int(IntPoint::new(bigint_int_value(&x), bigint_int_value(&y)));
+        }
+        z = BigInt::one();
+    }
+    Point::Rational(Box::new(RationalPoint::new(x, y, z)))
 }
 
 impl PartialEq for Line {

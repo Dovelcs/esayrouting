@@ -173,10 +173,6 @@ impl LineSegment {
 
     /// Checks if point is contained in this line segment.
     pub fn contains(&self, point: &Point) -> bool {
-        if !point.is_int_point() {
-            log::warn!("LineSegments.contains currently only implemented for IntPoints");
-            return false;
-        }
         if self.middle.side_of(point) != Side::Collinear {
             return false;
         }

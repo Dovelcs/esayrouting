@@ -44,9 +44,21 @@ impl BigIntDirection {
         )))
     }
 
-    pub fn turn_45_degree(&self, _factor: i32) -> Direction {
-        log::warn!("BigIntDirection: turn_45_degree not yet implemented");
-        Direction::BigInt(Box::new(self.clone()))
+    pub fn turn_45_degree(&self, factor: i32) -> Direction {
+        let (x, y) = (&self.x, &self.y);
+        let rotated = match factor % 8 {
+            0 => (x.clone(), y.clone()),
+            1 => (x - y, x + y),
+            2 => (-y, x.clone()),
+            3 => (-x - y, x - y),
+            4 => (-x, -y),
+            5 => (y - x, -x - y),
+            6 => (y.clone(), -x),
+            7 => (x + y, y - x),
+            // Match IntDirection::turn_45_degree: negative remainders map to NULL.
+            _ => return Direction::NULL,
+        };
+        Direction::BigInt(Box::new(BigIntDirection::new(rotated.0, rotated.1)))
     }
 
     pub fn opposite(&self) -> BigIntDirection {

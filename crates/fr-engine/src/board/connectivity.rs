@@ -7,7 +7,7 @@
 //! `TreeSet` order), so deep nets cannot overflow the stack.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -22,6 +22,157 @@ use super::search_tree::TreeObject;
 
 thread_local! {
     static CONTACTS: RefCell<ContactsCache> = RefCell::new(ContactsCache::default());
+}
+
+thread_local! {
+    static CONNECTED_SETS: RefCell<BTreeMap<NetNo, Vec<ConnectedSetsMemo>>> = RefCell::new(BTreeMap::new());
+}
+
+struct ConnectedSetsMemo {
+    witness: ConnectedSetsWitness,
+    result: Vec<ItemSet>,
+}
+
+#[derive(Clone)]
+struct ConnectedSetsWitness {
+    global_epoch: u64,
+    rules: std::sync::Arc<crate::rules::BoardRules>,
+    library: std::sync::Arc<crate::library::BoardLibrary>,
+    components: std::sync::Arc<crate::structure::Components>,
+    layer_structure: std::sync::Arc<crate::structure::LayerStructure>,
+    communication: crate::structure::Communication,
+    bounding_box: fr_geom::IntBox,
+    tree_kind: super::search_tree::TreeKind,
+    tree_clearance_class: i32,
+    java_variant: super::basic_board::JavaVariant,
+    overlap_contacts: bool,
+    stitching_vias: bool,
+    members: Vec<ConnectedSetsMemberWitness>,
+}
+
+#[derive(Clone)]
+struct ConnectedSetsMemberWitness {
+    key: ItemKey,
+    version: u64,
+    stitching_via: bool,
+    shapes: std::sync::Arc<[Option<TileShape>]>,
+}
+
+impl ConnectedSetsWitness {
+    fn capture(board: &BasicBoard, net_number: NetNo) -> Option<Self> {
+        if net_number <= 0 {
+            return None;
+        }
+        let items = board.item_repository();
+        let tree = board.default_tree();
+        let member_keys: Vec<ItemKey> = items.net_items(net_number).collect();
+        let mut members = Vec::new();
+        for key in member_keys {
+            let Some(item) = items.try_get(key) else {
+                return None;
+            };
+            if !items.is_listed(key)
+                || !item.is_on_board()
+                || item.net_numbers().iter().filter(|&&net| net > 0).count() != 1
+                || !item.contains_net(net_number)
+            {
+                return None;
+            }
+            let Some(shapes) = tree.cached_shapes(key) else {
+                return None;
+            };
+            let Some(leaves) = tree.item_leaves(key) else {
+                if shapes.iter().any(Option::is_some) {
+                    return None;
+                }
+                // Cached shapes normally acquire an item-leaf entry together. A missing entry
+                // is only coherent when there are no actual shapes.
+                if !shapes.is_empty() {
+                    return None;
+                }
+                members.push(ConnectedSetsMemberWitness {
+                    key,
+                    version: items.version(key),
+                    stitching_via: board.is_stitching_via(key),
+                    shapes: std::sync::Arc::clone(shapes),
+                });
+                continue;
+            };
+            if leaves.len() != shapes.len() {
+                return None;
+            }
+            for (index, shape) in shapes.iter().enumerate() {
+                match (shape, leaves[index]) {
+                    (Some(_), Some(leaf_id)) => {
+                        let Some(leaf) = tree.tree.leaf(leaf_id) else {
+                            return None;
+                        };
+                        if leaf.object != (TreeObject::Item { key, id: item.id().0 })
+                            || leaf.shape_index_in_object != index as i32
+                        {
+                            return None;
+                        }
+                    }
+                    (Some(_), None) => return None,
+                    (None, Some(_)) => return None,
+                    (None, None) => {}
+                }
+            }
+            members.push(ConnectedSetsMemberWitness {
+                key,
+                version: items.version(key),
+                stitching_via: board.is_stitching_via(key),
+                shapes: std::sync::Arc::clone(shapes),
+            });
+        }
+        Some(Self {
+            global_epoch: items.global_epoch(),
+            rules: std::sync::Arc::clone(&board.rules),
+            library: std::sync::Arc::clone(&board.library),
+            components: std::sync::Arc::clone(&board.components),
+            layer_structure: std::sync::Arc::clone(&board.layer_structure),
+            communication: board.communication.clone(),
+            bounding_box: board.bounding_box,
+            tree_kind: tree.kind,
+            tree_clearance_class: tree.compensated_clearance_class_no,
+            java_variant: board.java_variant,
+            overlap_contacts: board.overlap_contacts,
+            stitching_vias: board.stitching_vias,
+            members,
+        })
+    }
+
+    fn matches(&self, current: &Self) -> bool {
+        self.global_epoch == current.global_epoch
+            && std::sync::Arc::ptr_eq(&self.rules, &current.rules)
+            && std::sync::Arc::ptr_eq(&self.library, &current.library)
+            && std::sync::Arc::ptr_eq(&self.components, &current.components)
+            && std::sync::Arc::ptr_eq(&self.layer_structure, &current.layer_structure)
+            // The allocator advances as unrelated items are inserted; it does not affect
+            // connectivity, while existing members are covered by their keys and versions.
+            && self.communication.coordinate_transform == current.communication.coordinate_transform
+            && self.communication.unit == current.communication.unit
+            && self.communication.resolution == current.communication.resolution
+            && self.communication.specctra_parser_info == current.communication.specctra_parser_info
+            && self.bounding_box == current.bounding_box
+            && self.tree_kind == current.tree_kind
+            && self.tree_clearance_class == current.tree_clearance_class
+            && self.java_variant == current.java_variant
+            && self.overlap_contacts == current.overlap_contacts
+            && self.stitching_vias == current.stitching_vias
+            && self.members.len() == current.members.len()
+            && self.members.iter().zip(&current.members).all(|(old, new)| {
+                old.key == new.key
+                    && old.version == new.version
+                    && old.stitching_via == new.stitching_via
+                    && std::sync::Arc::ptr_eq(&old.shapes, &new.shapes)
+            })
+    }
+}
+
+/// Clear per-net connected-set results between validation runs.
+pub fn clear_connected_sets_cache() {
+    CONNECTED_SETS.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Per thread cache of normal contacts for the last few board contents (keyed by the epochs of
@@ -626,6 +777,39 @@ impl BasicBoard {
             }
             _ => None,
         }
+    }
+
+    /// Java `getConnectedSets(netNumber)`.
+    pub fn get_connected_sets_cached(&self, net_number: NetNo) -> Vec<ItemSet> {
+        let Some(witness) = ConnectedSetsWitness::capture(self, net_number) else {
+            return self.get_connected_sets(net_number);
+        };
+
+        let cached = CONNECTED_SETS.with(|cache| {
+            cache.borrow().get(&net_number).and_then(|memos| {
+                memos.iter().find(|memo| memo.witness.matches(&witness)).map(|memo| memo.result.clone())
+            })
+        });
+        if let Some(result) = cached {
+            if verify_caches() {
+                let fresh = self.get_connected_sets(net_number);
+                let cached_ordered: Vec<Vec<ItemKey>> = result.iter().map(|group| group.iter().collect()).collect();
+                let fresh_ordered: Vec<Vec<ItemKey>> = fresh.iter().map(|group| group.iter().collect()).collect();
+                assert_eq!(cached_ordered, fresh_ordered, "connected sets cache out of date");
+            }
+            return result;
+        }
+
+        let result = self.get_connected_sets(net_number);
+        CONNECTED_SETS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let memos = cache.entry(net_number).or_default();
+            if memos.len() == 2 {
+                memos.remove(0);
+            }
+            memos.push(ConnectedSetsMemo { witness, result: result.clone() });
+        });
+        result
     }
 
     /// Java `getConnectedSets(netNumber)`.

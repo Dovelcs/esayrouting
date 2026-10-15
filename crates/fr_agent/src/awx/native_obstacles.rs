@@ -10,85 +10,6 @@ use fr_engine::{
 };
 use fr_geom::{IntBox, IntPoint, Point};
 use std::collections::BTreeMap;
-use std::cell::RefCell;
-use std::time::Instant;
-
-#[derive(Default)]
-struct ObstacleDetailProfile {
-    enabled: bool,
-    active: String,
-    aggregates: BTreeMap<String, BTreeMap<String, u64>>,
-}
-
-thread_local! {
-    static OBSTACLE_DETAIL_PROFILE: RefCell<ObstacleDetailProfile> = RefCell::new(ObstacleDetailProfile::default());
-}
-
-/// Reset and enable request-local obstacle build detail counters.
-pub fn reset_obstacle_detail_profile() {
-    OBSTACLE_DETAIL_PROFILE.with(|profile| {
-        *profile.borrow_mut() = ObstacleDetailProfile { enabled: true, ..Default::default() };
-    });
-}
-
-/// Return aggregated obstacle build counters and coarse elapsed times.
-pub fn obstacle_detail_profile_json() -> serde_json::Value {
-    OBSTACLE_DETAIL_PROFILE.with(|profile| {
-        let profile = profile.borrow();
-        serde_json::json!({
-            "enabled": profile.enabled,
-            "time_unit_by_suffix": { "_us": "microseconds", "_ns": "nanoseconds" },
-            "timing_note": "map_build_total_us includes get_items_iteration_us and nested_* timings; helper/phase timings are subsets, and foreign_pad_drill_axis_geometry_ns is included in foreign_pad_raster_and_write_per_rung_ns; do not sum subset timers",
-            "aggregate_key": "request.net|request.stage",
-            "aggregates": profile.aggregates
-        })
-    })
-}
-
-pub(crate) fn obstacle_detail_add(name: &str, amount: u64) {
-    OBSTACLE_DETAIL_PROFILE.with(|profile| {
-        let mut profile = profile.borrow_mut();
-        if profile.enabled && !profile.active.is_empty() {
-            let key = profile.active.clone();
-            let counters = profile.aggregates.entry(key).or_default();
-            *counters.entry(name.to_owned()).or_default() += amount;
-        }
-    });
-}
-
-pub(crate) fn obstacle_detail_set(name: &str, value: u64) {
-    OBSTACLE_DETAIL_PROFILE.with(|profile| {
-        let mut profile = profile.borrow_mut();
-        if profile.enabled && !profile.active.is_empty() {
-            let key = profile.active.clone();
-            profile.aggregates.entry(key).or_default().insert(name.to_owned(), value);
-        }
-    });
-}
-
-pub(crate) fn obstacle_detail_elapsed(name: &str, started: Instant) {
-    obstacle_detail_add(name, started.elapsed().as_micros() as u64);
-}
-
-pub(crate) fn obstacle_elapsed_ns(started: Instant) -> u64 {
-    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
-}
-
-fn obstacle_detail_begin(request: &RungRequest) {
-    OBSTACLE_DETAIL_PROFILE.with(|profile| {
-        let mut profile = profile.borrow_mut();
-        if !profile.enabled {
-            return;
-        }
-        profile.active = format!("{}|{}", request.net, request.stage);
-        let key = profile.active.clone();
-        let counters = profile.aggregates.entry(key).or_default();
-        if counters.get("map_builds").copied().unwrap_or(0) > 0 {
-            *counters.entry("repeated_same_net_stage_builds".into()).or_default() += 1;
-        }
-        *counters.entry("map_builds".into()).or_default() += 1;
-    });
-}
 
 #[derive(Clone, Debug)]
 pub struct NativeGridConfig {
@@ -329,8 +250,6 @@ fn build_obstacle_map_from_config(
     own_nets: &[NetNo],
     config: NativeGridConfig,
 ) -> Result<ObstacleMapResult, String> {
-    obstacle_detail_begin(request);
-    let map_build_started = Instant::now();
     let grid_step_board = config.grid_step;
     if grid_step_board <= 0 {
         return Err("native obstacle grid step must be positive".into());
@@ -364,17 +283,12 @@ fn build_obstacle_map_from_config(
     let route_clearance = config.trace_clearance_class;
     let step = grid_step_board;
 
-    let item_scan_started = Instant::now();
-    let mut items_seen = 0u64;
     for key in board.board.get_items() {
-        items_seen += 1;
         let item = board.board.item(key);
         if !item.is_on_board() {
-            obstacle_detail_add("items_skipped_offboard", 1);
             continue;
         }
         if item.net_numbers().iter().any(|n| own.contains(n)) {
-            obstacle_detail_add("items_skipped_own_net", 1);
             continue;
         }
         let kind = item.board_item_type();
@@ -387,10 +301,8 @@ fn build_obstacle_map_from_config(
                 | BoardItemType::ViaObstacleArea
                 | BoardItemType::ConductionArea
         ) {
-            obstacle_detail_add("items_skipped_type", 1);
             continue;
         }
-        obstacle_detail_add(&format!("items_seen_type_{kind:?}"), 1);
         if kind == BoardItemType::Trace {
             let Some(trace) = item.as_trace() else {
                 continue;
@@ -412,11 +324,7 @@ fn build_obstacle_map_from_config(
                 + clearance as f64
                 + config.extra_clearance;
             let corners = trace.polyline().corners();
-            obstacle_detail_add("foreign_trace_segments", corners.windows(2).count() as u64);
-            let mut capsule_generation_ns = 0u64;
-            let mut capsule_stamp_ns = 0u64;
             for points in corners.windows(2) {
-                let generation_started = Instant::now();
                 let cells = crate::awx::native_via_obstacles::capsule_cells(
                     [points[0].to_float().x, points[0].to_float().y],
                     [points[1].to_float().x, points[1].to_float().y],
@@ -424,30 +332,13 @@ fn build_obstacle_map_from_config(
                     step,
                     board.units_per_mm,
                 );
-                capsule_generation_ns = capsule_generation_ns.saturating_add(
-                    obstacle_elapsed_ns(generation_started),
-                );
-                obstacle_detail_add("trace_capsule_cells_generated", cells.len() as u64);
-                let mut window_candidates = 0u64;
-                let mut window_accepted = 0u64;
-                let stamp_started = Instant::now();
                 for [gx, gy] in cells {
-                    window_candidates += 1;
                     let (x, y) = cell_center(gx, gy, step);
                     if in_box(&window, x, y) {
-                        window_accepted += 1;
                         obstacles.add_static_blocked_cell(gx, gy, layer_index);
                     }
                 }
-                capsule_stamp_ns = capsule_stamp_ns.saturating_add(
-                    obstacle_elapsed_ns(stamp_started),
-                );
-                obstacle_detail_add("trace_cells_window_candidates", window_candidates);
-                obstacle_detail_add("trace_cells_window_accepted", window_accepted);
-                obstacle_detail_add("trace_cells_window_rejected", window_candidates - window_accepted);
             }
-            obstacle_detail_add("trace_capsule_generation_ns", capsule_generation_ns);
-            obstacle_detail_add("trace_capsule_stamp_window_ns", capsule_stamp_ns);
             continue;
         }
         // Via-only keep-outs are stamped with each candidate's physical via
@@ -474,22 +365,15 @@ fn build_obstacle_map_from_config(
             };
             let from = item.first_layer(&board.board);
             let to = item.last_layer(&board.board);
-            let mut source_pad_raster_ns = 0u64;
-            let mut source_polygon_raster_ns = 0u64;
-            let mut source_pad_stamp_ns = 0u64;
-            let mut source_polygon_stamp_ns = 0u64;
             for layer_no in from..=to {
                 let Some(&layer_index) = route_layer_to_index.get(&layer_no) else {
-                    obstacle_detail_add("pin_layers_outside_route_stack", 1);
                     // Copper outside the searched stack only needs via keep-outs,
                     // which native_via_obstacles stamps from the pad copper.
                     continue;
                 };
                 let Some(shape) = item.drill_shape_on_layer(&board.board, layer_no) else {
-                    obstacle_detail_add("pin_layers_without_shape", 1);
                     continue;
                 };
-                obstacle_detail_add("pin_route_layer_shapes", 1);
                 let layer_clearance = board
                     .board
                     .clearance_value(route_clearance, clearance_class, layer_no)
@@ -499,7 +383,6 @@ fn build_obstacle_map_from_config(
                 let margin = layer_clearance as f64
                     + config.track_width as f64 / 2.0
                     + config.extra_clearance;
-                let raster_started = Instant::now();
                 let source_cells = crate::awx::native_pad_raster::source_pad_cells_shared(
                     &shape,
                     grid_step_board,
@@ -507,70 +390,33 @@ fn build_obstacle_map_from_config(
                     margin,
                     corner_buffer_fraction,
                 );
-                source_pad_raster_ns = source_pad_raster_ns.saturating_add(
-                    obstacle_elapsed_ns(raster_started),
-                );
                 match source_cells {
                     Some(cells) => {
-                        obstacle_detail_add("pin_source_pad_shapes", 1);
-                        obstacle_detail_add("pin_source_pad_cells_generated", cells.len() as u64);
-                        let mut window_candidates = 0u64;
-                        let mut window_accepted = 0u64;
-                        let stamp_started = Instant::now();
                         for &[gx, gy] in cells.iter() {
-                            window_candidates += 1;
                             let (x, y) = cell_center(gx, gy, step);
                             if in_box(&window, x, y) {
-                                window_accepted += 1;
                                 obstacles.add_static_blocked_cell(gx, gy, layer_index);
                             }
                         }
-                        source_pad_stamp_ns = source_pad_stamp_ns.saturating_add(
-                            obstacle_elapsed_ns(stamp_started),
-                        );
-                        obstacle_detail_add("pin_cells_window_candidates", window_candidates);
-                        obstacle_detail_add("pin_cells_window_accepted", window_accepted);
-                        obstacle_detail_add("pin_cells_window_rejected", window_candidates - window_accepted);
                     }
                     None => {
                         // Source custom polygons use point-in-polygon plus exact
                         // Euclidean distance to the nearest original edge.
-                        obstacle_detail_add("pin_source_polygon_shapes", 1);
-                        let raster_started = Instant::now();
                         let cells = crate::awx::native_pad_raster::source_polygon_cells_shared(
                             &shape.corner_approx_arr(),
                             grid_step_board,
                             margin,
                             board.units_per_mm,
                         );
-                        source_polygon_raster_ns = source_polygon_raster_ns.saturating_add(
-                            obstacle_elapsed_ns(raster_started),
-                        );
-                        obstacle_detail_add("pin_source_polygon_cells_generated", cells.len() as u64);
-                        let mut window_candidates = 0u64;
-                        let mut window_accepted = 0u64;
-                        let stamp_started = Instant::now();
                         for &[gx, gy] in cells.iter() {
-                            window_candidates += 1;
                             let (x, y) = cell_center(gx, gy, step);
                             if in_box(&window, x, y) {
-                                window_accepted += 1;
                                 obstacles.add_static_blocked_cell(gx, gy, layer_index);
                             }
                         }
-                        source_polygon_stamp_ns = source_polygon_stamp_ns.saturating_add(
-                            obstacle_elapsed_ns(stamp_started),
-                        );
-                        obstacle_detail_add("pin_cells_window_candidates", window_candidates);
-                        obstacle_detail_add("pin_cells_window_accepted", window_accepted);
-                        obstacle_detail_add("pin_cells_window_rejected", window_candidates - window_accepted);
                     }
                 }
             }
-            obstacle_detail_add("pin_source_pad_raster_ns", source_pad_raster_ns);
-            obstacle_detail_add("pin_source_polygon_raster_ns", source_polygon_raster_ns);
-            obstacle_detail_add("pin_source_pad_stamp_window_ns", source_pad_stamp_ns);
-            obstacle_detail_add("pin_source_polygon_stamp_window_ns", source_polygon_stamp_ns);
             continue;
         }
         let shapes = board.board.item_tile_shapes(item);
@@ -583,7 +429,6 @@ fn build_obstacle_map_from_config(
                 .max(config.clearance)
                 .max(0);
             let Some(&layer_index) = route_layer_to_index.get(&layer_no) else {
-                obstacle_detail_add("other_shapes_outside_route_stack", 1);
                 // Source obstacle_map.py: a foreign track on a copper layer outside cfg.layers
                 // cannot block a track search, but its barrel must still block a new via.
                 // The native tile shape already contains the foreign copper width/shape.
@@ -614,28 +459,17 @@ fn build_obstacle_map_from_config(
                     let gy0 = grid_round(bounds.ll.y, step).saturating_sub(1);
                     let gx1 = grid_round(bounds.ur.x, step).saturating_add(1);
                     let gy1 = grid_round(bounds.ur.y, step).saturating_add(1);
-                    let candidates = (gx1 as i64 - gx0 as i64 + 1).max(0) as u64
-                        * (gy1 as i64 - gy0 as i64 + 1).max(0) as u64;
-                    obstacle_detail_add("offstack_via_offset_contains_candidates", candidates);
-                    let mut window_candidates = 0u64;
-                    let mut window_rejected = 0u64;
-                    let mut contains_accepted = 0u64;
                     for gx in gx0..=gx1 {
                         for gy in gy0..=gy1 {
-                            window_candidates += 1;
                             let x = gx.saturating_mul(step);
                             let y = gy.saturating_mul(step);
-                            if !in_box(&window, x, y) {
-                                window_rejected += 1;
-                            } else if expanded.contains(&Point::Int(IntPoint::new(x, y))) {
-                                contains_accepted += 1;
+                            if in_box(&window, x, y)
+                                && expanded.contains(&Point::Int(IntPoint::new(x, y)))
+                            {
                                 obstacles.add_static_blocked_via(gx, gy);
                             }
                         }
                     }
-                    obstacle_detail_add("offstack_via_window_candidates", window_candidates);
-                    obstacle_detail_add("offstack_via_window_rejected", window_rejected);
-                    obstacle_detail_add("offstack_via_contains_accepted", contains_accepted);
                 }
                 continue;
             };
@@ -649,38 +483,21 @@ fn build_obstacle_map_from_config(
             let gy0 = grid_round(bounds.ll.y, step).saturating_sub(1);
             let gx1 = grid_round(bounds.ur.x, step).saturating_add(1);
             let gy1 = grid_round(bounds.ur.y, step).saturating_add(1);
-            let candidates = (gx1 as i64 - gx0 as i64 + 1).max(0) as u64
-                * (gy1 as i64 - gy0 as i64 + 1).max(0) as u64;
-            obstacle_detail_add("track_offset_contains_candidates", candidates);
-            let mut window_candidates = 0u64;
-            let mut window_rejected = 0u64;
-            let mut contains_accepted = 0u64;
             for gx in gx0..=gx1 {
                 for gy in gy0..=gy1 {
-                    window_candidates += 1;
                     let x = gx.saturating_mul(step);
                     let y = gy.saturating_mul(step);
                     if !in_box(&window, x, y) {
-                        window_rejected += 1;
                         continue;
                     }
                     if expanded.contains(&Point::Int(IntPoint::new(x, y))) {
-                        contains_accepted += 1;
                         obstacles.add_static_blocked_cell(gx, gy, layer_index);
                     }
                 }
             }
-            obstacle_detail_add("track_window_candidates", window_candidates);
-            obstacle_detail_add("track_window_rejected", window_rejected);
-            obstacle_detail_add("track_contains_accepted", contains_accepted);
         }
     }
-    obstacle_detail_add("get_items_seen", items_seen);
-    obstacle_detail_elapsed("get_items_iteration_us", item_scan_started);
-    let nested_started = Instant::now();
     crate::awx::native_outline::stamp_outline_and_cutouts(&mut obstacles, board, window, &config)?;
-    obstacle_detail_elapsed("nested_outline_total_us", nested_started);
-    let nested_started = Instant::now();
     crate::awx::native_via_obstacles::add_foreign_via_obstacles(
         &mut obstacles,
         board,
@@ -690,9 +507,7 @@ fn build_obstacle_map_from_config(
         &request.existing_vias,
         true,
     )?;
-    obstacle_detail_elapsed("nested_add_foreign_via_obstacles_total_us", nested_started);
     for &net in own_nets {
-        let nested_started = Instant::now();
         crate::awx::native_same_net::add_same_net_via_clearance(
             &mut obstacles,
             board,
@@ -702,8 +517,6 @@ fn build_obstacle_map_from_config(
             &request.existing_vias,
             &request.paste_pads,
         )?;
-        obstacle_detail_elapsed("nested_same_net_via_clearance_total_us", nested_started);
-        let nested_started = Instant::now();
         crate::awx::native_same_net::add_same_net_pad_drill_via_clearance(
             &mut obstacles,
             board,
@@ -711,12 +524,8 @@ fn build_obstacle_map_from_config(
             &config,
             &request.same_net_pads,
         )?;
-        obstacle_detail_elapsed("nested_same_net_pad_drill_clearance_total_us", nested_started);
     }
-    let nested_started = Instant::now();
     crate::awx::native_grid_window::fence_window(&mut obstacles, board, window, &config)?;
-    obstacle_detail_elapsed("nested_fence_window_total_us", nested_started);
-    let nested_started = Instant::now();
     crate::awx::native_grid_window::add_free_via_positions(
         &mut obstacles,
         board,
@@ -724,8 +533,6 @@ fn build_obstacle_map_from_config(
         &request.free_via_pads,
         grid_step_board,
     )?;
-    obstacle_detail_elapsed("nested_add_free_via_positions_total_us", nested_started);
-    obstacle_detail_elapsed("map_build_total_us", map_build_started);
     Ok(ObstacleMapResult {
         obstacles,
         layer_numbers: config.layer_numbers.clone(),

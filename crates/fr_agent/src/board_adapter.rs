@@ -3,7 +3,7 @@ use crate::{
     spec::{ChannelRegion, NetRule, RouteSpec},
 };
 use fr_engine::{
-    board::{BasicBoard, ItemKey, JavaVariant, RoutingBoard, TreeKind},
+    board::{connectivity::clear_connected_sets_cache, BasicBoard, ItemKey, JavaVariant, RoutingBoard, TreeKind},
     drc::clearance_violation::{clearance_violations, ClearanceViolation},
     ids::{FixedState, NetNo},
     library::BoardLibrary,
@@ -14,91 +14,10 @@ use fr_geom::{IntPoint, Point, Polyline};
 use fr_settings::RouterSettings;
 use serde::Serialize;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::Instant,
 };
-
-#[derive(Clone, Copy, Default)]
-struct Timing {
-    calls: u64,
-    ns: u64,
-}
-#[derive(Clone, Copy, Default)]
-struct ValidationMetrics {
-    slots: [Timing; 8],
-    detail: ValidationDetail,
-}
-#[derive(Clone, Copy, Default, Serialize)]
-struct ValidationDetail {
-    after_map_items: u64,
-    after_map_traces: u64,
-    after_map_pads: u64,
-    after_map_vias: u64,
-    baseline_compare_items: u64,
-    baseline_compare_traces: u64,
-    baseline_compare_pads: u64,
-    baseline_compare_vias: u64,
-    baseline_id_items: u64,
-    new_foreign_guard_items: u64,
-    drc_after_items: u64,
-    drc_before_items: u64,
-    drc_clearance_candidates: u64,
-    drc_retained_candidates: u64,
-    drc_rejected_candidates: u64,
-    retain_exact_copper_gap_checks: u64,
-    drc_result_key_candidates: u64,
-    drc_unique_result_keys: u64,
-    drc_candidate_generation_ns: u64,
-    drc_retain_check_ns: u64,
-    drc_result_key_build_ns: u64,
-    connectivity_calls: u64,
-    connectivity_net_iterations: u64,
-    connectivity_get_connected_sets_calls: u64,
-    connectivity_groups: u64,
-    connectivity_item_members: u64,
-    connectivity_pin_checks: u64,
-    connectivity_pins_emitted: u64,
-    connectivity_previous_groups_compared: u64,
-    connectivity_set_comparisons: u64,
-    connectivity_pin_membership_probes: u64,
-    connectivity_direct_net_incompletes_calls: u64,
-    invariant_after_map_entries: u64,
-    invariant_signature_format_calls: u64,
-    invariant_signature_format_bytes: u64,
-    invariant_baseline_id_lookups: u64,
-    invariant_protected_net_membership_checks: u64,
-    invariant_geometry_debug_fast_path_hits: u64,
-    invariant_geometry_debug_fast_path_misses: u64,
-    baseline_violations_cache_hits: u64,
-    baseline_violations_cache_misses: u64,
-    baseline_violations_validation_calls: u64,
-    baseline_connectivity_cache_hits: u64,
-    baseline_connectivity_cache_misses: u64,
-    baseline_connectivity_validation_calls: u64,
-    baseline_debug_cache_hits: u64,
-    baseline_debug_cache_misses: u64,
-    baseline_debug_cache_format_calls: u64,
-    after_map_ns: u64,
-    baseline_compare_ns: u64,
-    baseline_id_collection_ns: u64,
-    new_foreign_guard_ns: u64,
-    connectivity_build_ns: u64,
-    connectivity_compare_ns: u64,
-}
-#[derive(Clone, Copy)]
-enum Metric {
-    Violations,
-    Invariant,
-    Preserve,
-    Drc,
-    After,
-    Before,
-    Diff,
-    Connectivity,
-}
-thread_local! { static VALIDATION_METRICS: Cell<ValidationMetrics> = Cell::new(ValidationMetrics::default()); }
 thread_local! { static VALIDATION_BASELINE_CACHE: RefCell<Vec<ValidationBaselineMemo>> = const { RefCell::new(Vec::new()) }; }
 
 struct ValidationBaselineWitness {
@@ -185,10 +104,7 @@ enum BaselineDebugField {
 
 pub(crate) fn clear_validation_baseline_cache() {
     VALIDATION_BASELINE_CACHE.with(|cache| cache.borrow_mut().clear());
-}
-
-fn record_baseline_cache_metric(update: impl FnOnce(&mut ValidationDetail)) {
-    update_detail(update);
+    clear_connected_sets_cache();
 }
 
 fn cached_baseline_debug<T: std::fmt::Debug>(
@@ -231,16 +147,9 @@ fn cached_baseline_debug<T: std::fmt::Debug>(
             BaselineDebugField::TileShapes => &mut item_debug.tile_shapes,
         };
         if let Some(formatted) = cached {
-            record_baseline_cache_metric(|d| d.baseline_debug_cache_hits += 1);
             return Arc::clone(formatted);
         }
-        record_baseline_cache_metric(|d| d.baseline_debug_cache_misses += 1);
         let formatted = format!("{value:?}");
-        update_detail(|d| {
-            d.invariant_signature_format_calls += 1;
-            d.invariant_signature_format_bytes += formatted.len() as u64;
-            d.baseline_debug_cache_format_calls += 1;
-        });
         let formatted: Arc<str> = Arc::from(formatted);
         *cached = Some(Arc::clone(&formatted));
         formatted
@@ -292,13 +201,10 @@ fn cached_baseline_violations(
         })
     });
     if let Some(violations) = hit {
-        record_baseline_cache_metric(|d| d.baseline_violations_cache_hits += 1);
         return violations;
     }
-    record_baseline_cache_metric(|d| d.baseline_violations_cache_misses += 1);
-    record_baseline_cache_metric(|d| d.baseline_violations_validation_calls += 1);
     let witness = ValidationBaselineWitness::new(adapter);
-    let violations = Arc::new(adapter.violations_for_scan(Some(BoardScan::DrcBefore)));
+    let violations = Arc::new(adapter.violations_for_scan());
     store_validation_baseline(adapter, witness, Some(Arc::clone(&violations)), None);
     violations
 }
@@ -315,131 +221,12 @@ fn cached_baseline_connectivity(
         })
     });
     if let Some(connectivity) = hit {
-        record_baseline_cache_metric(|d| d.baseline_connectivity_cache_hits += 1);
         return connectivity;
     }
-    record_baseline_cache_metric(|d| d.baseline_connectivity_cache_misses += 1);
-    record_baseline_cache_metric(|d| d.baseline_connectivity_validation_calls += 1);
     let witness = ValidationBaselineWitness::new(adapter);
     let connectivity = Arc::new(adapter.connectivity());
     store_validation_baseline(adapter, witness, None, Some(Arc::clone(&connectivity)));
     connectivity
-}
-struct Timer {
-    metric: Metric,
-    start: Instant,
-}
-impl Timer {
-    fn start(metric: Metric) -> Self {
-        Self {
-            metric,
-            start: Instant::now(),
-        }
-    }
-}
-impl Drop for Timer {
-    fn drop(&mut self) {
-        VALIDATION_METRICS.with(|cell| {
-            let mut p = cell.get();
-            let s = &mut p.slots[self.metric as usize];
-            s.ns += self.start.elapsed().as_nanos() as u64;
-            if (self.metric as usize) < 2 {
-                s.calls += 1;
-            }
-            cell.set(p);
-        });
-    }
-}
-pub(crate) fn reset_validation_metrics() {
-    VALIDATION_METRICS.with(|cell| cell.set(ValidationMetrics::default()));
-}
-pub(crate) fn validation_metrics_json() -> serde_json::Value {
-    VALIDATION_METRICS.with(|cell| { let p = cell.get(); let s = &p.slots;
-        serde_json::json!({"thread_local":true,"timing_semantics":"invariant total encloses phases; DRC compare encloses both scans and diff; each scan encloses violations calls; nested durations overlap and must not be summed",
-            "violations_calls":s[0].calls,"violations_elapsed_ns":s[0].ns,"assert_invariants_calls":s[1].calls,"assert_invariants_elapsed_ns":s[1].ns,
-            "protected_object_checks_elapsed_ns":s[2].ns,"drc_compare_elapsed_ns":s[3].ns,"drc_after_scan_elapsed_ns":s[4].ns,
-            "drc_before_scan_elapsed_ns":s[5].ns,"drc_set_difference_elapsed_ns":s[6].ns,"connectivity_checks_elapsed_ns":s[7].ns,
-            "detail":p.detail,"detail_timing_semantics":"phase nanoseconds are aggregate wall time; DRC generation, retain, and key-build timings are sampled by 128-item batches in candidate order; nested timings overlap enclosing legacy timings"})
-    })
-}
-
-#[derive(Clone, Copy)]
-enum BoardScan {
-    AfterMap,
-    BaselineCompare,
-    BaselineIds,
-    NewForeignGuard,
-    DrcAfter,
-    DrcBefore,
-}
-fn record_board_scan(scan: BoardScan, items: u64, traces: u64, pads: u64, vias: u64) {
-    VALIDATION_METRICS.with(|cell| {
-        let mut p = cell.get();
-        let d = &mut p.detail;
-        match scan {
-            BoardScan::AfterMap => { d.after_map_items += items; d.after_map_traces += traces; d.after_map_pads += pads; d.after_map_vias += vias; }
-            BoardScan::BaselineCompare => { d.baseline_compare_items += items; d.baseline_compare_traces += traces; d.baseline_compare_pads += pads; d.baseline_compare_vias += vias; }
-            BoardScan::BaselineIds => d.baseline_id_items += items,
-            BoardScan::NewForeignGuard => d.new_foreign_guard_items += items,
-            BoardScan::DrcAfter => d.drc_after_items += items,
-            BoardScan::DrcBefore => d.drc_before_items += items,
-        }
-        cell.set(p);
-    });
-}
-fn update_detail(update: impl FnOnce(&mut ValidationDetail)) {
-    VALIDATION_METRICS.with(|cell| {
-        let mut p = cell.get();
-        update(&mut p.detail);
-        cell.set(p);
-    });
-}
-#[derive(Clone, Copy)]
-enum DetailPhase {
-    AfterMap,
-    BaselineCompare,
-    BaselineIds,
-    NewForeignGuard,
-    DrcCandidateGeneration,
-    DrcRetain,
-    DrcKeys,
-    ConnectivityBuild,
-    ConnectivityCompare,
-}
-fn record_phase_ns(phase: DetailPhase, ns: u64) {
-    update_detail(|d| match phase {
-        DetailPhase::AfterMap => d.after_map_ns += ns,
-        DetailPhase::BaselineCompare => d.baseline_compare_ns += ns,
-        DetailPhase::BaselineIds => d.baseline_id_collection_ns += ns,
-        DetailPhase::NewForeignGuard => d.new_foreign_guard_ns += ns,
-        DetailPhase::DrcCandidateGeneration => d.drc_candidate_generation_ns += ns,
-        DetailPhase::DrcRetain => d.drc_retain_check_ns += ns,
-        DetailPhase::DrcKeys => d.drc_result_key_build_ns += ns,
-        DetailPhase::ConnectivityBuild => d.connectivity_build_ns += ns,
-        DetailPhase::ConnectivityCompare => d.connectivity_compare_ns += ns,
-    });
-}
-struct DetailTimer {
-    phase: DetailPhase,
-    start: Instant,
-}
-impl DetailTimer {
-    fn start(phase: DetailPhase) -> Self {
-        Self { phase, start: Instant::now() }
-    }
-}
-impl Drop for DetailTimer {
-    fn drop(&mut self) {
-        record_phase_ns(self.phase, self.start.elapsed().as_nanos() as u64);
-    }
-}
-fn profiled_debug<T: std::fmt::Debug>(value: &T) -> String {
-    let formatted = format!("{:?}", value);
-    update_detail(|d| {
-        d.invariant_signature_format_calls += 1;
-        d.invariant_signature_format_bytes += formatted.len() as u64;
-    });
-    formatted
 }
 
 /// Prove that a baseline item's content and every input used to derive its
@@ -483,7 +270,6 @@ fn retain_clearance_candidate(
     board: &BasicBoard,
     violation: &ClearanceViolation,
     allow_awx_same_net_via_pad_contact: bool,
-    mut exact_copper_checks: Option<&mut u64>,
 ) -> bool {
     let first = board.item(violation.first_item);
     let second = board.item(violation.second_item);
@@ -533,9 +319,6 @@ fn retain_clearance_candidate(
         }
     }
 
-    if let Some(checks) = exact_copper_checks.as_deref_mut() {
-        *checks += 1;
-    }
     let Some(actual_gap) = crate::copper_clearance::actual_copper_gap(
         board,
         violation.first_item,
@@ -1203,7 +986,7 @@ impl BoardAdapter {
             .ok_or("engine rejected trace insertion")?;
         if clearance_violations(&self.board, key)
             .iter()
-            .any(|v| retain_clearance_candidate(&self.board, v, self.awx_same_net_via_pad_contact, None))
+            .any(|v| retain_clearance_candidate(&self.board, v, self.awx_same_net_via_pad_contact))
         {
             return Err(format!("{}: inserted candidate violates DRC", leg.net));
         }
@@ -1211,84 +994,28 @@ impl BoardAdapter {
         Ok(key)
     }
     pub fn violations(&self) -> BTreeSet<(i32, i32, i32, u64, u64)> {
-        self.violations_for_scan(None)
+        self.violations_for_scan()
     }
-    fn violations_for_scan(
-        &self,
-        scan: Option<BoardScan>,
-    ) -> BTreeSet<(i32, i32, i32, u64, u64)> {
-        let _timer = Timer::start(Metric::Violations);
-        const ITEM_BATCH: usize = 128;
-        let mut keys = self.board.item_repository().iter();
+    fn violations_for_scan(&self) -> BTreeSet<(i32, i32, i32, u64, u64)> {
         let mut result = BTreeSet::new();
-        loop {
-            let batch: Vec<_> = keys.by_ref().take(ITEM_BATCH).collect();
-            if batch.is_empty() {
-                break;
-            }
-            let generation_start = Instant::now();
-            let mut candidates = Vec::new();
-            let mut traces = 0;
-            let mut pads = 0;
-            let mut vias = 0;
-            for &key in &batch {
-                let item = self.board.item(key);
-                traces += item.is_trace() as u64;
-                pads += item.is_pin() as u64;
-                vias += item.is_via() as u64;
-                candidates.extend(clearance_violations(&self.board, key));
-            }
-            let generation_ns = generation_start.elapsed().as_nanos() as u64;
-            let candidate_count = candidates.len() as u64;
-            record_phase_ns(DetailPhase::DrcCandidateGeneration, generation_ns);
-            update_detail(|d| d.drc_clearance_candidates += candidate_count);
-            if let Some(scan) = scan {
-                record_board_scan(scan, batch.len() as u64, traces, pads, vias);
-            }
-
-            let retain_start = Instant::now();
-            let mut retained = Vec::new();
-            let mut exact_copper_checks = 0u64;
-            for candidate in candidates {
+        for key in self.board.item_repository().iter() {
+            for candidate in clearance_violations(&self.board, key) {
                 if retain_clearance_candidate(
                     &self.board,
                     &candidate,
                     self.awx_same_net_via_pad_contact,
-                    Some(&mut exact_copper_checks),
                 ) {
-                    retained.push(candidate);
+                    let a = self.board.item(candidate.first_item).id().0;
+                    let b = self.board.item(candidate.second_item).id().0;
+                    result.insert((
+                        a.min(b),
+                        a.max(b),
+                        candidate.layer,
+                        candidate.expected_clearance.to_bits(),
+                        candidate.actual_clearance.to_bits(),
+                    ));
                 }
             }
-            let retain_ns = retain_start.elapsed().as_nanos() as u64;
-            let retained_count = retained.len() as u64;
-            let rejected_count = candidate_count.saturating_sub(retained_count);
-            record_phase_ns(DetailPhase::DrcRetain, retain_ns);
-            update_detail(|d| {
-                d.drc_retained_candidates += retained_count;
-                d.drc_rejected_candidates += rejected_count;
-                d.retain_exact_copper_gap_checks += exact_copper_checks;
-            });
-
-            let key_start = Instant::now();
-            let mut key_candidates = 0u64;
-            let mut unique_keys = 0u64;
-            for v in retained {
-                let a = self.board.item(v.first_item).id().0;
-                let b = self.board.item(v.second_item).id().0;
-                key_candidates += 1;
-                unique_keys += result.insert((
-                    a.min(b),
-                    a.max(b),
-                    v.layer,
-                    v.expected_clearance.to_bits(),
-                    v.actual_clearance.to_bits(),
-                )) as u64;
-            }
-            record_phase_ns(DetailPhase::DrcKeys, key_start.elapsed().as_nanos() as u64);
-            update_detail(|d| {
-                d.drc_result_key_candidates += key_candidates;
-                d.drc_unique_result_keys += unique_keys;
-            });
         }
         result
     }
@@ -1320,7 +1047,6 @@ impl BoardAdapter {
                     &source.board,
                     violation,
                     self.awx_same_net_via_pad_contact && source.awx_same_net_via_pad_contact,
-                    None,
                 )
             })
             .map(|violation| {
@@ -1366,36 +1092,19 @@ impl BoardAdapter {
             .collect()
     }
     pub fn connectivity(&self) -> BTreeMap<String, Vec<Vec<i32>>> {
-        let _detail_timer = DetailTimer::start(DetailPhase::ConnectivityBuild);
-        let mut net_iterations = 0u64;
-        let mut connected_calls = 0u64;
-        let mut groups = 0u64;
-        let mut members = 0u64;
-        let mut pin_checks = 0u64;
-        let mut pins = 0u64;
-        let result = self.board
+        self.board
             .rules
             .nets
             .iter()
             .map(|n| {
-                net_iterations += 1;
-                connected_calls += 1;
-                let connected_sets = self.board.get_connected_sets(n.net_number);
-                groups += connected_sets.len() as u64;
+                let connected_sets = self.board.get_connected_sets_cached(n.net_number);
                 let mut groups: Vec<Vec<i32>> = connected_sets
                     .into_iter()
                     .map(|s| {
                         let mut ids: Vec<_> = s
                             .iter()
-                            .filter(|&k| {
-                                members += 1;
-                                pin_checks += 1;
-                                self.board.item(k).is_pin()
-                            })
-                            .map(|k| {
-                                pins += 1;
-                                self.board.item(k).id().0
-                            })
+                            .filter(|&k| self.board.item(k).is_pin())
+                            .map(|k| self.board.item(k).id().0)
                             .collect();
                         ids.sort();
                         ids
@@ -1405,19 +1114,7 @@ impl BoardAdapter {
                 groups.sort();
                 (n.name.clone(), groups)
             })
-            .collect();
-        // `connectivity()` uses get_connected_sets; it does not invoke the
-        // NetIncompletes/airline calculator.
-        update_detail(|d| {
-            d.connectivity_calls += 1;
-            d.connectivity_net_iterations += net_iterations;
-            d.connectivity_get_connected_sets_calls += connected_calls;
-            d.connectivity_groups += groups;
-            d.connectivity_item_members += members;
-            d.connectivity_pin_checks += pin_checks;
-            d.connectivity_pins_emitted += pins;
-        });
-        result
+            .collect()
     }
     pub fn assert_preserved(&self, before: &Self) -> Result<(), String> {
         self.assert_invariants(before, &BTreeSet::new(), true)
@@ -1601,44 +1298,17 @@ impl BoardAdapter {
         strict: bool,
         moved_components: &BTreeSet<String>,
     ) -> Result<(), String> {
-        let _total_timer = Timer::start(Metric::Invariant);
-        let preservation_timer = Timer::start(Metric::Preserve);
-        let _after_map_timer = DetailTimer::start(DetailPhase::AfterMap);
-        let mut after_items = 0u64;
-        let mut after_traces = 0u64;
-        let mut after_pads = 0u64;
-        let mut after_vias = 0u64;
         let after: BTreeMap<_, _> = self
             .board
             .item_repository()
             .iter()
             .map(|k| {
                 let item = self.board.item(k);
-                after_items += 1;
-                after_traces += item.is_trace() as u64;
-                after_pads += item.is_pin() as u64;
-                after_vias += item.is_via() as u64;
                 (item.id().0, k)
             })
             .collect();
-        update_detail(|d| d.invariant_after_map_entries += after.len() as u64);
-        record_board_scan(BoardScan::AfterMap, after_items, after_traces, after_pads, after_vias);
-        drop(_after_map_timer);
-        let _baseline_compare_timer = DetailTimer::start(DetailPhase::BaselineCompare);
-        let mut baseline_items = 0u64;
-        let mut baseline_traces = 0u64;
-        let mut baseline_pads = 0u64;
-        let mut baseline_vias = 0u64;
-        let mut baseline_id_lookups = 0u64;
-        let mut protected_net_checks = 0u64;
-        let mut geometry_debug_fast_path_hits = 0u64;
-        let mut geometry_debug_fast_path_misses = 0u64;
         for k in before.board.item_repository().iter() {
             let item = before.board.item(k);
-            baseline_items += 1;
-            baseline_traces += item.is_trace() as u64;
-            baseline_pads += item.is_pin() as u64;
-            baseline_vias += item.is_via() as u64;
             let component_no = item.component_no();
             let moved_component = if component_no <= 0 {
                 false
@@ -1654,7 +1324,6 @@ impl BoardAdapter {
                 && (item.is_trace() || item.is_via())
                 && item.fixed_state() == FixedState::Unfixed
                 && !item.net_numbers().iter().any(|&n| {
-                    protected_net_checks += 1;
                     before
                         .board
                         .rules
@@ -1665,7 +1334,6 @@ impl BoardAdapter {
             {
                 continue;
             }
-            baseline_id_lookups += 1;
             let a = after.get(&item.id().0).ok_or("original item removed")?;
             let now = self.board.item(*a);
             let debug_geometry_unchanged = if moved_component {
@@ -1677,11 +1345,6 @@ impl BoardAdapter {
                     k,
                     *a,
                 );
-                if unchanged {
-                    geometry_debug_fast_path_hits += 1;
-                } else {
-                    geometry_debug_fast_path_misses += 1;
-                }
                 unchanged
             };
             if item.board_item_type() != now.board_item_type()
@@ -1697,7 +1360,7 @@ impl BoardAdapter {
                         &before.board.item_tile_shapes(item),
                     )
                     .as_ref()
-                        != profiled_debug(&self.board.item_tile_shapes(now)).as_str())
+                        != format!("{:?}", self.board.item_tile_shapes(now)).as_str())
             {
                 return Err("frozen original item type/shape/layers changed".into());
             }
@@ -1712,7 +1375,7 @@ impl BoardAdapter {
                     &item.kind,
                 )
                 .as_ref()
-                    != profiled_debug(&now.kind).as_str()
+                    != format!("{:?}", now.kind).as_str()
             {
                 return Err("original non-routing entity properties changed".into());
             }
@@ -1768,32 +1431,14 @@ impl BoardAdapter {
                 }
             }
         }
-        record_board_scan(BoardScan::BaselineCompare, baseline_items, baseline_traces, baseline_pads, baseline_vias);
-        update_detail(|d| {
-            d.invariant_baseline_id_lookups += baseline_id_lookups;
-            d.invariant_protected_net_membership_checks += protected_net_checks;
-            d.invariant_geometry_debug_fast_path_hits += geometry_debug_fast_path_hits;
-            d.invariant_geometry_debug_fast_path_misses += geometry_debug_fast_path_misses;
-        });
-        drop(_baseline_compare_timer);
-        let _baseline_ids_timer = DetailTimer::start(DetailPhase::BaselineIds);
-        let mut baseline_id_items = 0u64;
         let original_ids: BTreeSet<_> = before
             .board
             .item_repository()
             .iter()
-            .map(|k| {
-                baseline_id_items += 1;
-                before.board.item(k).id()
-            })
+            .map(|k| before.board.item(k).id())
             .collect();
-        record_board_scan(BoardScan::BaselineIds, baseline_id_items, 0, 0, 0);
-        drop(_baseline_ids_timer);
-        let _foreign_guard_timer = DetailTimer::start(DetailPhase::NewForeignGuard);
-        let mut foreign_guard_items = 0u64;
         let mut protected_copper_found = false;
         for k in self.board.item_repository().iter() {
-            foreign_guard_items += 1;
             let item = self.board.item(k);
             if !original_ids.contains(&item.id())
                 && (item.is_trace() || item.is_via())
@@ -1809,46 +1454,24 @@ impl BoardAdapter {
                 break;
             }
         }
-        record_board_scan(BoardScan::NewForeignGuard, foreign_guard_items, 0, 0, 0);
-        drop(_foreign_guard_timer);
         if protected_copper_found {
             return Err("protected net acquired new copper".into());
         }
-        drop(preservation_timer);
-        let drc_timer = Timer::start(Metric::Drc);
-        let after_violations = {
-            let _timer = Timer::start(Metric::After);
-            self.violations_for_scan(Some(BoardScan::DrcAfter))
-        };
-        let before_violations = {
-            let _timer = Timer::start(Metric::Before);
-            cached_baseline_violations(before)
-        };
-        let has_new_violation = {
-            let _timer = Timer::start(Metric::Diff);
-            !after_violations.is_subset(&before_violations)
-        };
-        drop(drc_timer);
+        let after_violations = self.violations_for_scan();
+        let before_violations = cached_baseline_violations(before);
+        let has_new_violation = !after_violations.is_subset(&before_violations);
         if has_new_violation {
             return Err("new full-board clearance violation".into());
         }
-        let _connectivity_timer = Timer::start(Metric::Connectivity);
         let previous = cached_baseline_connectivity(before);
         let current = self.connectivity();
-        let _connectivity_compare_timer = DetailTimer::start(DetailPhase::ConnectivityCompare);
-        let mut previous_groups_compared = 0u64;
-        let mut set_comparisons = 0u64;
-        let mut pin_membership_probes = 0u64;
         for (net, groups) in previous.iter() {
             for connected in groups {
-                previous_groups_compared += 1;
                 let mut found = false;
                 if let Some(sets) = current.get(net) {
                     for set in sets {
-                        set_comparisons += 1;
                         let mut contains_all = true;
                         for id in connected {
-                            pin_membership_probes += 1;
                             // `connectivity()` sorts every pin-id vector before returning it,
                             // so use logarithmic lookup when checking whether an old group is
                             // still contained in a current group.
@@ -1864,20 +1487,10 @@ impl BoardAdapter {
                     }
                 }
                 if !found {
-                    update_detail(|d| {
-                        d.connectivity_previous_groups_compared += previous_groups_compared;
-                        d.connectivity_set_comparisons += set_comparisons;
-                        d.connectivity_pin_membership_probes += pin_membership_probes;
-                    });
                     return Err(format!("existing {net} connectivity split"));
                 }
             }
         }
-        update_detail(|d| {
-            d.connectivity_previous_groups_compared += previous_groups_compared;
-            d.connectivity_set_comparisons += set_comparisons;
-            d.connectivity_pin_membership_probes += pin_membership_probes;
-        });
         Ok(())
     }
 }

@@ -31,7 +31,7 @@ use crate::{
         braid_connect::{rung_specs, LadderMode, RungEndpoint, RungReport, RungRequest},
         endpoint_recovery::{try_source_ripup, RecoveryState, RipAccepted},
         fab_rules::{EscalationPolicy, FabTier},
-        native_rung::{endpoint_grid_calls, route_multilayer_endpoint_sets_in_run},
+        native_rung::route_multilayer_endpoint_sets_in_run,
         net_multipoint::{plan_native_multipoint, MultipointPlan, MultipointTerminal},
         whole_context::RoutingRules,
     },
@@ -50,9 +50,9 @@ use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Write},
+    io::Write,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -353,108 +353,19 @@ fn rules_for_layer(
     })
 }
 
-const LOG_WRITE_SAMPLE_EVERY: u64 = 1024;
-
-#[derive(Clone, Copy, Default)]
-struct LogWriteProfile {
-    write_calls: u64,
-    bytes: u64,
-    flush_calls: u64,
-    sampled_write_calls: u64,
-    sampled_write_elapsed_ns: u128,
-    log_event_calls: u64,
-    log_event_elapsed_ns: u128,
-    serialize_elapsed_ns: u128,
-    write_flush_elapsed_ns: u128,
-}
-
 thread_local! {
-    static LOG_WRITE_PROFILE: std::cell::RefCell<LogWriteProfile> = std::cell::RefCell::new(LogWriteProfile::default());
     static LOG_EVENT_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-struct ProfiledLogWriter<'a> {
-    inner: &'a mut fs::File,
-}
-
-impl Write for ProfiledLogWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let ordinal = LOG_WRITE_PROFILE.with(|profile| {
-            let mut profile = profile.borrow_mut();
-            profile.write_calls += 1;
-            profile.write_calls
-        });
-        let sampled = ordinal % LOG_WRITE_SAMPLE_EVERY == 0;
-        let started = sampled.then(Instant::now);
-        let result = self.inner.write(bytes);
-        LOG_WRITE_PROFILE.with(|profile| {
-            let mut profile = profile.borrow_mut();
-            if let Ok(written) = &result {
-                profile.bytes += *written as u64;
-            }
-            if let Some(started) = started {
-                profile.sampled_write_calls += 1;
-                profile.sampled_write_elapsed_ns += started.elapsed().as_nanos();
-            }
-        });
-        result
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        LOG_WRITE_PROFILE.with(|profile| profile.borrow_mut().flush_calls += 1);
-        self.inner.flush()
-    }
-}
-
 fn log_event(log: &mut fs::File, event: &serde_json::Value) -> Result<(), String> {
-    let started = Instant::now();
-    let result = LOG_EVENT_BUFFER.with(|buffer| {
+    LOG_EVENT_BUFFER.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
         buffer.clear();
-        let serialize_started = Instant::now();
-        let serialize_result = serde_json::to_writer(&mut *buffer, event)
+        serde_json::to_writer(&mut *buffer, event)
             .map_err(|e| e.to_string())
-            .map(|()| buffer.push(b'\n'));
-        let serialize_elapsed_ns = serialize_started.elapsed().as_nanos();
-        LOG_WRITE_PROFILE.with(|profile| {
-            profile.borrow_mut().serialize_elapsed_ns += serialize_elapsed_ns;
-        });
-        serialize_result?;
-
-        let write_started = Instant::now();
-        let result = (|| {
-            let mut writer = ProfiledLogWriter { inner: log };
-            writer.write_all(&buffer).map_err(|e| e.to_string())?;
-            writer.flush().map_err(|e| e.to_string())
-        })();
-        LOG_WRITE_PROFILE.with(|profile| {
-            profile.borrow_mut().write_flush_elapsed_ns += write_started.elapsed().as_nanos();
-        });
-        result
-    });
-    LOG_WRITE_PROFILE.with(|profile| {
-        let mut profile = profile.borrow_mut();
-        profile.log_event_calls += 1;
-        profile.log_event_elapsed_ns += started.elapsed().as_nanos();
-    });
-    result
-}
-
-fn log_write_profile_json() -> serde_json::Value {
-    let profile = LOG_WRITE_PROFILE.with(|profile| *profile.borrow());
-    serde_json::json!({
-        "coverage":"thread-local aggregate for log_event; write_calls count Write::write calls through the forwarding wrapper, not OS syscalls; bytes are successful returned byte counts; flush_calls count forwarded Write::flush calls.",
-        "write_calls":profile.write_calls,
-        "bytes":profile.bytes,
-        "flush_calls":profile.flush_calls,
-        "log_event_calls":profile.log_event_calls,
-        "log_event_format_write_flush_elapsed_ns":profile.log_event_elapsed_ns,
-        "serialize_elapsed_ns":profile.serialize_elapsed_ns,
-        "write_flush_elapsed_ns":profile.write_flush_elapsed_ns,
-        "sampled_write_every_n_calls":LOG_WRITE_SAMPLE_EVERY,
-        "sampled_write_calls":profile.sampled_write_calls,
-        "sampled_write_elapsed_ns":profile.sampled_write_elapsed_ns,
-        "sampled_write_elapsed_is_estimate":true
+            .map(|()| buffer.push(b'\n'))?;
+        log.write_all(&buffer).map_err(|e| e.to_string())?;
+        log.flush().map_err(|e| e.to_string())
     })
 }
 
@@ -560,7 +471,7 @@ fn final_unconnected_inventory(
     nets: &[(NetNo, String)],
     attempts: &[serde_json::Value],
     skips: &[serde_json::Value],
-    profile: &DriverProfile,
+    retry_counts: &BTreeMap<String, u64>,
 ) -> serde_json::Value {
     let pad_refs: BTreeMap<i32, String> = board
         .pads()
@@ -654,12 +565,7 @@ fn final_unconnected_inventory(
             .iter()
             .filter(|event| event["net"].as_str() == Some(name.as_str()))
             .collect();
-        let retry_count = profile
-            .nets
-            .get(name)
-            .and_then(|stages| stages.get("retry_build_endpoint_request"))
-            .map(|counter| counter.calls)
-            .unwrap_or(0);
+        let retry_count = retry_counts.get(name).copied().unwrap_or(0);
         let last_failure = net_attempts.iter().rev().find_map(|event| {
             let result = &event["result"];
             if result["accepted"].as_bool().unwrap_or(false) {
@@ -681,7 +587,6 @@ fn final_unconnected_inventory(
                 "route_stage": event["stage"], "failure_stage": failure_stage,
                 "reason": raw, "category": category,
                 "expanded": result.get("expanded").or_else(|| result.get("expanded_nodes")),
-                "grid_router_calls": result["grid_router_calls"],
                 "evidence_scope": "net_history",
             }))
         });
@@ -795,7 +700,7 @@ struct Driver<'a> {
     incomplete_total: i32,
     count_witness: IncompleteCountWitness,
     record_best_calls: u64,
-    profile: DriverProfile,
+    retry_counts: BTreeMap<String, u64>,
 }
 
 struct IncompleteCountWitness {
@@ -865,81 +770,6 @@ fn full_incomplete_counts(board: &BoardAdapter) -> (BTreeMap<NetNo, i32>, i32) {
     (counts, total)
 }
 
-#[derive(Default)]
-struct DriverProfile {
-    nets: BTreeMap<String, BTreeMap<String, ProfileCounter>>,
-    record_best: BTreeMap<String, RecordBestMetrics>,
-}
-
-#[derive(Default)]
-struct RecordBestMetrics {
-    incomplete_count_calls: u64,
-    incomplete_count_elapsed_ns: u128,
-    full_refresh_calls: u64,
-    affected_refresh_calls: u64,
-    refreshed_net_count: u64,
-    cache_fullcheck_calls: u64,
-    cache_fullcheck_mismatches: u64,
-    cache_fullcheck_last_diff: i64,
-    board_clone_calls: u64,
-    board_clone_elapsed_ns: u128,
-    best_not_improved_calls: u64,
-}
-
-#[derive(Default)]
-struct ProfileCounter {
-    calls: u64,
-    elapsed_ns: u128,
-}
-
-impl DriverProfile {
-    fn add(&mut self, net: &str, stage: &str, elapsed: Duration) {
-        let counter = self
-            .nets
-            .entry(net.to_string())
-            .or_default()
-            .entry(stage.to_string())
-            .or_default();
-        counter.calls += 1;
-        counter.elapsed_ns += elapsed.as_nanos();
-    }
-
-    fn json(&self) -> serde_json::Value {
-        let mut nets = serde_json::Map::new();
-        for (net, stages) in &self.nets {
-            let mut stage_values = serde_json::Map::new();
-            for (stage, counter) in stages {
-                stage_values.insert(stage.clone(), serde_json::json!({
-                    "calls": counter.calls,
-                    "elapsed_ns": counter.elapsed_ns,
-                    "inclusive": matches!(stage.as_str(), "route_net_fully" | "phase1_route" | "phase3_taps" | "drain_reroute_queue" | "recover_edge" | "route_endpoint_set"),
-                }));
-            }
-            nets.insert(net.clone(), serde_json::Value::Object(stage_values));
-        }
-        serde_json::Value::Object(nets)
-    }
-
-    fn record_best_json(&self) -> serde_json::Value {
-        let record_best = self.record_best.iter().map(|(net, metrics)| {
-            (net.clone(), serde_json::json!({
-                "incomplete_count_calls":metrics.incomplete_count_calls,
-                "incomplete_count_elapsed_ns":metrics.incomplete_count_elapsed_ns,
-                "full_refresh_calls":metrics.full_refresh_calls,
-                "affected_refresh_calls":metrics.affected_refresh_calls,
-                "refreshed_net_count":metrics.refreshed_net_count,
-                "cache_fullcheck_calls":metrics.cache_fullcheck_calls,
-                "cache_fullcheck_mismatches":metrics.cache_fullcheck_mismatches,
-                "cache_fullcheck_last_diff":metrics.cache_fullcheck_last_diff,
-                "board_clone_calls":metrics.board_clone_calls,
-                "board_clone_elapsed_ns":metrics.board_clone_elapsed_ns,
-                "best_not_improved_calls":metrics.best_not_improved_calls
-            }))
-        }).collect::<serde_json::Map<_, _>>();
-        serde_json::Value::Object(record_best)
-    }
-}
-
 /// Pop the native backend's PRIVATE `_via_unblock_blame` key from a route
 /// report. The value is the source `pcb_data._via_unblock_blame` set
 /// (`single_ended_loop.py:1034..1071`): the native net numbers of the committed
@@ -962,6 +792,7 @@ fn take_via_unblock_blame(report: &mut serde_json::Value) -> Option<BTreeSet<Net
     )
 }
 
+
 impl Driver<'_> {
     /// Snapshot `board` as the run's best consistent state when its actual
     /// copper has strictly fewer remaining incompletes. Callers provide the
@@ -969,11 +800,8 @@ impl Driver<'_> {
     fn record_best(
         &mut self,
         board: &BoardAdapter,
-        net_name: &str,
         changed_nets: &[NetNo],
     ) -> Result<(), String> {
-        let started = Instant::now();
-        let count_started = Instant::now();
         let affected: BTreeSet<NetNo> = changed_nets.iter().copied().collect();
         let affected_refresh = !affected.is_empty()
             && affected.iter().all(|net| self.incomplete_counts.contains_key(net))
@@ -993,43 +821,20 @@ impl Driver<'_> {
         }
         self.count_witness = IncompleteCountWitness::new(board);
         let count = self.incomplete_total;
-        let count_elapsed = count_started.elapsed();
-        let metrics = self.profile.record_best.entry(net_name.to_string()).or_default();
-        metrics.incomplete_count_calls += 1;
-        metrics.incomplete_count_elapsed_ns += count_elapsed.as_nanos();
-        if affected_refresh {
-            metrics.affected_refresh_calls += 1;
-            metrics.refreshed_net_count += affected.len() as u64;
-        } else {
-            metrics.full_refresh_calls += 1;
-            metrics.refreshed_net_count += self.incomplete_counts.len() as u64;
-        }
         self.record_best_calls += 1;
         if self.record_best_calls % RECORD_BEST_FULLCHECK_EVERY == 0 {
-            let full_count_started = Instant::now();
             let full_count =
                 fr_engine::pipeline::stats::incomplete_count(&board.board, None);
-            metrics.cache_fullcheck_calls += 1;
-            metrics.cache_fullcheck_last_diff = i64::from(full_count) - i64::from(count);
             if full_count != count {
-                metrics.cache_fullcheck_mismatches += 1;
-                metrics.incomplete_count_elapsed_ns += full_count_started.elapsed().as_nanos();
                 return Err(format!(
                     "record_best net-count cache disagrees with full count: incremental={count}, full={full_count}"
                 ));
             }
-            metrics.incomplete_count_elapsed_ns += full_count_started.elapsed().as_nanos();
         }
         if count < self.best_incompletes {
-            let clone_started = Instant::now();
             self.best_board = board.clone();
-            metrics.board_clone_calls += 1;
-            metrics.board_clone_elapsed_ns += clone_started.elapsed().as_nanos();
             self.best_incompletes = count;
-        } else {
-            metrics.best_not_improved_calls += 1;
         }
-        self.profile.add(net_name, "record_best", started.elapsed());
         Ok(())
     }
 
@@ -1053,7 +858,6 @@ impl Driver<'_> {
         if starts.is_empty() || targets.is_empty() {
             return Ok((None, None));
         }
-        let build_started = Instant::now();
         let request = build_endpoint_request(
             board,
             &self.ctx,
@@ -1064,8 +868,6 @@ impl Driver<'_> {
             targets[0].clone(),
             route_layers,
         )?;
-        self.profile
-            .add(name, "build_endpoint_request", build_started.elapsed());
         let mut event = serde_json::json!({"event":"attempt_start","net":name,"stage":stage,
             "from_item":board.board.item(from_item).id().0,"to_item":board.board.item(to_item).id().0,
             "start":starts[0].point,"end":targets[0].point,
@@ -1077,11 +879,7 @@ impl Driver<'_> {
             "new_via_drill_source":"explicit job rule",
             "existing_pad_drill_source":"exact native padstack electrical copper; DSN drill unknown where absent",
             "via_drill_mm":request.rules.via_drill});
-        let log_started = Instant::now();
         log_event(&mut self.log, &event)?;
-        self.profile
-            .add(name, "attempt_log_write", log_started.elapsed());
-        let calls_before = endpoint_grid_calls();
         let (candidate, mut report, frontier) = match route_multilayer_endpoint_sets_in_run(
             request,
             from_item,
@@ -1094,7 +892,6 @@ impl Driver<'_> {
             Ok(v) => v,
             Err(e) => (None, serde_json::json!({"accepted":false,"reason":e}), None),
         };
-        report["grid_router_calls"] = (endpoint_grid_calls() - calls_before).into();
         // ORIGINAL source keystone: take the private `_via_unblock_blame` key OUT
         // of the report BEFORE it is logged or kept as an attempt, then hand this
         // edge's blame to the rip custody. `set_attempt_blame` REPLACES the
@@ -1106,12 +903,7 @@ impl Driver<'_> {
         event["event"] = "attempt_end".into();
         event["elapsed_ns"] = serde_json::json!(route_started.elapsed().as_nanos());
         event["result"] = report;
-        let log_started = Instant::now();
         log_event(&mut self.log, &event)?;
-        self.profile
-            .add(name, "attempt_log_write", log_started.elapsed());
-        self.profile
-            .add(name, "route_endpoint_set", route_started.elapsed());
         self.attempts.push(event);
         Ok((candidate, frontier))
     }
@@ -1134,18 +926,16 @@ impl Driver<'_> {
         frontier: &RungReport,
         target_data: T,
     ) -> Result<Option<RipAccepted<T>>, String> {
-        let recover_started = Instant::now();
         let ctx = self.ctx.clone();
         let baseline = self.baseline;
         let protected = self.protected;
         let net_name = name.to_string();
-        let retry_profile = Arc::new(Mutex::new(Vec::<u128>::new()));
-        let retry_profile_in = retry_profile.clone();
+        let mut retry_count = 0u64;
         let starts0 = starts.to_vec();
         let targets0 = targets.to_vec();
         let route_layers0 = route_layers.to_vec();
-        let retry = move |trial: &BoardAdapter| {
-            let build_started = Instant::now();
+        let mut retry = |trial: &BoardAdapter| {
+            retry_count += 1;
             let request = build_endpoint_request(
                 trial,
                 &ctx,
@@ -1156,10 +946,6 @@ impl Driver<'_> {
                 targets0[0].clone(),
                 &route_layers0,
             )?;
-            retry_profile_in
-                .lock()
-                .unwrap()
-                .push(build_started.elapsed().as_nanos());
             let (candidate, mut report, fresh) = route_multilayer_endpoint_sets_in_run(
                 request, from_item, to_item, &starts0, &targets0, baseline, protected,
             )?;
@@ -1186,17 +972,9 @@ impl Driver<'_> {
             frontier,
             protected,
             &mut self.recovery,
-            retry,
+            &mut retry,
         )?;
-        if let Ok(retry_builds) = retry_profile.lock() {
-            for elapsed_ns in retry_builds.iter() {
-                self.profile.add(
-                    name,
-                    "retry_build_endpoint_request",
-                    Duration::from_nanos((*elapsed_ns).min(u64::MAX as u128) as u64),
-                );
-            }
-        }
+        *self.retry_counts.entry(name.to_string()).or_default() += retry_count;
         if let Some(accepted) = &accepted {
             let event = serde_json::json!({"event":"rip_accepted","net":name,
                 "victims":accepted.victims});
@@ -1209,8 +987,6 @@ impl Driver<'_> {
                 self.pending.retain(|entry| entry.net != *victim);
             }
         }
-        self.profile
-            .add(name, "recover_edge", recover_started.elapsed());
         Ok(accepted)
     }
 
@@ -1222,10 +998,7 @@ impl Driver<'_> {
         name: &str,
         route_layers: &[(i32, String)],
     ) -> Result<Phase1Outcome, String> {
-        let started = Instant::now();
-        let result = self.phase1_route_inner(board, net, name, route_layers);
-        self.profile.add(name, "phase1_route", started.elapsed());
-        result
+        self.phase1_route_inner(board, net, name, route_layers)
     }
 
     fn phase1_route_inner(
@@ -1275,7 +1048,7 @@ impl Driver<'_> {
             if let Some(new_board) = candidate {
                 *board = new_board;
                 self.accepted += 1;
-                self.record_best(board, name, &[net])?;
+                self.record_best(board, &[net])?;
                 let mut routed = BTreeSet::new();
                 routed.insert(a);
                 routed.insert(b);
@@ -1306,7 +1079,7 @@ impl Driver<'_> {
                 self.accepted += 1;
                 let mut changed_nets = accepted.victims.clone();
                 changed_nets.push(net);
-                self.record_best(board, name, &changed_nets)?;
+                self.record_best(board, &changed_nets)?;
                 return Ok(Phase1Outcome::Pending {
                     plan,
                     routed: accepted.target_data,
@@ -1391,7 +1164,7 @@ impl Driver<'_> {
                 if let Some(new_board) = candidate {
                     *board = new_board;
                     self.accepted += 1;
-                    self.record_best(board, name, &[net])?;
+                    self.record_best(board, &[net])?;
                     committed = true;
                     break;
                 }
@@ -1412,7 +1185,7 @@ impl Driver<'_> {
                         self.accepted += 1;
                         let mut changed_nets = accepted.victims.clone();
                         changed_nets.push(net);
-                        self.record_best(board, name, &changed_nets)?;
+                        self.record_best(board, &changed_nets)?;
                         committed = true;
                         break;
                     }
@@ -1454,10 +1227,7 @@ impl Driver<'_> {
         routed: &mut BTreeSet<usize>,
         route_layers: &[(i32, String)],
     ) -> Result<(), String> {
-        let started = Instant::now();
-        let result = self.phase3_taps_inner(board, net, name, plan, routed, route_layers);
-        self.profile.add(name, "phase3_taps", started.elapsed());
-        result
+        self.phase3_taps_inner(board, net, name, plan, routed, route_layers)
     }
 
     fn phase3_taps_inner(
@@ -1633,7 +1403,7 @@ impl Driver<'_> {
             if let Some(new_board) = candidate {
                 *board = new_board;
                 self.accepted += 1;
-                self.record_best(board, name, &[net])?;
+                self.record_best(board, &[net])?;
                 routed.insert(src_idx);
                 routed.insert(tgt_idx);
                 remaining.retain(|&(x, y, _)| {
@@ -1662,7 +1432,7 @@ impl Driver<'_> {
                     self.accepted += 1;
                     let mut changed_nets = accepted.victims.clone();
                     changed_nets.push(net);
-                    self.record_best(board, name, &changed_nets)?;
+                    self.record_best(board, &changed_nets)?;
                     routed.insert(src_idx);
                     routed.insert(tgt_idx);
                     remaining.retain(|&(x, y, _)| {
@@ -1690,10 +1460,7 @@ impl Driver<'_> {
         name: &str,
         route_layers: &[(i32, String)],
     ) -> Result<bool, String> {
-        let started = Instant::now();
-        let result = self.route_net_fully_inner(board, net, name, route_layers);
-        self.profile.add(name, "route_net_fully", started.elapsed());
-        result
+        self.route_net_fully_inner(board, net, name, route_layers)
     }
 
     fn route_net_fully_inner(
@@ -1718,11 +1485,7 @@ impl Driver<'_> {
     /// Reroute the victims queued by every accepted rip, in FIFO rip order,
     /// each with its main edge and immediate taps. Bounded by the run deadline.
     fn drain_reroute_queue(&mut self, board: &mut BoardAdapter) -> Result<(), String> {
-        let started = Instant::now();
-        let result = self.drain_reroute_queue_inner(board);
-        self.profile
-            .add("<queue>", "drain_reroute_queue", started.elapsed());
-        result
+        self.drain_reroute_queue_inner(board)
     }
 
     fn drain_reroute_queue_inner(&mut self, board: &mut BoardAdapter) -> Result<(), String> {
@@ -1759,7 +1522,7 @@ impl Driver<'_> {
                         .is_ok()
                 {
                     *board = restored;
-                    self.record_best(board, &name, &[victim])?;
+                    self.record_best(board, &[victim])?;
                 }
             }
         }
@@ -2209,11 +1972,6 @@ fn boxed_in_risk_order(board: &BoardAdapter, pending: &[PendingNet]) -> Vec<NetN
 pub fn run(path: &Path) -> Result<(), String> {
     crate::awx::native_pad_raster::clear_source_raster_cache();
     crate::board_adapter::clear_validation_baseline_cache();
-    let preload_started = Instant::now();
-    crate::awx::native_rung::reset_endpoint_runtime_profile();
-    crate::board_adapter::reset_validation_metrics();
-    crate::awx::native_obstacles::reset_obstacle_detail_profile();
-    LOG_WRITE_PROFILE.with(|profile| *profile.borrow_mut() = LogWriteProfile::default());
     let job: EndpointJob = toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     if job.budget_ms == 0
@@ -2251,7 +2009,6 @@ pub fn run(path: &Path) -> Result<(), String> {
         ));
     }
     let count_witness = IncompleteCountWitness::new(&board);
-    let preload_ns = preload_started.elapsed().as_nanos();
     let started = Instant::now();
     let deadline = started + Duration::from_millis(job.budget_ms);
     let log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
@@ -2280,9 +2037,8 @@ pub fn run(path: &Path) -> Result<(), String> {
         incomplete_total,
         count_witness,
         record_best_calls: 0,
-        profile: DriverProfile::default(),
+        retry_counts: BTreeMap::new(),
     };
-    let mut phase_ns = BTreeMap::<String, u128>::new();
 
     // Original native nets in DSN order, dispatched through the default
     // multipoint ordering exactly once before routing. Root source `route.py`
@@ -2295,18 +2051,12 @@ pub fn run(path: &Path) -> Result<(), String> {
         .iter()
         .map(|n| (n.net_number, n.name.clone()))
         .collect();
-    phase_ns.insert(
-        "setup_after_budget_start".into(),
-        started.elapsed().as_nanos(),
-    );
-    let phase_started = Instant::now();
+
     let nets = crate::awx::net_ordering::order_native_nets_mps(&board, &original_nets)?;
-    phase_ns.insert("net_ordering".into(), phase_started.elapsed().as_nanos());
 
     // ---- Phase 1: one main edge per multipoint net; plain nets fully. ----
     // Best-board custody now lives on the driver and is snapshotted after EVERY
     // accepted revision (main, tap, rip, reroute), not only at phase boundaries.
-    let phase_started = Instant::now();
     for (net_index, (net, name)) in nets.iter().enumerate() {
         if Instant::now() >= deadline {
             driver.skips.extend(nets[net_index..].iter().map(
@@ -2343,28 +2093,17 @@ pub fn run(path: &Path) -> Result<(), String> {
             Phase1Outcome::Plain | Phase1Outcome::Failed => {}
         }
     }
-    phase_ns.insert("phase1_main".into(), phase_started.elapsed().as_nanos());
 
     // Victims ripped while routing the mains are rerouted before the tap pass;
     // a reroute invalidates the victim's stale pending entry inside the drain.
-    let phase_started = Instant::now();
     driver.drain_reroute_queue(&mut board)?;
-    phase_ns.insert(
-        "reroute_after_main".into(),
-        phase_started.elapsed().as_nanos(),
-    );
 
     // ---- Phase 3: remaining MST edges of every pending net, after ALL mains. ----
     // Source `_order_nets_by_boxed_in_risk`: the most boxed-in pending nets route
     // FIRST (measured on the board as it stands after every main), NOT the
     // phase-1 insertion order.
-    let phase_started = Instant::now();
     let phase3_order = boxed_in_risk_order(&board, &driver.pending);
-    phase_ns.insert(
-        "phase3_risk_ordering".into(),
-        phase_started.elapsed().as_nanos(),
-    );
-    let phase_started = Instant::now();
+
     for net_no in phase3_order {
         if Instant::now() >= deadline {
             break;
@@ -2388,19 +2127,12 @@ pub fn run(path: &Path) -> Result<(), String> {
         )?;
         driver.pending.push(entry);
     }
-    phase_ns.insert("phase3_taps".into(), phase_started.elapsed().as_nanos());
 
     // Victims ripped by the tap edges are rerouted after the taps.
-    let phase_started = Instant::now();
     driver.drain_reroute_queue(&mut board)?;
-    phase_ns.insert(
-        "reroute_after_taps".into(),
-        phase_started.elapsed().as_nanos(),
-    );
-    let routing_loop_elapsed_ns = started.elapsed().as_nanos();
+
     // Budget may end with casualties: keep the best consistent board instead of
     // the ripped one, so the run never claims worse connectivity than it made.
-    let phase_started = Instant::now();
     let final_live_cached_total = driver.incomplete_total;
     let final_live_incompletes = fr_engine::pipeline::stats::incomplete_count(&board.board, None);
     let final_live_diff = i64::from(final_live_incompletes) - i64::from(final_live_cached_total);
@@ -2432,21 +2164,11 @@ pub fn run(path: &Path) -> Result<(), String> {
         "driver_count_scope":if best_board_restored {"best_board_after_sync"} else {"live_board"},
         "driver_count_after_restore":driver.incomplete_total,
     });
-    phase_ns.insert(
-        "best_board_restore_check".into(),
-        phase_started.elapsed().as_nanos(),
-    );
-    let routing_budget_elapsed_ns = started.elapsed().as_nanos();
 
-    let phase_started = Instant::now();
     board.assert_invariants(&baseline, &job.protected_nets, true)?;
-    phase_ns.insert("final_invariant".into(), phase_started.elapsed().as_nanos());
-    let phase_started = Instant::now();
+
     let session = board.ses();
-    phase_ns.insert(
-        "ses_serialization".into(),
-        phase_started.elapsed().as_nanos(),
-    );
+
     // Restore authorized physical via definitions independently from the source
     // and explicit job rules before materializing the serialized route copper.
     let replay_layer = baseline
@@ -2474,18 +2196,12 @@ pub fn run(path: &Path) -> Result<(), String> {
             Ok((n.name.clone(), r.via_size, r.via_drill))
         })
         .collect::<Result<_, String>>()?;
-    let phase_started = Instant::now();
     let mut replay =
         BoardAdapter::load_session_with_via_candidates(&input, &session, &replay_candidates)?;
-    phase_ns.insert("ses_replay_load".into(), phase_started.elapsed().as_nanos());
+
     replay.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
-    let phase_started = Instant::now();
     replay.assert_session_invariants(&baseline, &job.protected_nets, true)?;
-    phase_ns.insert(
-        "ses_replay_assert".into(),
-        phase_started.elapsed().as_nanos(),
-    );
-    let phase_started = Instant::now();
+
     let session_replay_new_violations = replay.new_session_violations_since(&baseline).len();
     let replay_vias =
         crate::awx::board_snapshot::BoardSnapshot::capture_vias(&replay, &BTreeMap::new())?;
@@ -2500,101 +2216,40 @@ pub fn run(path: &Path) -> Result<(), String> {
                 .into(),
         );
     }
-    phase_ns.insert(
-        "ses_replay_checks".into(),
-        phase_started.elapsed().as_nanos(),
-    );
+
     let attempts = driver.attempts;
     let accepted = driver.accepted;
     let skips = driver.skips;
-    let phase_started = Instant::now();
     let new_violations = board
         .violations()
         .difference(&baseline.violations())
         .count();
-    phase_ns.insert("final_drc_count".into(), phase_started.elapsed().as_nanos());
-    let phase_started = Instant::now();
-    let validation_profile = crate::board_adapter::validation_metrics_json();
-    let validation_profile_ns = phase_started.elapsed().as_nanos();
-    phase_ns.insert("validation_profile_snapshot".into(), validation_profile_ns);
-    let obstacle_detail_profile = crate::awx::native_obstacles::obstacle_detail_profile_json();
+
     let legacy_wall_seconds = started.elapsed().as_secs_f64();
-    let final_inventory_started = Instant::now();
     let final_unconnected =
-        final_unconnected_inventory(&board, &nets, &attempts, &skips, &driver.profile);
-    let final_inventory_ns = final_inventory_started.elapsed().as_nanos();
-    phase_ns.insert("final_unconnected_inventory".into(), final_inventory_ns);
-    let final_profile_started = Instant::now();
-    let backend_runtime_profile = crate::awx::native_rung::endpoint_runtime_profile();
-    let backend_snapshot_ns = final_profile_started.elapsed().as_nanos();
-    phase_ns.insert("backend_profile_snapshot".into(), backend_snapshot_ns);
-    let endpoint_elapsed_ns_before_report = started.elapsed().as_nanos();
-    let accounted_ns = phase_ns.values().sum::<u128>();
-    let unaccounted_at_report_build_ns =
-        endpoint_elapsed_ns_before_report.saturating_sub(accounted_ns);
-    let report_build_started = Instant::now();
+        final_unconnected_inventory(&board, &nets, &attempts, &skips, &driver.retry_counts);
     let report = serde_json::json!({
         "actual_solver":"awx_grid::GridRouter","scope":"all native incompletes; active signal stack and native via transitions",
         "scheduler":"native NetIncompletes Delaunay/Kruskal airlines; recomputed after each accepted transaction",
         "whole_bga_bus_stages":"not applicable: flattened component identity",
         "budget_ms":job.budget_ms,"requested_threads":job.threads,"effective_threads":1,
         "parallel_policy":"serial board transactions","wall_seconds":legacy_wall_seconds,
-        "timing_profile": {
-            "coverage":"phase timings are additive top-level intervals; driver function and per-net timings are inclusive and overlap phase totals; backend runtime profile has backend-defined nesting.",
-            "budget_wall_seconds_ends_at":"deadline is checked only in routing phases; routing_loop_elapsed_ns marks the second reroute drain completion before best-board restore and final validation.",
-            "preload_setup_elapsed_ns":preload_ns,
-            "routing_budget_elapsed_ns":routing_budget_elapsed_ns,
-            "routing_loop_elapsed_ns":routing_loop_elapsed_ns,
-            "endpoint_elapsed_ns_before_report":endpoint_elapsed_ns_before_report,
-            "phases_elapsed_ns":phase_ns,
-            "validation_profile_snapshot_ns":validation_profile_ns,
-            "driver_by_net":driver.profile.json(),
-            "record_best_detail_by_net":driver.profile.record_best_json(),
-            "record_best_final_check":record_best_final_check,
-            "log_write_profile":log_write_profile_json(),
-            "unaccounted_ns":unaccounted_at_report_build_ns,
-            "unaccounted_scope":"endpoint_elapsed_ns_before_report minus mutually exclusive phases_elapsed_ns; excludes preload_setup_elapsed_ns, report build/serialization, SES output write, and stdout write.",
-            "report_build_serialization_and_output":"measured after report creation and recorded in the JSONL runtime_output_profile line; that profile line's own write is excluded.",
-        },
-        "backend_runtime_profile":backend_runtime_profile,
-        "obstacle_detail_profile":obstacle_detail_profile,
+        "record_best_final_check":record_best_final_check,
         "final_unconnected_nets":final_unconnected,
         "before_incompletes":before,"after_incompletes":fr_engine::pipeline::stats::incomplete_count(&board.board,None),
         "session_replay_incompletes":fr_engine::pipeline::stats::incomplete_count(&replay.board,None),
         "session_replay_vias":replay_vias.len(), "session_replay_via_geometry":replay_vias,
         "session_replay_new_violations":session_replay_new_violations,
-        "accepted":accepted,"grid_router_calls":attempts.iter().filter_map(|v|v["result"]["grid_router_calls"].as_u64()).sum::<u64>(),
-        "new_vias":board.board.get_vias().len().saturating_sub(baseline.board.get_vias().len()),"new_violations":new_violations,"validation_profile":validation_profile,
+        "accepted":accepted,
+        "new_vias":board.board.get_vias().len().saturating_sub(baseline.board.get_vias().len()),"new_violations":new_violations,
         "attempts":attempts,"skipped":skips,"output":job.output
     });
-    let report_build_ns = report_build_started.elapsed().as_nanos();
     let serialized_report = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
-    let report_serialize_ns = report_build_started
-        .elapsed()
-        .as_nanos()
-        .saturating_sub(report_build_ns);
-    let output_started = Instant::now();
     write_atomic(&output_path, &session)?;
-    let session_write_ns = output_started.elapsed().as_nanos();
-    let stdout_started = Instant::now();
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{}", serialized_report).map_err(|e| e.to_string())?;
     stdout.flush().map_err(|e| e.to_string())?;
-    let stdout_write_ns = stdout_started.elapsed().as_nanos();
     drop(stdout);
-    log_event(
-        &mut driver.log,
-        &serde_json::json!({
-            "event":"runtime_output_profile",
-            "report_serialization_ns":report_serialize_ns,
-            "report_build_ns":report_build_ns,
-            "endpoint_elapsed_ns_before_report":endpoint_elapsed_ns_before_report,
-            "final_inventory_ns":final_inventory_ns,
-            "ses_output_write_ns":session_write_ns,
-            "stdout_write_ns":stdout_write_ns,
-            "profile_line_write_included":false,
-        }),
-    )?;
     Ok(())
 }
 
@@ -2603,7 +2258,6 @@ pub fn run(path: &Path) -> Result<(), String> {
 pub fn run_residual(path: &Path) -> Result<(), String> {
     crate::awx::native_pad_raster::clear_source_raster_cache();
     crate::board_adapter::clear_validation_baseline_cache();
-    crate::board_adapter::reset_validation_metrics();
     let job: ResidualJob = toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     if job.budget_ms == 0
@@ -2788,7 +2442,7 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
         incomplete_total,
         count_witness,
         record_best_calls: 0,
-        profile: DriverProfile::default(),
+        retry_counts: BTreeMap::new(),
     };
     let mut outcomes = Vec::new();
     for (
@@ -2846,7 +2500,7 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
                 trial.assert_invariants(&baseline, &job.protected_nets, true)?;
                 board = trial;
                 driver.accepted += 1;
-                driver.record_best(&board, name, &[*net])?;
+                driver.record_best(&board, &[*net])?;
                 status = "accepted";
             } else {
                 status = "rejected_no_net_progress";
@@ -2937,17 +2591,15 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
         })
         .collect();
     let complete = after_by_net.values().all(|count| *count == 0);
-    let validation_profile = crate::board_adapter::validation_metrics_json();
     let output = serde_json::json!({"scope":"frozen initial residual airlines only","nets":if selected.is_empty(){"all".to_string()}else{job.nets.join(",")},
         "initial_net_incompletes":initial_by_net,"after_net_incompletes":after_by_net,
         "routing_complete":complete,"success":complete,
         "record_best_final_check":{"full_count":final_board_incompletes,"driver_count":driver.incomplete_total,"final_diff":final_diff},
-        "record_best_detail_by_net":driver.profile.record_best_json(),
         "ses_replay_net_incompletes":replay_by_net,
         "ses_replay_new_violations":replay_new_violations,
         "accepted":driver.accepted,"budget_ms":job.budget_ms,"requested_threads":job.threads,"effective_threads":1,
         "elapsed_seconds":started.elapsed().as_secs_f64(),"gap_outcomes":outcomes,
-        "attempts":driver.attempts,"frozen_initial_airline_count":initial_gaps.len(),"validation_profile":validation_profile,
+        "attempts":driver.attempts,"frozen_initial_airline_count":initial_gaps.len(),
         "net_skips":net_skips,
         "endpoint_policy":"frozen native terminal endpoints in entry-time connected groups; no baseline trace split/interior endpoints; no targets from newly committed Cu",
         "output":output_path.display().to_string()});

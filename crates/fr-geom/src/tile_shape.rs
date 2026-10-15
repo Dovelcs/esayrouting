@@ -1072,7 +1072,11 @@ impl TileShape {
 
     /// Java overload `intersects(TileShape)` resolves to `intersects(Shape)`.
     pub fn intersects_tile(&self, other: &TileShape) -> bool {
-        self.intersects(&Shape::Tile(other.clone()))
+        match self {
+            TileShape::IntBox(b) => other.intersects_int_box(b),
+            TileShape::IntOctagon(o) => other.intersects_int_octagon(o),
+            TileShape::Simplex(s) => other.intersects_simplex(s),
+        }
     }
 
     pub fn intersects_int_box(&self, other: &IntBox) -> bool {

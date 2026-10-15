@@ -5,9 +5,7 @@
 //! via placement using their actual native tile geometry. Per-net via sizes are
 //! stamped into their own via-legality rungs.
 
-use super::native_obstacles::{
-    grid_round, obstacle_detail_add, obstacle_elapsed_ns, NativeGridConfig,
-};
+use super::native_obstacles::{grid_round, NativeGridConfig};
 use super::whole_context::{ContextPad, CopperVia};
 use crate::board_adapter::BoardAdapter;
 use awx_grid::obstacle_map::GridObstacleMap;
@@ -277,10 +275,8 @@ fn stamp_foreign_trace_vias(
             .map(|(i, g)| (i + 1, g.0, g.1)),
     );
     for key in board.board.get_traces() {
-        obstacle_detail_add("via_keepout_trace_items_scanned", 1);
         let item = board.board.item(key);
         if item.net_numbers().iter().any(|net| own.contains(net)) {
-            obstacle_detail_add("via_keepout_trace_items_own_skipped", 1);
             continue;
         }
         let Some(trace) = item.as_trace() else {
@@ -289,11 +285,9 @@ fn stamp_foreign_trace_vias(
         let polyline = trace.polyline();
         let layer_no = trace.layer();
         for segment_index in 0..(polyline.corner_count() - 1).max(0) as usize {
-            obstacle_detail_add("via_keepout_trace_segments", 1);
             let p0 = polyline.corner(segment_index as i32).to_float();
             let p1 = polyline.corner(segment_index as i32 + 1).to_float();
             for (rung, diameter, _) in &geometries {
-                obstacle_detail_add("via_keepout_trace_segment_rung_pairs", 1);
                 let clearance = resolved_clearance(
                     board,
                     config,
@@ -307,8 +301,6 @@ fn stamp_foreign_trace_vias(
                     + config.extra_clearance;
                 let cells =
                     capsule_cells([p0.x, p0.y], [p1.x, p1.y], margin, step, board.units_per_mm);
-                obstacle_detail_add("via_keepout_trace_capsule_cells_generated", cells.len() as u64);
-                obstacle_detail_add("via_keepout_trace_capsule_stamp_cells", cells.len() as u64);
                 stamp_via_cells(obstacles, &cells, *rung, static_base);
             }
         }
@@ -358,7 +350,6 @@ fn stamp_item_via_cells(
     rung: usize,
     static_base: bool,
 ) -> Result<bool, String> {
-    obstacle_detail_add("stamp_item_via_cells_calls", 1);
     let item = board.board.item(key);
     let shapes = item_copper_shapes(board, key);
     if shapes.is_empty() {
@@ -386,9 +377,8 @@ fn stamp_item_via_cells(
     } else {
         REGULAR_CORNER_BUFFER_FRACTION
     };
-    let mut cells = BTreeSet::<(i32, i32)>::new();
+    let mut cells = Vec::<[i32; 2]>::new();
     for (_, shape, primitive) in shapes {
-        obstacle_detail_add("via_keepout_pad_layer_shapes", 1);
         // Real PadCu circle/rect primitive: use the source-exact raster, which
         // includes the corner buffer the offset-tile raster omits (the
         // TracePin8 corner grazes).
@@ -400,9 +390,7 @@ fn stamp_item_via_cells(
                 margin,
                 corner_buffer_fraction,
             ) {
-                obstacle_detail_add("via_keepout_pad_source_shape_count", 1);
-                obstacle_detail_add("via_keepout_pad_source_cells_generated", source_cells.len() as u64);
-                cells.extend(source_cells.into_iter().map(|[x, y]| (x, y)));
+                cells.extend(source_cells);
                 continue;
             }
         }
@@ -412,19 +400,16 @@ fn stamp_item_via_cells(
             .as_ref()
             .map(Shape::corner_approx_arr)
             .unwrap_or_else(|| shape.corner_approx_arr());
-        obstacle_detail_add("via_keepout_pad_polygon_shape_count", 1);
-        let polygon_cells = super::native_pad_raster::source_polygon_cells(
-                &corners,
-                step,
-                margin,
-                board.units_per_mm,
-            );
-        obstacle_detail_add("via_keepout_pad_polygon_cells_generated", polygon_cells.len() as u64);
-        cells.extend(polygon_cells.into_iter().map(|[x, y]| (x, y)));
+        cells.extend(super::native_pad_raster::source_polygon_cells(
+            &corners,
+            step,
+            margin,
+            board.units_per_mm,
+        ));
     }
-    let cells: Vec<_> = cells.into_iter().map(|(x, y)| [x, y]).collect();
+    cells.sort_unstable();
+    cells.dedup();
     stamp_via_cells(map, &cells, rung, static_base);
-    obstacle_detail_add("via_keepout_pad_unique_cells_stamped", cells.len() as u64);
     Ok(!cells.is_empty())
 }
 
@@ -450,75 +435,40 @@ pub fn add_foreign_via_obstacles(
     }
     let step = config.grid_step;
     let mut foreign_vias = Vec::new();
-
-    let via_geometry_started = std::time::Instant::now();
     for via in existing_vias {
-        obstacle_detail_add("existing_vias_seen", 1);
         if own.contains(&(via.net_id as NetNo)) {
-            obstacle_detail_add("existing_vias_own_skipped", 1);
             continue;
         }
         foreign_vias.push(via_geometry(board, via)?);
     }
-    obstacle_detail_add(
-        "existing_via_geometry_loop_ns",
-        obstacle_elapsed_ns(via_geometry_started),
-    );
-    obstacle_detail_add("existing_via_geometry_objects", foreign_vias.len() as u64);
     // This map is independent of which copper layers are routable: source
     // stamps trace-to-via footprints on route and non-route copper layers.
-    let trace_via_started = std::time::Instant::now();
     stamp_foreign_trace_vias(obstacles, board, config, &own, static_base);
-    obstacle_detail_add(
-        "stamp_foreign_trace_vias_total_ns",
-        obstacle_elapsed_ns(trace_via_started),
-    );
-    let native_pads_started = std::time::Instant::now();
     let native_pads = board.pads();
-    obstacle_detail_add(
-        "board_pads_construction_ns",
-        obstacle_elapsed_ns(native_pads_started),
-    );
     let mut foreign_pad_meta = Vec::new();
-    let mut native_pad_comparisons = 0u64;
-    let context_mapping_started = std::time::Instant::now();
     for pad in pads {
-        obstacle_detail_add("context_pads_seen", 1);
         if own.contains(&(pad.net_id as NetNo)) {
-            obstacle_detail_add("context_pads_own_skipped", 1);
             continue;
         }
         let mut native_match = None;
         for native in &native_pads {
-            native_pad_comparisons += 1;
             if native.reference == pad.key {
                 native_match = Some(native);
                 break;
             }
         }
         let Some(native) = native_match else {
-            obstacle_detail_add("context_pads_native_reference_missing", 1);
             continue;
         };
         let Some(key) = native.key else {
-            obstacle_detail_add("context_pads_native_key_missing", 1);
             continue;
         };
         foreign_pad_meta.push((pad, key));
     }
-    obstacle_detail_add(
-        "context_pad_native_mapping_ns",
-        obstacle_elapsed_ns(context_mapping_started),
-    );
-    obstacle_detail_add("context_pad_native_reference_comparisons", native_pad_comparisons);
-    obstacle_detail_add("context_pad_native_mapping_candidates", pads.len() as u64);
-    obstacle_detail_add("context_pad_native_mapping_matches", foreign_pad_meta.len() as u64);
-    obstacle_detail_add("native_pad_objects_for_mapping", native_pads.len() as u64);
 
     // Via-to-track keep-out is fixed by the obstacle via and route track, so
     // it is stamped once into the base track maps. The via-placement map is
     // rebuilt below for rung 0 and every distinct configured route-via size.
-    let foreign_via_track_started = std::time::Instant::now();
     for via in &foreign_vias {
         let gx = grid_round(via.center[0].round() as i32, step);
         let gy = grid_round(via.center[1].round() as i32, step);
@@ -527,7 +477,6 @@ pub fn add_foreign_via_obstacles(
         .sqrt()
             / step as f64;
         for (layer_index, &layer_no) in config.layer_numbers.iter().enumerate() {
-            obstacle_detail_add("foreign_via_track_layers_stamped", 1);
             let clearance = resolved_clearance(
                 board,
                 config,
@@ -545,16 +494,11 @@ pub fn add_foreign_via_obstacles(
                 + VIA_DIAGONAL_MARGIN_CELLS
                 + off;
             let cells = circle_cells([gx, gy], track_radius);
-            obstacle_detail_add("foreign_via_track_circle_cells_generated", cells.len() as u64);
             for cell in cells {
                 stamp_track_cells(obstacles, &[cell], layer_index, static_base);
             }
         }
     }
-    obstacle_detail_add(
-        "foreign_via_track_keepout_loop_ns",
-        obstacle_elapsed_ns(foreign_via_track_started),
-    );
 
     let mut rung_sizes = via_rung_geometries(config);
     // Rung 0 is the configured run geometry; following indexes use the exact
@@ -568,22 +512,23 @@ pub fn add_foreign_via_obstacles(
     );
 
     for (rung, new_diameter, new_drill) in geometries {
-        obstacle_detail_add("foreign_via_rungs_processed", 1);
-        let rung_item_started = std::time::Instant::now();
-        let mut rung_item_accepted = 0u64;
         let mut generic_pin_stamps = BTreeSet::new();
         let can_skip_duplicate_static_stamp = rung == 0 && static_base;
         // Through-vias occupy every physical copper layer. Explicit keepouts
         // foreign planes and native pads need their own via-radius footprint,
         // independently of the thinner track footprint in the layer map.
         for key in board.board.get_items() {
-            obstacle_detail_add("via_rung_item_candidates", 1);
-            let item=board.board.item(key);
+            let item = board.board.item(key);
             if item.is_on_board()
-                && !item.net_numbers().iter().any(|n|own.contains(n))
-                && matches!(item.board_item_type(),BoardItemType::ObstacleArea|BoardItemType::ViaObstacleArea|BoardItemType::ConductionArea|BoardItemType::Pin) {
-                obstacle_detail_add(&format!("via_rung_item_type_{:?}_accepted", item.board_item_type()), 1);
-                rung_item_accepted += 1;
+                && !item.net_numbers().iter().any(|n| own.contains(n))
+                && matches!(
+                    item.board_item_type(),
+                    BoardItemType::ObstacleArea
+                        | BoardItemType::ViaObstacleArea
+                        | BoardItemType::ConductionArea
+                        | BoardItemType::Pin
+                )
+            {
                 let stamped = stamp_item_via_cells(
                     obstacles,
                     board,
@@ -599,19 +544,9 @@ pub fn add_foreign_via_obstacles(
                 {
                     generic_pin_stamps.insert(key);
                 }
-            } else {
-                obstacle_detail_add("via_rung_items_filtered", 1);
             }
         }
-        obstacle_detail_add(
-            "via_rung_item_keepout_loop_ns",
-            obstacle_elapsed_ns(rung_item_started),
-        );
-        obstacle_detail_add("via_rung_item_keepouts_accepted", rung_item_accepted);
-
-        let foreign_via_rung_started = std::time::Instant::now();
         for via in &foreign_vias {
-            obstacle_detail_add("foreign_via_rung_candidates", 1);
             let gx = grid_round(via.center[0].round() as i32, step);
             let gy = grid_round(via.center[1].round() as i32, step);
             let off = ((via.center[0] - gx as f64 * step as f64).powi(2)
@@ -623,7 +558,6 @@ pub fn add_foreign_via_obstacles(
             let radius =
                 via_placement_radius(via.diameter, new_diameter, stack_clearance, step) + off;
             let cells = circle_cells([gx, gy], radius);
-            obstacle_detail_add("foreign_via_rung_circle_cells_generated", cells.len() as u64);
             stamp_via_cells(obstacles, &cells, rung, static_base);
             let holes = h2h_cells(
                 via.center,
@@ -633,22 +567,10 @@ pub fn add_foreign_via_obstacles(
                 step,
                 upm,
             );
-            obstacle_detail_add("foreign_via_h2h_cells_generated", holes.len() as u64);
             stamp_via_cells(obstacles, &holes, rung, static_base);
         }
-        obstacle_detail_add(
-            "foreign_via_rung_geometry_and_stamp_ns",
-            obstacle_elapsed_ns(foreign_via_rung_started),
-        );
-        let foreign_pad_rung_started = std::time::Instant::now();
-        let mut foreign_pad_rung_count = 0u64;
-        let mut foreign_pad_drill_axis_ns = 0u64;
         for &(pad, key) in &foreign_pad_meta {
-            foreign_pad_rung_count += 1;
-            obstacle_detail_add("foreign_pad_rung_candidates", 1);
-            if can_skip_duplicate_static_stamp && generic_pin_stamps.contains(&key) {
-                obstacle_detail_add("duplicate_stamps_avoided", 1);
-            } else {
+            if !(can_skip_duplicate_static_stamp && generic_pin_stamps.contains(&key)) {
                 stamp_item_via_cells(
                     obstacles,
                     board,
@@ -666,7 +588,6 @@ pub fn add_foreign_via_obstacles(
                 .drill_axis
                 .unwrap_or([pad.point, pad.point])
                 .map(|p| [p[0] * upm, p[1] * upm]);
-            let drill_axis_started = std::time::Instant::now();
             let cells = drill_axis_cells(
                 axis,
                 pad.drill * upm,
@@ -675,17 +596,8 @@ pub fn add_foreign_via_obstacles(
                 step,
                 upm,
             );
-            foreign_pad_drill_axis_ns = foreign_pad_drill_axis_ns
-                .saturating_add(obstacle_elapsed_ns(drill_axis_started));
-            obstacle_detail_add("foreign_pad_drill_axis_cells_generated", cells.len() as u64);
             stamp_via_cells(obstacles, &cells, rung, static_base);
         }
-        obstacle_detail_add(
-            "foreign_pad_raster_and_write_per_rung_ns",
-            obstacle_elapsed_ns(foreign_pad_rung_started),
-        );
-        obstacle_detail_add("foreign_pad_rung_objects", foreign_pad_rung_count);
-        obstacle_detail_add("foreign_pad_drill_axis_geometry_ns", foreign_pad_drill_axis_ns);
     }
     Ok(())
 }

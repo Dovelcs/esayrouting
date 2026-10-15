@@ -15,6 +15,7 @@
 //!   (object `compareTo`, then shape index): rooms first (descending id), then items
 //!   (descending id).
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -683,6 +684,18 @@ impl BasicBoard {
         shapes[index as usize].clone()
     }
 
+    pub(crate) fn tree_shape_view(&self, t: usize, key: ItemKey, index: i32) -> Option<Cow<'_, TileShape>> {
+        if let Some(Some(shape)) = self
+            .search_trees
+            .trees[t]
+            .cached_shapes(key)
+            .and_then(|shapes| usize::try_from(index).ok().and_then(|index| shapes.get(index)))
+        {
+            return Some(Cow::Borrowed(shape));
+        }
+        self.tree_shape(t, key, index).map(Cow::Owned)
+    }
+
     /// Java `Item.treeShapeCount(tree)`.
     pub fn tree_shape_count(&self, t: usize, key: ItemKey) -> i32 {
         self.item_tree_shapes(t, key).len() as i32
@@ -810,6 +823,13 @@ impl BasicBoard {
         match object {
             TreeObject::Item { key, .. } => self.tree_shape(t, key, index),
             TreeObject::Room { key, .. } => Some(self.search_trees.trees[t].rooms[&key].shape.clone()),
+        }
+    }
+
+    pub(crate) fn object_tree_shape_view(&self, t: usize, object: TreeObject, index: i32) -> Option<Cow<'_, TileShape>> {
+        match object {
+            TreeObject::Item { key, .. } => self.tree_shape_view(t, key, index),
+            TreeObject::Room { key, .. } => Some(Cow::Borrowed(&self.search_trees.trees[t].rooms[&key].shape)),
         }
     }
 
@@ -1100,9 +1120,9 @@ impl BasicBoard {
                 current_half_clearance = tmp_half_clearance;
                 current_offset_shape = query_shape.enlarge(current_half_clearance as f64).expect("enlarge");
             }
-            let tmp_shape = self.object_tree_shape(t, object, shape_index).expect("tree shape is null");
+            let tmp_shape = self.object_tree_shape_view(t, object, shape_index).expect("tree shape is null");
             // enlarge both item shapes by the half clearance to create symmetry.
-            let tmp_offset_shape = tmp_shape.enlarge(current_half_clearance as f64);
+            let tmp_offset_shape = tmp_shape.as_ref().enlarge(current_half_clearance as f64);
             if current_offset_shape.intersects(&Shape::Tile(tmp_offset_shape)) {
                 out.push(TreeEntry { object, shape_index });
             }

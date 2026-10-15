@@ -119,7 +119,7 @@ fn item_clearance_violations(board: &BasicBoard, key: ItemKey, smallest_clearanc
     let cl_class = this.clearance_class();
     let compensation_used = board.is_clearance_compensation_used();
     for i in 0..board.tile_shape_count(key) {
-        let Some(current_tile_shape) = board.tile_shape(key, i) else {
+        let Some(current_tile_shape) = board.tree_shape_view(DEFAULT_TREE, key, i) else {
             // Java would throw a NullPointerException in the tree query.
             log::warn!("Item.clearanceViolations: tile shape {i} of item {} is null", this.id().0);
             continue;
@@ -127,7 +127,7 @@ fn item_clearance_violations(board: &BasicBoard, key: ItemKey, smallest_clearanc
         let layer = board.shape_layer(key, i);
         let entries = board.overlapping_tree_entries_with_clearance(
             DEFAULT_TREE,
-            &ConvexShape::Tile(current_tile_shape.clone()),
+            &ConvexShape::Tile(current_tile_shape.as_ref().clone()),
             layer,
             &[],
             cl_class,
@@ -178,9 +178,9 @@ fn item_clearance_violations(board: &BasicBoard, key: ItemKey, smallest_clearanc
                     };
                     // Use the actual pad tile shape (not just its center) to determine containment.
                     let pin_tile_shape = if this.is_pin() {
-                        Some(current_tile_shape.clone())
+                        Some(current_tile_shape.as_ref().clone())
                     } else {
-                        board.tile_shape(other_key, entry.shape_index)
+                        board.tree_shape_view(DEFAULT_TREE, other_key, entry.shape_index).map(|shape| shape.into_owned())
                     };
                     if let Some(s) = pin_tile_shape {
                         if outline_contains_tile_shape(outline, &s) {
@@ -194,8 +194,8 @@ fn item_clearance_violations(board: &BasicBoard, key: ItemKey, smallest_clearanc
                 continue;
             }
             // the two shapes the clearance is calculated between
-            let shape1 = &current_tile_shape;
-            let Some(shape2) = board.tile_shape(other_key, entry.shape_index) else {
+            let shape1 = current_tile_shape.as_ref();
+            let Some(shape2) = board.tree_shape_view(DEFAULT_TREE, other_key, entry.shape_index) else {
                 log::warn!(
                     "Item.clearanceViolations: unexpected null shape (shape2 is null) between item1 id={} and item2 id={}",
                     this.id().0,
@@ -215,12 +215,12 @@ fn item_clearance_violations(board: &BasicBoard, key: ItemKey, smallest_clearanc
                 (c1, c2)
             };
             let enlarged1 = if cl_comp1 > 0 { shape1.enlarge(cl_comp1 as f64) } else { shape1.clone() };
-            let enlarged2 = if cl_comp2 > 0 { shape2.enlarge(cl_comp2 as f64) } else { shape2.clone() };
+            let enlarged2 = if cl_comp2 > 0 { shape2.as_ref().enlarge(cl_comp2 as f64) } else { shape2.as_ref().clone() };
             let intersection = enlarged1.intersection(&enlarged2);
             if intersection.dimension() != 2 {
                 continue;
             }
-            let actual_clearance = clearance_between_two_shapes(shape1, &shape2, minimum_clearance, cl_comp1, cl_comp2);
+            let actual_clearance = clearance_between_two_shapes(shape1, shape2.as_ref(), minimum_clearance, cl_comp1, cl_comp2);
             let shortfall = minimum_clearance - actual_clearance;
             let comm = &board.communication;
             let board_unit_to_um = Unit::scale(1.0, comm.unit, Unit::Um) / comm.resolution.max(1) as f64;

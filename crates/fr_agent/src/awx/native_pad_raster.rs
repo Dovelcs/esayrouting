@@ -31,7 +31,6 @@
 //!     source rounded-rect model; everything else must fall back to the polygon raster.
 
 use fr_geom::{FloatPoint, Shape};
-use super::native_obstacles::{obstacle_detail_add, obstacle_detail_set};
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
@@ -94,7 +93,6 @@ impl RasterCache {
             let Some((old_key, old_size)) = self.insertion_order.pop_front() else { break };
             if self.cells.remove(&old_key).is_some() {
                 self.bytes = self.bytes.saturating_sub(old_size);
-                obstacle_detail_add("source_raster_cache_evictions", 1);
             }
         }
         self.bytes = self.bytes.saturating_add(size);
@@ -121,18 +119,10 @@ fn cache_footprint(
     SOURCE_RASTER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(cells) = cache.get(&key) {
-            obstacle_detail_add("source_raster_cache_hits", 1);
-            obstacle_detail_set("source_raster_cache_estimated_bytes", cache.bytes as u64);
             return Some(cells);
         }
-        obstacle_detail_add("source_raster_cache_misses", 1);
-        let Some(cells) = raster() else {
-            obstacle_detail_set("source_raster_cache_estimated_bytes", cache.bytes as u64);
-            return None;
-        };
-        let cells = cache.insert(key, cells);
-        obstacle_detail_set("source_raster_cache_estimated_bytes", cache.bytes as u64);
-        Some(cells)
+        let cells = raster()?;
+        Some(cache.insert(key, cells))
     })
 }
 
@@ -370,14 +360,6 @@ pub(crate) fn source_pad_cells_shared(
         return None;
     }
     let pad = recognize_pad_primitive(shape, units_per_mm)?;
-    obstacle_detail_add(
-        if shape.as_circle().is_some() {
-            "source_pad_raster_circle_shapes"
-        } else {
-            "source_pad_raster_rectangle_shapes"
-        },
-        1,
-    );
     let key = RasterKey::Pad {
         primitive: [
             pad.center_x_mm.to_bits(),
@@ -503,10 +485,8 @@ fn source_pad_cells_uncached(
     let inner_half_h = half_height - corner_radius - corner_threshold;
 
     let mut cells: Vec<[i32; 2]> = Vec::new();
-    let mut candidates = 0u64;
     for ex in -expand_x..=expand_x {
         for ey in -expand_y..=expand_y {
-            candidates += 1;
             // Cell centre relative to the REAL pad centre (issue #70).
             let mut cell_x = ex as f64 * grid_step - off_x;
             let mut cell_y = ey as f64 * grid_step - off_y;
@@ -541,8 +521,6 @@ fn source_pad_cells_uncached(
             }
         }
     }
-    obstacle_detail_add("source_pad_raster_loop_candidates", candidates);
-    obstacle_detail_add("source_pad_raster_cells_generated", cells.len() as u64);
 
     Some(cells)
 }
@@ -618,17 +596,13 @@ fn source_polygon_cells_uncached(
     let threshold = margin_board - 1e-6 * units_per_mm;
     let threshold_sq = threshold * threshold;
     let mut cells = Vec::new();
-    let mut candidates = 0u64;
-    let mut edge_tests = 0u64;
     for gx in gx0.min(gx1)..=gx0.max(gx1) {
         for gy in gy0.min(gy1)..=gy0.max(gy1) {
-            candidates += 1;
             let x = gx as f64 * step;
             let y = gy as f64 * step;
             let mut inside = false;
             let mut edge_distance_sq = f64::INFINITY;
             for i in 0..corners.len() {
-                edge_tests += 1;
                 let a = corners[i];
                 let b = corners[(i + 1) % corners.len()];
                 if (a.y > y) != (b.y > y)
@@ -653,8 +627,5 @@ fn source_polygon_cells_uncached(
             }
         }
     }
-    obstacle_detail_add("source_polygon_raster_loop_candidates", candidates);
-    obstacle_detail_add("source_polygon_raster_edge_tests", edge_tests);
-    obstacle_detail_add("source_polygon_raster_cells_generated", cells.len() as u64);
     cells
 }

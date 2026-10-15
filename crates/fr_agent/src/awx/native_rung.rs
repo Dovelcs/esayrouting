@@ -14,7 +14,6 @@ use fr_engine::{
 use fr_geom::{FloatPoint, IntBox, IntPoint, Point as EnginePoint, Polyline};
 use fr_settings::RouterSettings;
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     time::Instant,
 };
@@ -341,130 +340,6 @@ struct SourceRouteAttempt {
     backward_probe_iterations: usize,
 }
 
-static ENDPOINT_GRID_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[derive(Default, Clone)]
-struct EndpointProfileBucket {
-    calls: u64,
-    accepted: u64,
-    rejected: u64,
-    total_ns: u128,
-    phases_ns: BTreeMap<String, u128>,
-    grid_calls: u64,
-    grid_successes: u64,
-    grid_failures: u64,
-    grid_iterations: u64,
-    forward_probe_iterations: u64,
-    backward_probe_iterations: u64,
-    failures: BTreeMap<(String, String), u64>,
-}
-
-#[derive(Default)]
-struct EndpointProfileState {
-    enabled: bool,
-    buckets: BTreeMap<(String, String), EndpointProfileBucket>,
-    calls: u64,
-    accepted: u64,
-    rejected: u64,
-}
-
-thread_local! {
-    static ENDPOINT_RUNTIME_PROFILE: RefCell<EndpointProfileState> = RefCell::new(EndpointProfileState::default());
-    static ENDPOINT_PROFILE_CONTEXT: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
-    static ENDPOINT_CALL_PHASES: RefCell<BTreeMap<String, u128>> = RefCell::new(BTreeMap::new());
-    static ENDPOINT_CALL_GRID_STATS: RefCell<(u64, u64, u64)> = const { RefCell::new((0, 0, 0)) };
-}
-
-/// Enable endpoint runtime profiling and clear all profile data for this run.
-pub fn reset_endpoint_runtime_profile() {
-    ENDPOINT_RUNTIME_PROFILE.with(|profile| {
-        *profile.borrow_mut() = EndpointProfileState {
-            enabled: true,
-            ..EndpointProfileState::default()
-        };
-    });
-}
-
-/// Return the current run's endpoint runtime profile (empty until reset).
-pub fn endpoint_runtime_profile() -> serde_json::Value {
-    ENDPOINT_RUNTIME_PROFILE.with(|profile| {
-        let profile = profile.borrow();
-        let by_net_stage = profile.buckets.iter().map(|((net, stage), bucket)| {
-            let phases = bucket.phases_ns.iter().map(|(name, ns)| (name.clone(), serde_json::json!(ns))).collect::<serde_json::Map<_, _>>();
-            let failures = bucket.failures.iter().map(|((failure_stage, reason), count)| (format!("{failure_stage}|{reason}"), serde_json::json!(count))).collect::<serde_json::Map<_, _>>();
-            (format!("{net}|{stage}"), serde_json::json!({
-                "net": net, "stage": stage, "calls": bucket.calls, "accepted": bucket.accepted, "rejected": bucket.rejected,
-                "total_ns": bucket.total_ns, "phases_ns": phases,
-                "grid_router_calls": bucket.grid_calls, "grid_successes": bucket.grid_successes,
-                "grid_failures": bucket.grid_failures, "grid_iterations": bucket.grid_iterations,
-                "forward_probe_iterations": bucket.forward_probe_iterations,
-                "backward_probe_iterations": bucket.backward_probe_iterations,
-                "failures": failures,
-                "attempt_count_note": "grid_router_calls counts actual route_core invocations, including retry/probe calls and recovery-module calls whose report may be discarded; it can differ from report attempts."
-            }))
-        }).collect::<serde_json::Map<_, _>>();
-        serde_json::json!({"enabled": profile.enabled, "calls": profile.calls, "accepted": profile.accepted, "rejected": profile.rejected, "by_net_stage": by_net_stage})
-    })
-}
-
-struct EndpointProfileContextGuard;
-impl EndpointProfileContextGuard {
-    fn set(net: String, stage: String) -> Self {
-        ENDPOINT_PROFILE_CONTEXT.with(|context| *context.borrow_mut() = Some((net, stage)));
-        ENDPOINT_CALL_PHASES.with(|phases| phases.borrow_mut().clear());
-        ENDPOINT_CALL_GRID_STATS.with(|stats| *stats.borrow_mut() = (0, 0, 0));
-        Self
-    }
-}
-impl Drop for EndpointProfileContextGuard {
-    fn drop(&mut self) {
-        ENDPOINT_PROFILE_CONTEXT.with(|context| *context.borrow_mut() = None);
-    }
-}
-
-struct EndpointProfileTimer {
-    name: &'static str,
-    started: Option<Instant>,
-}
-impl EndpointProfileTimer {
-    fn start(name: &'static str) -> Self {
-        let enabled = ENDPOINT_RUNTIME_PROFILE.with(|profile| profile.borrow().enabled);
-        Self {
-            name,
-            started: enabled.then(Instant::now),
-        }
-    }
-}
-impl Drop for EndpointProfileTimer {
-    fn drop(&mut self) {
-        let Some(started) = self.started else {
-            return;
-        };
-        let elapsed = started.elapsed().as_nanos();
-        ENDPOINT_CALL_PHASES.with(|phases| {
-            *phases
-                .borrow_mut()
-                .entry(self.name.to_string())
-                .or_default() += elapsed
-        });
-    }
-}
-
-fn endpoint_profile_grid_call(iterations: usize, success: bool) {
-    let enabled = ENDPOINT_RUNTIME_PROFILE.with(|profile| profile.borrow().enabled);
-    if !enabled {
-        return;
-    }
-    ENDPOINT_CALL_GRID_STATS.with(|stats| {
-        let mut stats = stats.borrow_mut();
-        stats.0 += 1;
-        stats.1 += iterations as u64;
-        if success {
-            stats.2 += 1;
-        }
-    });
-}
-
 fn route_core(
     router: &GridRouter,
     obstacles: &GridObstacleMap,
@@ -475,8 +350,6 @@ fn route_core(
     via_rung: usize,
     dynamic: bool,
 ) -> (Option<Vec<(i32, i32, u8)>>, usize, Vec<(i32, i32, u8)>) {
-    ENDPOINT_GRID_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _profile_timer = EndpointProfileTimer::start("route_core_astar_inclusive");
     let budget = budget.min(u32::MAX as usize) as u32;
     let ceiling = if dynamic { 10_000_000 } else { budget };
     let (path, iterations, frontier) = router.route_with_frontier(
@@ -496,7 +369,6 @@ fn route_core(
         0,
         via_rung,
     );
-    endpoint_profile_grid_call(iterations as usize, path.is_some());
     (path, iterations as usize, frontier)
 }
 
@@ -1119,7 +991,6 @@ fn source_grid_search_with_endpoints(
         target_points[0],
     )?;
     let mut obstacle_result = {
-        let _profile_timer = EndpointProfileTimer::start("obstacle_build");
         super::native_obstacles::build_obstacle_map(
             board,
             request,
@@ -1132,7 +1003,6 @@ fn source_grid_search_with_endpoints(
         )?
     };
 
-    let endpoint_map_timer = EndpointProfileTimer::start("endpoint_and_map_preparation");
     let mut obstacles = obstacle_result.obstacles;
     let layer_numbers = obstacle_result.layer_numbers;
     let gx0 = (window.ll.x as f64 / grid_step_board as f64).ceil() as i32;
@@ -1334,7 +1204,6 @@ fn source_grid_search_with_endpoints(
     let router = config.router();
     let native_config = obstacle_result.config.clone();
     let grid_step_mm = grid_step_board as f64 / upm;
-    drop(endpoint_map_timer);
     let mut attempt = source_route_attempt(
         &router,
         &obstacles,
@@ -3190,142 +3059,14 @@ fn route_multilayer_endpoint_sets_core(
     ),
     String,
 > {
-    let profile_enabled = ENDPOINT_RUNTIME_PROFILE.with(|profile| profile.borrow().enabled);
-    if !profile_enabled {
-        return route_multilayer_endpoint_sets_inner(
-            request,
-            from_item,
-            to_item,
-            start_candidates,
-            target_candidates,
-            policy,
-        );
-    }
-    let net_key = request.net.clone();
-    let stage_key = request.stage.clone();
-    let _context = EndpointProfileContextGuard::set(net_key.clone(), stage_key.clone());
-    let started = Instant::now();
-    let grid_before = ENDPOINT_CALL_GRID_STATS.with(|stats| *stats.borrow());
-    let result = route_multilayer_endpoint_sets_inner(
+    route_multilayer_endpoint_sets_inner(
         request,
         from_item,
         to_item,
         start_candidates,
         target_candidates,
         policy,
-    );
-    let elapsed_ns = started.elapsed().as_nanos();
-    let grid_after = ENDPOINT_CALL_GRID_STATS.with(|stats| *stats.borrow());
-    let phases = ENDPOINT_CALL_PHASES.with(|phases| phases.borrow().clone());
-    let (accepted, failure_stage, reason) = match &result {
-        Ok((_, report, _)) => {
-            let accepted = report
-                .get("accepted")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let stage = report
-                .get("_endpoint_diagnostic")
-                .and_then(|d| d.get("stage"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(if accepted { "accepted" } else { "unknown" })
-                .to_string();
-            let reason = report
-                .get("reason")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            (accepted, stage, reason)
-        }
-        Err(error) => (false, "error".to_string(), error.clone()),
-    };
-    // Only these disjoint top-level timers contribute to accounting. Search
-    // subphases (obstacle/map/A*) overlap the initial search and via-pad retry.
-    let top_level_phases = [
-        "prepare_control_clone_config",
-        "source_grid_search_inclusive",
-        "via_pad_unblock_inclusive",
-        "owner_resolution_and_weld",
-        "geometry_planning",
-        "geometry_insertion_and_bridge",
-        "foreign_working_copper_protection",
-        "invariant_validation",
-        "connectivity_and_merge",
-    ];
-    let accounted_top_level_ns = top_level_phases.iter().fold(0u128, |sum, name| {
-        sum.saturating_add(phases.get(*name).copied().unwrap_or(0))
-    });
-    let unattributed_ns = elapsed_ns.saturating_sub(accounted_top_level_ns);
-    let call_profile = serde_json::json!({
-        "total_ns": elapsed_ns,
-        "phases_ns": phases,
-        "accounted_top_level_ns": accounted_top_level_ns,
-        "unattributed_ns": unattributed_ns,
-        "phase_accounting": "accounted_top_level_ns sums disjoint prepare_control, initial source search, via-pad unblock, owner/weld, geometry plan/insert, foreign protection, invariant, and connectivity phases. obstacle_build, endpoint_and_map_preparation, and route_core_astar_inclusive are nested subphases and are excluded from that sum; A* calls inside retries are also nested. unattributed_ns is total_ns minus accounted_top_level_ns.",
-        "grid_router_calls": grid_after.0.saturating_sub(grid_before.0),
-        "grid_successes": grid_after.2.saturating_sub(grid_before.2),
-        "grid_failures": grid_after.0.saturating_sub(grid_before.0).saturating_sub(grid_after.2.saturating_sub(grid_before.2)),
-        "grid_iterations": grid_after.1.saturating_sub(grid_before.1),
-        "forward_probe_iterations": result.as_ref().ok().and_then(|(_, r, _)| r.pointer("/_endpoint_diagnostic/search_evidence/forward_probe_iterations")).and_then(serde_json::Value::as_u64).unwrap_or(0),
-        "backward_probe_iterations": result.as_ref().ok().and_then(|(_, r, _)| r.pointer("/_endpoint_diagnostic/search_evidence/backward_probe_iterations")).and_then(serde_json::Value::as_u64).unwrap_or(0),
-        "failure_stage": if accepted { serde_json::Value::Null } else { serde_json::json!(failure_stage) },
-        "reason": if reason.is_empty() { serde_json::Value::Null } else { serde_json::json!(reason) }
-    });
-    ENDPOINT_RUNTIME_PROFILE.with(|profile| {
-        let mut profile = profile.borrow_mut();
-        let key = (net_key, stage_key);
-        profile.calls += 1;
-        if accepted {
-            profile.accepted += 1;
-        } else {
-            profile.rejected += 1;
-        }
-        let bucket = profile.buckets.entry(key).or_default();
-        bucket.calls += 1;
-        bucket.total_ns += elapsed_ns;
-        if accepted {
-            bucket.accepted += 1;
-        } else {
-            bucket.rejected += 1;
-            *bucket
-                .failures
-                .entry((failure_stage.clone(), reason.clone()))
-                .or_default() += 1;
-        }
-        bucket.grid_calls += grid_after.0.saturating_sub(grid_before.0);
-        bucket.grid_successes += grid_after.2.saturating_sub(grid_before.2);
-        bucket.grid_failures += grid_after
-            .0
-            .saturating_sub(grid_before.0)
-            .saturating_sub(grid_after.2.saturating_sub(grid_before.2));
-        bucket.grid_iterations += grid_after.1.saturating_sub(grid_before.1);
-        let (forward_probe, backward_probe) = result
-            .as_ref()
-            .ok()
-            .and_then(|(_, r, _)| r.pointer("/_endpoint_diagnostic/search_evidence"))
-            .map(|e| {
-                (
-                    e.get("forward_probe_iterations")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                    e.get("backward_probe_iterations")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                )
-            })
-            .unwrap_or((0, 0));
-        bucket.forward_probe_iterations += forward_probe;
-        bucket.backward_probe_iterations += backward_probe;
-        for (name, ns) in phases {
-            *bucket.phases_ns.entry(name).or_default() += ns;
-        }
-    });
-    match result {
-        Ok((board, mut report, frontier)) => {
-            report["_runtime_profile"] = call_profile;
-            Ok((board, report, frontier))
-        }
-        Err(error) => Err(error),
-    }
+    )
 }
 
 fn route_multilayer_endpoint_sets_inner(
@@ -3377,13 +3118,10 @@ fn route_multilayer_endpoint_sets_inner(
         .rules
         .net_class_of(net)
         .get_trace_clearance_class();
-    let calls_before = ENDPOINT_GRID_CALLS.load(std::sync::atomic::Ordering::Relaxed);
     let (mut trial, control, _) = {
-        let _profile_timer = EndpointProfileTimer::start("prepare_control_clone_config");
         prepare_control(&request)?
     };
     let mut outcome = {
-        let _profile_timer = EndpointProfileTimer::start("source_grid_search_inclusive");
         source_grid_search_with_endpoints(
             &request,
             &trial,
@@ -3397,8 +3135,7 @@ fn route_multilayer_endpoint_sets_inner(
             &targets,
         )?
     };
-    let calls = ENDPOINT_GRID_CALLS.load(std::sync::atomic::Ordering::Relaxed) - calls_before;
-    let mut report = serde_json::json!({"grid_router_calls":calls,"expanded":outcome.iterations,"path_cells":outcome.path.as_ref().map_or(0,Vec::len),"accepted":false});
+    let mut report = serde_json::json!({"expanded":outcome.iterations,"path_cells":outcome.path.as_ref().map_or(0,Vec::len),"accepted":false});
     // Private endpoint-set evidence for failed/no-reduction runs. Keep this
     // attached to the existing private JSON report; public route types stay
     // unchanged.
@@ -3440,7 +3177,6 @@ fn route_multilayer_endpoint_sets_inner(
             return Ok((None, report, None));
         }
         let unblock_result = {
-            let _profile_timer = EndpointProfileTimer::start("via_pad_unblock_inclusive");
             try_via_pad_unblock(&request, &mut outcome)?
         };
         match unblock_result {
@@ -3449,9 +3185,6 @@ fn route_multilayer_endpoint_sets_inner(
                 path
             }
             None => {
-                report["grid_router_calls"] =
-                    (ENDPOINT_GRID_CALLS.load(std::sync::atomic::Ordering::Relaxed) - calls_before)
-                        .into();
                 report["expanded"] = outcome.iterations.into();
                 report["path_cells"] = outcome.path.as_ref().map_or(0, Vec::len).into();
                 report["reason"] =
@@ -3490,8 +3223,6 @@ fn route_multilayer_endpoint_sets_inner(
             }
         }
     };
-    report["grid_router_calls"] =
-        (ENDPOINT_GRID_CALLS.load(std::sync::atomic::Ordering::Relaxed) - calls_before).into();
     report["expanded"] = outcome.iterations.into();
     report["path_cells"] = path.len().into();
     report["_endpoint_diagnostic"]["actual_taps"] = serde_json::json!(tap_results.iter().map(|tap| serde_json::json!({
@@ -3562,7 +3293,6 @@ fn route_multilayer_endpoint_sets_inner(
     let mut welded_pieces = Vec::new();
     let mut weld_seed_bridges = 0usize;
     let mut exact_endpoints: Vec<ExactEndpointOverride> = Vec::new();
-    let owner_weld_timer = EndpointProfileTimer::start("owner_resolution_and_weld");
     if policy.split_this_run_trace {
         // A via-pad retry may start or land on a newly created, not-yet-
         // materialized via. Its pad representative remains the only native
@@ -3794,7 +3524,6 @@ fn route_multilayer_endpoint_sets_inner(
             }
         }
     }
-    drop(owner_weld_timer);
     let mut through_holes = super::native_grid_window::same_net_through_hole_positions(
         &trial,
         &[net],
@@ -3813,7 +3542,6 @@ fn route_multilayer_endpoint_sets_inner(
                 .map(|(&cell, &size)| (cell, size)),
         );
     }
-    let geometry_plan_timer = EndpointProfileTimer::start("geometry_planning");
     let mut geometry = super::grid_path::path_to_geometry(super::grid_path::GridPathRequest {
         path: &path,
         grid_step_board: outcome.grid_step_board,
@@ -3831,7 +3559,6 @@ fn route_multilayer_endpoint_sets_inner(
         existing_vias: &request.existing_vias,
         through_hole_positions: &through_holes,
     })?;
-    drop(geometry_plan_timer);
     report["_endpoint_diagnostic"]["stage"] = "geometry_planned".into();
     report["_endpoint_diagnostic"]["planned_geometry"] = serde_json::json!({
         "segments": geometry.segments.iter().map(|s| serde_json::json!({"start_mm":s.start_mm,"end_mm":s.end_mm,"layer":s.layer,"width_mm":s.width_mm})).collect::<Vec<_>>(),
@@ -3847,7 +3574,6 @@ fn route_multilayer_endpoint_sets_inner(
     }
     // Commit the kept unblock copper, then the grid geometry, so the landed
     // board carries the tapped vias the retry actually reached (#803).
-    let insertion_bridge_timer = EndpointProfileTimer::start("geometry_insertion_and_bridge");
     let source_trace_ids = request
         .board
         .board
@@ -3878,13 +3604,11 @@ fn route_multilayer_endpoint_sets_inner(
     report["_endpoint_diagnostic"]["welded_split_piece_count"] = welded_pieces.len().into();
     report["_endpoint_diagnostic"]["split_contact_bridges"] = split_bridges.into();
     report["_endpoint_diagnostic"]["weld_seed_bridges"] = weld_seed_bridges.into();
-    drop(insertion_bridge_timer);
     // In-run only: the operation must not ADD copper on a foreign working net,
     // NOR delete or mutate an existing FOREIGN working item (its geometry, net,
     // clearance class or fixed state). `assert_invariants` only guards the
     // frozen baseline/protected copper, so the working-board delta is checked
     // explicitly here.
-    let foreign_protection_timer = EndpointProfileTimer::start("foreign_working_copper_protection");
     if policy.split_this_run_trace {
         let working_ids = request
             .board
@@ -3962,8 +3686,6 @@ fn route_multilayer_endpoint_sets_inner(
             }
         }
     }
-    drop(foreign_protection_timer);
-    let invariant_timer = EndpointProfileTimer::start("invariant_validation");
     if let Err(error) = trial.assert_invariants(policy.baseline, policy.protected, true) {
         let details: Vec<_>=trial.board.get_items().into_iter().flat_map(|key|fr_engine::drc::clearance_violation::clearance_violations(&trial.board,key)).map(|v| {
             let a=trial.board.item(v.first_item);let b=trial.board.item(v.second_item);
@@ -3976,9 +3698,6 @@ fn route_multilayer_endpoint_sets_inner(
         report["candidate_segments"]=serde_json::json!(geometry.segments.iter().map(|s|serde_json::json!({"start_mm":s.start_mm,"end_mm":s.end_mm,"layer":s.layer,"width_mm":s.width_mm})).collect::<Vec<_>>());
         return Ok((None, report, None));
     }
-
-    drop(invariant_timer);
-    let connectivity_merge_timer = EndpointProfileTimer::start("connectivity_and_merge");
     let before = fr_engine::drc::NetIncompletes::new(
         &request.board.board,
         net,
@@ -4074,7 +3793,6 @@ fn route_multilayer_endpoint_sets_inner(
         return Ok((None, report, None));
     }
     report["accepted"] = true.into();
-    drop(connectivity_merge_timer);
     Ok((Some(trial), report, None))
 }
 
@@ -4845,11 +4563,6 @@ fn bridge_welded_point_to_drill_center(
         );
     }
     None
-}
-
-/// Number of actual source GridRouter calls; endpoint CLI is serial.
-pub fn endpoint_grid_calls() -> usize {
-    ENDPOINT_GRID_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Compatibility entry for ordinary single-layer endpoints.

@@ -1,6 +1,7 @@
 pub mod spec;
 
 pub mod board_adapter;
+pub(crate) mod copper_clearance;
 pub mod execution;
 pub mod planner;
 pub mod solver;

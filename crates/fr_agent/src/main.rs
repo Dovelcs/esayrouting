@@ -8,11 +8,11 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     if args.len() == 1 && args[0] == "--help" {
-        println!("usage: fastroute_agent <check|plan|route|awx-points|prepare-stack|init> job.toml\nawx-points: source AWX GridRouter for native pin-set airlines across active signal layers with explicit test via rules; check: structure only; plan: board validation and trial routing; route: verified SES export; init: new configuration\nDistances are mm. Joint candidate groups support two-terminal nets; remaining routing inherits DSN rules. Differential coupling, impedance, and cross-net paths are unsupported hard constraints.");
+        println!("usage: fastroute_agent <check|plan|route|awx-points|awx-residual|prepare-stack|init> job.toml\nawx-points: source AWX GridRouter for native pin-set airlines; awx-residual: only the target net's frozen initial incompletes from an input SES; check: structure only; plan: validation and trial routing; route: verified SES export; init: new configuration\nDistances are mm. Differential coupling, impedance, and cross-net paths are unsupported hard constraints.");
         return Ok(());
     }
     if args.len() != 2 {
-        return Err("usage: fastroute_agent <check|plan|route|awx-points|prepare-stack|init> job.toml".into());
+        return Err("usage: fastroute_agent <check|plan|route|awx-points|awx-residual|prepare-stack|init> job.toml".into());
     }
     let path = Path::new(&args[1]);
     match args[0].as_str() {
@@ -28,6 +28,7 @@ fn run() -> Result<(), String> {
         }
         "prepare-stack" => return fr_agent::stack_prepare::run(path),
         "awx-points" => return fr_agent::awx_endpoint::run(path),
+        "awx-residual" => return fr_agent::awx_endpoint::run_residual(path),
         "check" => {
             let loaded = LoadedSpec::load(path).map_err(|e| e.to_string())?;
             println!(
@@ -56,7 +57,9 @@ fn run() -> Result<(), String> {
                 return Err("routing incomplete; see structured report".into());
             }
         }
-        _ => return Err("unknown command; expected check, plan, route, awx-points, or init".into()),
+        _ => {
+            return Err("unknown command; expected check, plan, route, awx-points, or init".into())
+        }
     }
     Ok(())
 }

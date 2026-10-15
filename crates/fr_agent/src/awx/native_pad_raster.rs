@@ -5,10 +5,9 @@
 //! driven from the *actual* copper `fr_geom::Shape` of a pad instead of the pad's
 //! declared `size_x`/`size_y`/`shape`/`rect_rotation` metadata.
 //!
-//! This module deliberately does NOT memoize, vectorize, or otherwise restructure the
-//! source algorithm: the source keeps the scalar form as the independent reference the
-//! vectorized twin is graded against, and the pad sub-cell offset and corner buffer must
-//! reproduce its cell set bit-for-bit.
+//! Repeated footprints are memoized by their exact raster inputs. The cached value is
+//! still produced by the source scalar algorithm below, whose pad sub-cell offset and
+//! corner buffer must reproduce its cell set bit-for-bit.
 //!
 //! Recognized primitives:
 //!   * a genuine `Shape::Circle` (the native circle primitive), and
@@ -32,6 +31,110 @@
 //!     source rounded-rect model; everything else must fall back to the polygon raster.
 
 use fr_geom::{FloatPoint, Shape};
+use super::native_obstacles::{obstacle_detail_add, obstacle_detail_set};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
+
+const CACHE_MAX_ENTRIES: usize = 8192;
+const CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+enum RasterKey {
+    Pad {
+        primitive: [u64; 6],
+        grid_step: i32,
+        units_per_mm: u64,
+        margin: u64,
+        corner_buffer: u64,
+    },
+    Polygon {
+        corners: Vec<(u64, u64)>,
+        grid_step: i32,
+        margin: u64,
+        units_per_mm: u64,
+    },
+}
+
+impl RasterKey {
+    fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Pad { .. } => 0,
+                Self::Polygon { corners, .. } => corners.len() * std::mem::size_of::<(u64, u64)>(),
+            }
+    }
+}
+
+#[derive(Default)]
+struct RasterCache {
+    cells: HashMap<RasterKey, Arc<[[i32; 2]]>>,
+    insertion_order: VecDeque<(RasterKey, usize)>,
+    bytes: usize,
+}
+
+impl RasterCache {
+    fn get(&mut self, key: &RasterKey) -> Option<Arc<[[i32; 2]]>> {
+        self.cells.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: RasterKey, cells: Vec<[i32; 2]>) -> Arc<[[i32; 2]]> {
+        let output_bytes = cells.len() * std::mem::size_of::<[i32; 2]>();
+        let key_bytes = key.estimated_bytes();
+        let size = output_bytes
+            .saturating_add(key_bytes.saturating_mul(2))
+            .saturating_add(128);
+        let shared: Arc<[[i32; 2]]> = Arc::from(cells);
+        if size > CACHE_MAX_BYTES {
+            return shared;
+        }
+        while self.cells.len() >= CACHE_MAX_ENTRIES || self.bytes.saturating_add(size) > CACHE_MAX_BYTES {
+            let Some((old_key, old_size)) = self.insertion_order.pop_front() else { break };
+            if self.cells.remove(&old_key).is_some() {
+                self.bytes = self.bytes.saturating_sub(old_size);
+                obstacle_detail_add("source_raster_cache_evictions", 1);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.insertion_order.push_back((key.clone(), size));
+        self.cells.insert(key, Arc::clone(&shared));
+        shared
+    }
+}
+
+thread_local! {
+    static SOURCE_RASTER_CACHE: RefCell<RasterCache> = RefCell::new(RasterCache::default());
+}
+
+/// Clear source pad/polygon footprints at the start or end of one routing run.
+/// The cache is bounded even when callers omit this lifecycle hook.
+pub fn clear_source_raster_cache() {
+    SOURCE_RASTER_CACHE.with(|cache| *cache.borrow_mut() = RasterCache::default());
+}
+
+fn cache_footprint(
+    key: RasterKey,
+    raster: impl FnOnce() -> Option<Vec<[i32; 2]>>,
+) -> Option<Arc<[[i32; 2]]>> {
+    SOURCE_RASTER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(cells) = cache.get(&key) {
+            obstacle_detail_add("source_raster_cache_hits", 1);
+            obstacle_detail_set("source_raster_cache_estimated_bytes", cache.bytes as u64);
+            return Some(cells);
+        }
+        obstacle_detail_add("source_raster_cache_misses", 1);
+        let Some(cells) = raster() else {
+            obstacle_detail_set("source_raster_cache_estimated_bytes", cache.bytes as u64);
+            return None;
+        };
+        let cells = cache.insert(key, cells);
+        obstacle_detail_set("source_raster_cache_estimated_bytes", cache.bytes as u64);
+        Some(cells)
+    })
+}
 
 /// The one absolute-coordinate input is rounded to a nanometre scale in mm, matching
 /// `iter_pad_blocked_cells`' `off_x = round(off_x, 9)`.
@@ -231,7 +334,76 @@ fn is_rectangle(p: &[FloatPoint]) -> bool {
 /// Returns `None` when the exact copper shape is neither a genuine circle nor an exact
 /// rectangle primitive, so the caller keeps its actual polygon raster (which applies no
 /// corner buffer). No bounding-box substitute is produced.
-pub(crate) fn source_pad_cells(
+pub fn source_pad_cells(
+    shape: &Shape,
+    grid_step_board: i32,
+    units_per_mm: f64,
+    margin_board: f64,
+    corner_buffer_fraction: f64,
+) -> Option<Vec<[i32; 2]>> {
+    source_pad_cells_shared(
+        shape,
+        grid_step_board,
+        units_per_mm,
+        margin_board,
+        corner_buffer_fraction,
+    )
+    .map(|cells| cells.to_vec())
+}
+
+/// Cached form used by map builders that can stamp an immutable shared footprint.
+pub(crate) fn source_pad_cells_shared(
+    shape: &Shape,
+    grid_step_board: i32,
+    units_per_mm: f64,
+    margin_board: f64,
+    corner_buffer_fraction: f64,
+) -> Option<Arc<[[i32; 2]]>> {
+    if grid_step_board <= 0
+        || !units_per_mm.is_finite()
+        || units_per_mm <= 0.0
+        || !margin_board.is_finite()
+        || margin_board < 0.0
+        || !corner_buffer_fraction.is_finite()
+        || corner_buffer_fraction < 0.0
+    {
+        return None;
+    }
+    let pad = recognize_pad_primitive(shape, units_per_mm)?;
+    obstacle_detail_add(
+        if shape.as_circle().is_some() {
+            "source_pad_raster_circle_shapes"
+        } else {
+            "source_pad_raster_rectangle_shapes"
+        },
+        1,
+    );
+    let key = RasterKey::Pad {
+        primitive: [
+            pad.center_x_mm.to_bits(),
+            pad.center_y_mm.to_bits(),
+            pad.half_width_mm.to_bits(),
+            pad.half_height_mm.to_bits(),
+            pad.corner_radius_mm.to_bits(),
+            pad.rotation_deg.to_bits(),
+        ],
+        grid_step: grid_step_board,
+        units_per_mm: units_per_mm.to_bits(),
+        margin: margin_board.to_bits(),
+        corner_buffer: corner_buffer_fraction.to_bits(),
+    };
+    cache_footprint(key, || {
+        source_pad_cells_uncached(
+            shape,
+            grid_step_board,
+            units_per_mm,
+            margin_board,
+            corner_buffer_fraction,
+        )
+    })
+}
+
+fn source_pad_cells_uncached(
     shape: &Shape,
     grid_step_board: i32,
     units_per_mm: f64,
@@ -250,7 +422,6 @@ pub(crate) fn source_pad_cells(
     }
 
     let pad = recognize_pad_primitive(shape, units_per_mm)?;
-
     let grid_step = grid_step_board as f64 / units_per_mm;
     if !grid_step.is_finite() || grid_step <= 0.0 {
         return None;
@@ -332,8 +503,10 @@ pub(crate) fn source_pad_cells(
     let inner_half_h = half_height - corner_radius - corner_threshold;
 
     let mut cells: Vec<[i32; 2]> = Vec::new();
+    let mut candidates = 0u64;
     for ex in -expand_x..=expand_x {
         for ey in -expand_y..=expand_y {
+            candidates += 1;
             // Cell centre relative to the REAL pad centre (issue #70).
             let mut cell_x = ex as f64 * grid_step - off_x;
             let mut cell_y = ey as f64 * grid_step - off_y;
@@ -368,6 +541,8 @@ pub(crate) fn source_pad_cells(
             }
         }
     }
+    obstacle_detail_add("source_pad_raster_loop_candidates", candidates);
+    obstacle_detail_add("source_pad_raster_cells_generated", cells.len() as u64);
 
     Some(cells)
 }
@@ -376,7 +551,45 @@ pub(crate) fn source_pad_cells(
 /// `obstacle_map._emit`: cell centres inside the polygon, or at most
 /// `margin - 1e-6 mm` from its nearest edge. Polygon vertices and `margin_board`
 /// use native board units; `units_per_mm` converts the source tie epsilon.
-pub(crate) fn source_polygon_cells(
+pub fn source_polygon_cells(
+    corners: &[FloatPoint],
+    grid_step_board: i32,
+    margin_board: f64,
+    units_per_mm: f64,
+) -> Vec<[i32; 2]> {
+    source_polygon_cells_shared(corners, grid_step_board, margin_board, units_per_mm).to_vec()
+}
+
+/// Cached form used by map builders that can stamp an immutable shared footprint.
+pub(crate) fn source_polygon_cells_shared(
+    corners: &[FloatPoint],
+    grid_step_board: i32,
+    margin_board: f64,
+    units_per_mm: f64,
+) -> Arc<[[i32; 2]]> {
+    if corners.len() < 3
+        || grid_step_board <= 0
+        || !margin_board.is_finite()
+        || margin_board < 0.0
+        || !units_per_mm.is_finite()
+        || units_per_mm <= 0.0
+        || corners.iter().any(|p| !p.x.is_finite() || !p.y.is_finite())
+    {
+        return Arc::<[[i32; 2]]>::from(Vec::new());
+    }
+    let key = RasterKey::Polygon {
+        corners: corners.iter().map(|p| (p.x.to_bits(), p.y.to_bits())).collect(),
+        grid_step: grid_step_board,
+        margin: margin_board.to_bits(),
+        units_per_mm: units_per_mm.to_bits(),
+    };
+    cache_footprint(key, || {
+        Some(source_polygon_cells_uncached(corners, grid_step_board, margin_board, units_per_mm))
+    })
+    .unwrap_or_else(|| Arc::<[[i32; 2]]>::from(Vec::new()))
+}
+
+fn source_polygon_cells_uncached(
     corners: &[FloatPoint],
     grid_step_board: i32,
     margin_board: f64,
@@ -405,13 +618,17 @@ pub(crate) fn source_polygon_cells(
     let threshold = margin_board - 1e-6 * units_per_mm;
     let threshold_sq = threshold * threshold;
     let mut cells = Vec::new();
+    let mut candidates = 0u64;
+    let mut edge_tests = 0u64;
     for gx in gx0.min(gx1)..=gx0.max(gx1) {
         for gy in gy0.min(gy1)..=gy0.max(gy1) {
+            candidates += 1;
             let x = gx as f64 * step;
             let y = gy as f64 * step;
             let mut inside = false;
             let mut edge_distance_sq = f64::INFINITY;
             for i in 0..corners.len() {
+                edge_tests += 1;
                 let a = corners[i];
                 let b = corners[(i + 1) % corners.len()];
                 if (a.y > y) != (b.y > y)
@@ -436,5 +653,8 @@ pub(crate) fn source_polygon_cells(
             }
         }
     }
+    obstacle_detail_add("source_polygon_raster_loop_candidates", candidates);
+    obstacle_detail_add("source_polygon_raster_edge_tests", edge_tests);
+    obstacle_detail_add("source_polygon_raster_cells_generated", cells.len() as u64);
     cells
 }

@@ -80,55 +80,60 @@ impl StatsCache {
 ///
 /// [`ItemRepository::version`]: crate::board::ItemRepository::version
 pub fn incomplete_count(board: &BasicBoard, incomplete_nets: Option<&mut std::collections::BTreeSet<NetNo>>) -> i32 {
-    // the net item lists of `DesignRulesChecker.calculateAllIncompletes`
     let max_net_no = board.rules.nets.max_net_number().max(0) as usize;
-    let mut net_item_lists: Vec<Vec<ItemKey>> = vec![Vec::new(); max_net_no];
-    for key in board.items.iter() {
-        let item = board.item(key);
-        if item.is_connectable_class() {
-            for &n in item.net_numbers() {
-                if n >= 1 && (n as usize) <= max_net_no {
-                    net_item_lists[n as usize - 1].push(key);
-                }
-            }
-        }
-    }
-    let global = board.items.global_epoch();
     let mut total = 0i32;
     let mut incomplete: Vec<NetNo> = Vec::new();
-    NET_COUNTS.with(|memo| {
-        let mut memo = memo.borrow_mut();
-        for (i, list) in net_item_lists.iter().enumerate() {
-            let net_no = i as NetNo + 1;
-            let key: Vec<(ItemKey, u64)> = list.iter().map(|&k| (k, board.items.version(k))).collect();
-            let entries = memo.entry(net_no).or_default();
-            let cached = entries.iter().find(|e| e.global == global && e.items == key).map(|e| e.count);
-            let count = match cached {
-                Some(c) => {
-                    if verify_caches() {
-                        assert_eq!(c, NetIncompletes::new(board, net_no, list).count(), "net incompletes cache out of date");
-                    }
-                    c
-                }
-                None => {
-                    let c = NetIncompletes::new(board, net_no, list).count();
-                    if entries.len() >= NET_COUNT_SLOTS {
-                        entries.remove(0);
-                    }
-                    entries.push(NetCount { global, items: key, count: c });
-                    c
-                }
-            };
-            total = total.wrapping_add(count);
-            if count > 0 {
-                incomplete.push(net_no);
-            }
+    for net_no in 1..=max_net_no as NetNo {
+        let items = board.get_connectable_items(net_no);
+        let count = incomplete_count_for_net_items(board, net_no, &items);
+        total = total.wrapping_add(count);
+        if count > 0 {
+            incomplete.push(net_no);
         }
-    });
+    }
     if let Some(nets) = incomplete_nets {
         nets.extend(incomplete);
     }
     total
+}
+
+/// Return the number of incomplete connections on one valid board net.
+///
+/// Invalid net numbers and nets without connectable items return zero. The result uses the same
+/// per-net memo as [`incomplete_count`], with the same item versions, global epoch, and cache
+/// verification behavior.
+pub fn incomplete_count_for_net(board: &BasicBoard, net: NetNo) -> i32 {
+    if net < 1 || net > board.rules.nets.max_net_number() {
+        return 0;
+    }
+    let items = board.get_connectable_items(net);
+    incomplete_count_for_net_items(board, net, &items)
+}
+
+fn incomplete_count_for_net_items(board: &BasicBoard, net: NetNo, items: &[ItemKey]) -> i32 {
+    let global = board.items.global_epoch();
+    let key: Vec<(ItemKey, u64)> = items.iter().map(|&k| (k, board.items.version(k))).collect();
+    NET_COUNTS.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        let entries = memo.entry(net).or_default();
+        let cached = entries.iter().find(|e| e.global == global && e.items == key).map(|e| e.count);
+        match cached {
+            Some(c) => {
+                if verify_caches() {
+                    assert_eq!(c, NetIncompletes::new(board, net, items).count(), "net incompletes cache out of date");
+                }
+                c
+            }
+            None => {
+                let c = NetIncompletes::new(board, net, items).count();
+                if entries.len() >= NET_COUNT_SLOTS {
+                    entries.remove(0);
+                }
+                entries.push(NetCount { global, items: key, count: c });
+                c
+            }
+        }
+    })
 }
 
 struct NetCount {

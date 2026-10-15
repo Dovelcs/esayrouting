@@ -3,14 +3,549 @@ use crate::{
     spec::{ChannelRegion, NetRule, RouteSpec},
 };
 use fr_engine::{
-    board::{ItemKey, RoutingBoard},
-    drc::clearance_violation::clearance_violations,
+    board::{BasicBoard, ItemKey, JavaVariant, RoutingBoard, TreeKind},
+    drc::clearance_violation::{clearance_violations, ClearanceViolation},
     ids::{FixedState, NetNo},
+    library::BoardLibrary,
+    rules::BoardRules,
+    structure::{Communication, Components, LayerStructure},
 };
 use fr_geom::{IntPoint, Point, Polyline};
 use fr_settings::RouterSettings;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Instant,
+};
+
+#[derive(Clone, Copy, Default)]
+struct Timing {
+    calls: u64,
+    ns: u64,
+}
+#[derive(Clone, Copy, Default)]
+struct ValidationMetrics {
+    slots: [Timing; 8],
+    detail: ValidationDetail,
+}
+#[derive(Clone, Copy, Default, Serialize)]
+struct ValidationDetail {
+    after_map_items: u64,
+    after_map_traces: u64,
+    after_map_pads: u64,
+    after_map_vias: u64,
+    baseline_compare_items: u64,
+    baseline_compare_traces: u64,
+    baseline_compare_pads: u64,
+    baseline_compare_vias: u64,
+    baseline_id_items: u64,
+    new_foreign_guard_items: u64,
+    drc_after_items: u64,
+    drc_before_items: u64,
+    drc_clearance_candidates: u64,
+    drc_retained_candidates: u64,
+    drc_rejected_candidates: u64,
+    retain_exact_copper_gap_checks: u64,
+    drc_result_key_candidates: u64,
+    drc_unique_result_keys: u64,
+    drc_candidate_generation_ns: u64,
+    drc_retain_check_ns: u64,
+    drc_result_key_build_ns: u64,
+    connectivity_calls: u64,
+    connectivity_net_iterations: u64,
+    connectivity_get_connected_sets_calls: u64,
+    connectivity_groups: u64,
+    connectivity_item_members: u64,
+    connectivity_pin_checks: u64,
+    connectivity_pins_emitted: u64,
+    connectivity_previous_groups_compared: u64,
+    connectivity_set_comparisons: u64,
+    connectivity_pin_membership_probes: u64,
+    connectivity_direct_net_incompletes_calls: u64,
+    invariant_after_map_entries: u64,
+    invariant_signature_format_calls: u64,
+    invariant_signature_format_bytes: u64,
+    invariant_baseline_id_lookups: u64,
+    invariant_protected_net_membership_checks: u64,
+    invariant_geometry_debug_fast_path_hits: u64,
+    invariant_geometry_debug_fast_path_misses: u64,
+    baseline_violations_cache_hits: u64,
+    baseline_violations_cache_misses: u64,
+    baseline_violations_validation_calls: u64,
+    baseline_connectivity_cache_hits: u64,
+    baseline_connectivity_cache_misses: u64,
+    baseline_connectivity_validation_calls: u64,
+    baseline_debug_cache_hits: u64,
+    baseline_debug_cache_misses: u64,
+    baseline_debug_cache_format_calls: u64,
+    after_map_ns: u64,
+    baseline_compare_ns: u64,
+    baseline_id_collection_ns: u64,
+    new_foreign_guard_ns: u64,
+    connectivity_build_ns: u64,
+    connectivity_compare_ns: u64,
+}
+#[derive(Clone, Copy)]
+enum Metric {
+    Violations,
+    Invariant,
+    Preserve,
+    Drc,
+    After,
+    Before,
+    Diff,
+    Connectivity,
+}
+thread_local! { static VALIDATION_METRICS: Cell<ValidationMetrics> = Cell::new(ValidationMetrics::default()); }
+thread_local! { static VALIDATION_BASELINE_CACHE: RefCell<Vec<ValidationBaselineMemo>> = const { RefCell::new(Vec::new()) }; }
+
+struct ValidationBaselineWitness {
+    item_epoch: u64,
+    global_epoch: u64,
+    tree_item_epoch: u64,
+    rules: Arc<BoardRules>,
+    library: Arc<BoardLibrary>,
+    components: Arc<Components>,
+    layer_structure: Arc<LayerStructure>,
+    communication: Communication,
+    bounding_box: fr_geom::IntBox,
+    tree_kind: TreeKind,
+    tree_clearance_class: i32,
+    java_variant: JavaVariant,
+    stitching_vias: bool,
+    awx_same_net_via_pad_contact: bool,
+}
+
+impl ValidationBaselineWitness {
+    fn new(adapter: &BoardAdapter) -> Self {
+        let board = &adapter.board;
+        let items = board.item_repository();
+        let tree = board.default_tree();
+        Self {
+            item_epoch: items.epoch(),
+            global_epoch: items.global_epoch(),
+            tree_item_epoch: tree.item_epoch(),
+            rules: Arc::clone(&board.rules),
+            library: Arc::clone(&board.library),
+            components: Arc::clone(&board.components),
+            layer_structure: Arc::clone(&board.layer_structure),
+            communication: board.communication.clone(),
+            bounding_box: board.bounding_box,
+            tree_kind: tree.kind,
+            tree_clearance_class: tree.compensated_clearance_class_no,
+            java_variant: board.java_variant,
+            stitching_vias: board.stitching_vias,
+            awx_same_net_via_pad_contact: adapter.awx_same_net_via_pad_contact,
+        }
+    }
+
+    fn matches(&self, adapter: &BoardAdapter) -> bool {
+        let board = &adapter.board;
+        let items = board.item_repository();
+        let tree = board.default_tree();
+        self.item_epoch == items.epoch()
+            && self.global_epoch == items.global_epoch()
+            && self.tree_item_epoch == tree.item_epoch()
+            && Arc::ptr_eq(&self.rules, &board.rules)
+            && Arc::ptr_eq(&self.library, &board.library)
+            && Arc::ptr_eq(&self.components, &board.components)
+            && Arc::ptr_eq(&self.layer_structure, &board.layer_structure)
+            && self.communication == board.communication
+            && self.bounding_box == board.bounding_box
+            && self.tree_kind == tree.kind
+            && self.tree_clearance_class == tree.compensated_clearance_class_no
+            && self.java_variant == board.java_variant
+            && self.stitching_vias == board.stitching_vias
+            && self.awx_same_net_via_pad_contact == adapter.awx_same_net_via_pad_contact
+    }
+}
+
+#[derive(Default)]
+struct ValidationBaselineMemo {
+    witness: Option<ValidationBaselineWitness>,
+    violations: Option<Arc<BTreeSet<(i32, i32, i32, u64, u64)>>>,
+    connectivity: Option<Arc<BTreeMap<String, Vec<Vec<i32>>>>>,
+    debug_strings: BTreeMap<i32, BaselineDebugStrings>,
+}
+
+#[derive(Default)]
+struct BaselineDebugStrings {
+    item_version: u64,
+    kind: Option<Arc<str>>,
+    tile_shapes: Option<Arc<str>>,
+}
+
+#[derive(Clone, Copy)]
+enum BaselineDebugField {
+    Kind,
+    TileShapes,
+}
+
+pub(crate) fn clear_validation_baseline_cache() {
+    VALIDATION_BASELINE_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+fn record_baseline_cache_metric(update: impl FnOnce(&mut ValidationDetail)) {
+    update_detail(update);
+}
+
+fn cached_baseline_debug<T: std::fmt::Debug>(
+    adapter: &BoardAdapter,
+    key: ItemKey,
+    field: BaselineDebugField,
+    value: &T,
+) -> Arc<str> {
+    let board = &adapter.board;
+    let item = board.item(key);
+    let item_id = item.id().0;
+    let item_version = board.item_repository().version(key);
+    VALIDATION_BASELINE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let memo_index = cache.iter().position(|memo| {
+            memo.witness
+                .as_ref()
+                .is_some_and(|witness| witness.matches(adapter))
+        });
+        let memo_index = memo_index.unwrap_or_else(|| {
+            if cache.len() == 2 {
+                cache.remove(0);
+            }
+            cache.push(ValidationBaselineMemo {
+                witness: Some(ValidationBaselineWitness::new(adapter)),
+                ..ValidationBaselineMemo::default()
+            });
+            cache.len() - 1
+        });
+        let memo = &mut cache[memo_index];
+        let item_debug = memo.debug_strings.entry(item_id).or_default();
+        if item_debug.item_version != item_version {
+            *item_debug = BaselineDebugStrings {
+                item_version,
+                ..BaselineDebugStrings::default()
+            };
+        }
+        let cached = match field {
+            BaselineDebugField::Kind => &mut item_debug.kind,
+            BaselineDebugField::TileShapes => &mut item_debug.tile_shapes,
+        };
+        if let Some(formatted) = cached {
+            record_baseline_cache_metric(|d| d.baseline_debug_cache_hits += 1);
+            return Arc::clone(formatted);
+        }
+        record_baseline_cache_metric(|d| d.baseline_debug_cache_misses += 1);
+        let formatted = format!("{value:?}");
+        update_detail(|d| {
+            d.invariant_signature_format_calls += 1;
+            d.invariant_signature_format_bytes += formatted.len() as u64;
+            d.baseline_debug_cache_format_calls += 1;
+        });
+        let formatted: Arc<str> = Arc::from(formatted);
+        *cached = Some(Arc::clone(&formatted));
+        formatted
+    })
+}
+
+fn store_validation_baseline(
+    adapter: &BoardAdapter,
+    witness: ValidationBaselineWitness,
+    violations: Option<Arc<BTreeSet<(i32, i32, i32, u64, u64)>>>,
+    connectivity: Option<Arc<BTreeMap<String, Vec<Vec<i32>>>>>,
+) {
+    VALIDATION_BASELINE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(memo) = cache.iter_mut().find(|memo| {
+            memo.witness
+                .as_ref()
+                .is_some_and(|cached| cached.matches(adapter))
+        }) {
+            if let Some(violations) = violations {
+                memo.violations = Some(violations);
+            }
+            if let Some(connectivity) = connectivity {
+                memo.connectivity = Some(connectivity);
+            }
+            return;
+        }
+        if cache.len() == 2 {
+            cache.remove(0);
+        }
+        cache.push(ValidationBaselineMemo {
+            witness: Some(witness),
+            violations,
+            connectivity,
+            debug_strings: BTreeMap::new(),
+        });
+    });
+}
+
+fn cached_baseline_violations(
+    adapter: &BoardAdapter,
+) -> Arc<BTreeSet<(i32, i32, i32, u64, u64)>> {
+    let hit = VALIDATION_BASELINE_CACHE.with(|cache| {
+        cache.borrow().iter().find_map(|memo| {
+            memo.witness
+                .as_ref()
+                .filter(|witness| witness.matches(adapter))
+                .and_then(|_| memo.violations.clone())
+        })
+    });
+    if let Some(violations) = hit {
+        record_baseline_cache_metric(|d| d.baseline_violations_cache_hits += 1);
+        return violations;
+    }
+    record_baseline_cache_metric(|d| d.baseline_violations_cache_misses += 1);
+    record_baseline_cache_metric(|d| d.baseline_violations_validation_calls += 1);
+    let witness = ValidationBaselineWitness::new(adapter);
+    let violations = Arc::new(adapter.violations_for_scan(Some(BoardScan::DrcBefore)));
+    store_validation_baseline(adapter, witness, Some(Arc::clone(&violations)), None);
+    violations
+}
+
+fn cached_baseline_connectivity(
+    adapter: &BoardAdapter,
+) -> Arc<BTreeMap<String, Vec<Vec<i32>>>> {
+    let hit = VALIDATION_BASELINE_CACHE.with(|cache| {
+        cache.borrow().iter().find_map(|memo| {
+            memo.witness
+                .as_ref()
+                .filter(|witness| witness.matches(adapter))
+                .and_then(|_| memo.connectivity.clone())
+        })
+    });
+    if let Some(connectivity) = hit {
+        record_baseline_cache_metric(|d| d.baseline_connectivity_cache_hits += 1);
+        return connectivity;
+    }
+    record_baseline_cache_metric(|d| d.baseline_connectivity_cache_misses += 1);
+    record_baseline_cache_metric(|d| d.baseline_connectivity_validation_calls += 1);
+    let witness = ValidationBaselineWitness::new(adapter);
+    let connectivity = Arc::new(adapter.connectivity());
+    store_validation_baseline(adapter, witness, None, Some(Arc::clone(&connectivity)));
+    connectivity
+}
+struct Timer {
+    metric: Metric,
+    start: Instant,
+}
+impl Timer {
+    fn start(metric: Metric) -> Self {
+        Self {
+            metric,
+            start: Instant::now(),
+        }
+    }
+}
+impl Drop for Timer {
+    fn drop(&mut self) {
+        VALIDATION_METRICS.with(|cell| {
+            let mut p = cell.get();
+            let s = &mut p.slots[self.metric as usize];
+            s.ns += self.start.elapsed().as_nanos() as u64;
+            if (self.metric as usize) < 2 {
+                s.calls += 1;
+            }
+            cell.set(p);
+        });
+    }
+}
+pub(crate) fn reset_validation_metrics() {
+    VALIDATION_METRICS.with(|cell| cell.set(ValidationMetrics::default()));
+}
+pub(crate) fn validation_metrics_json() -> serde_json::Value {
+    VALIDATION_METRICS.with(|cell| { let p = cell.get(); let s = &p.slots;
+        serde_json::json!({"thread_local":true,"timing_semantics":"invariant total encloses phases; DRC compare encloses both scans and diff; each scan encloses violations calls; nested durations overlap and must not be summed",
+            "violations_calls":s[0].calls,"violations_elapsed_ns":s[0].ns,"assert_invariants_calls":s[1].calls,"assert_invariants_elapsed_ns":s[1].ns,
+            "protected_object_checks_elapsed_ns":s[2].ns,"drc_compare_elapsed_ns":s[3].ns,"drc_after_scan_elapsed_ns":s[4].ns,
+            "drc_before_scan_elapsed_ns":s[5].ns,"drc_set_difference_elapsed_ns":s[6].ns,"connectivity_checks_elapsed_ns":s[7].ns,
+            "detail":p.detail,"detail_timing_semantics":"phase nanoseconds are aggregate wall time; DRC generation, retain, and key-build timings are sampled by 128-item batches in candidate order; nested timings overlap enclosing legacy timings"})
+    })
+}
+
+#[derive(Clone, Copy)]
+enum BoardScan {
+    AfterMap,
+    BaselineCompare,
+    BaselineIds,
+    NewForeignGuard,
+    DrcAfter,
+    DrcBefore,
+}
+fn record_board_scan(scan: BoardScan, items: u64, traces: u64, pads: u64, vias: u64) {
+    VALIDATION_METRICS.with(|cell| {
+        let mut p = cell.get();
+        let d = &mut p.detail;
+        match scan {
+            BoardScan::AfterMap => { d.after_map_items += items; d.after_map_traces += traces; d.after_map_pads += pads; d.after_map_vias += vias; }
+            BoardScan::BaselineCompare => { d.baseline_compare_items += items; d.baseline_compare_traces += traces; d.baseline_compare_pads += pads; d.baseline_compare_vias += vias; }
+            BoardScan::BaselineIds => d.baseline_id_items += items,
+            BoardScan::NewForeignGuard => d.new_foreign_guard_items += items,
+            BoardScan::DrcAfter => d.drc_after_items += items,
+            BoardScan::DrcBefore => d.drc_before_items += items,
+        }
+        cell.set(p);
+    });
+}
+fn update_detail(update: impl FnOnce(&mut ValidationDetail)) {
+    VALIDATION_METRICS.with(|cell| {
+        let mut p = cell.get();
+        update(&mut p.detail);
+        cell.set(p);
+    });
+}
+#[derive(Clone, Copy)]
+enum DetailPhase {
+    AfterMap,
+    BaselineCompare,
+    BaselineIds,
+    NewForeignGuard,
+    DrcCandidateGeneration,
+    DrcRetain,
+    DrcKeys,
+    ConnectivityBuild,
+    ConnectivityCompare,
+}
+fn record_phase_ns(phase: DetailPhase, ns: u64) {
+    update_detail(|d| match phase {
+        DetailPhase::AfterMap => d.after_map_ns += ns,
+        DetailPhase::BaselineCompare => d.baseline_compare_ns += ns,
+        DetailPhase::BaselineIds => d.baseline_id_collection_ns += ns,
+        DetailPhase::NewForeignGuard => d.new_foreign_guard_ns += ns,
+        DetailPhase::DrcCandidateGeneration => d.drc_candidate_generation_ns += ns,
+        DetailPhase::DrcRetain => d.drc_retain_check_ns += ns,
+        DetailPhase::DrcKeys => d.drc_result_key_build_ns += ns,
+        DetailPhase::ConnectivityBuild => d.connectivity_build_ns += ns,
+        DetailPhase::ConnectivityCompare => d.connectivity_compare_ns += ns,
+    });
+}
+struct DetailTimer {
+    phase: DetailPhase,
+    start: Instant,
+}
+impl DetailTimer {
+    fn start(phase: DetailPhase) -> Self {
+        Self { phase, start: Instant::now() }
+    }
+}
+impl Drop for DetailTimer {
+    fn drop(&mut self) {
+        record_phase_ns(self.phase, self.start.elapsed().as_nanos() as u64);
+    }
+}
+fn profiled_debug<T: std::fmt::Debug>(value: &T) -> String {
+    let formatted = format!("{:?}", value);
+    update_detail(|d| {
+        d.invariant_signature_format_calls += 1;
+        d.invariant_signature_format_bytes += formatted.len() as u64;
+    });
+    formatted
+}
+
+/// Prove that a baseline item's content and every input used to derive its
+/// default-tree shapes are unchanged. Public Arc-backed board data can be
+/// mutated through copy-on-write access, so epoch equality alone is not enough.
+fn unchanged_debug_geometry_inputs(
+    before: &BasicBoard,
+    after: &BasicBoard,
+    before_key: ItemKey,
+    after_key: ItemKey,
+) -> bool {
+    let before_item = before.item(before_key);
+    let after_item = after.item(after_key);
+    // Obstacle tiling also depends on Communication's host CAD/resolution
+    // settings, which are not represented by the board epochs or Arc fields.
+    if before_item.is_obstacle_area()
+        || before_item.is_conduction_area()
+        || after_item.is_obstacle_area()
+        || after_item.is_conduction_area()
+    {
+        return false;
+    }
+    (before_key == after_key || before_item.id() == after_item.id())
+        && before.item_repository().version(before_key)
+            == after.item_repository().version(after_key)
+        && before.item_repository().global_epoch() == after.item_repository().global_epoch()
+        && std::sync::Arc::ptr_eq(&before.rules, &after.rules)
+        && std::sync::Arc::ptr_eq(&before.library, &after.library)
+        && std::sync::Arc::ptr_eq(&before.components, &after.components)
+        && std::sync::Arc::ptr_eq(&before.layer_structure, &after.layer_structure)
+        && before.bounding_box == after.bounding_box
+        && before.default_tree().kind == after.default_tree().kind
+        && before.default_tree().compensated_clearance_class_no
+            == after.default_tree().compensated_clearance_class_no
+}
+
+/// Retain native DRC findings unless the broad-phase tile candidate can be
+/// disproved against actual copper shapes with the same raw clearance.
+/// Keepouts, outlines, and non-authorized structural via/pad restrictions stay native.
+fn retain_clearance_candidate(
+    board: &BasicBoard,
+    violation: &ClearanceViolation,
+    allow_awx_same_net_via_pad_contact: bool,
+    mut exact_copper_checks: Option<&mut u64>,
+) -> bool {
+    let first = board.item(violation.first_item);
+    let second = board.item(violation.second_item);
+    if first.is_obstacle_area()
+        || second.is_obstacle_area()
+        || first.is_board_outline()
+        || second.is_board_outline()
+        || first.is_component_outline()
+        || second.is_component_outline()
+    {
+        return true;
+    }
+    if board.rules.get_hole_clearance() > 0
+        && (first.is_pin() || first.is_via() || second.is_pin() || second.is_via())
+    {
+        // The search-tree candidate may include a copper-to-hole delta that is
+        // not represented by the pad/via copper outlines below.
+        return true;
+    }
+
+    let via_pin = if first.is_via() && second.is_pin() {
+        Some((violation.first_item, violation.second_item))
+    } else if first.is_pin() && second.is_via() {
+        Some((violation.second_item, violation.first_item))
+    } else {
+        None
+    };
+    if let Some((via_key, pin_key)) = via_pin {
+        let via = board.item(via_key);
+        let pin = board.item(pin_key);
+        if via.shares_net(pin) {
+            let attach_allowed = via.as_via().is_some_and(|via| via.attach_allowed);
+            if !attach_allowed {
+                return true;
+            }
+            if !pin.drill_allowed(board) {
+                let same_single_net = via.net_numbers().len() == 1
+                    && pin.net_numbers().len() == 1
+                    && via.net_numbers()[0] == pin.net_numbers()[0];
+                if !(allow_awx_same_net_via_pad_contact && same_single_net) {
+                    return true;
+                }
+                // This is the explicit AWX H2H-disabled same-net via/pad rule,
+                // not a numeric copper-clearance result.
+                return false;
+            }
+        }
+    }
+
+    if let Some(checks) = exact_copper_checks.as_deref_mut() {
+        *checks += 1;
+    }
+    let Some(actual_gap) = crate::copper_clearance::actual_copper_gap(
+        board,
+        violation.first_item,
+        violation.second_item,
+        violation.layer,
+    ) else {
+        return true;
+    };
+    !actual_gap.is_finite() || actual_gap < violation.expected_clearance
+}
 
 pub(crate) fn canonical_point_key(point: &fr_geom::Point) -> String {
     match point {
@@ -30,17 +565,12 @@ mod canonical_point_key_tests {
     #[test]
     fn equivalent_homogeneous_points_share_a_key() {
         let integer = Point::Int(IntPoint::new(1, 2));
-        let rational = Point::Rational(Box::new(RationalPoint::new(
-            2.into(),
-            4.into(),
-            2.into(),
-        )));
-        let scaled = Point::Rational(Box::new(RationalPoint::new(
-            3.into(),
-            6.into(),
-            3.into(),
-        )));
-        assert_eq!(canonical_point_key(&integer), canonical_point_key(&rational));
+        let rational = Point::Rational(Box::new(RationalPoint::new(2.into(), 4.into(), 2.into())));
+        let scaled = Point::Rational(Box::new(RationalPoint::new(3.into(), 6.into(), 3.into())));
+        assert_eq!(
+            canonical_point_key(&integer),
+            canonical_point_key(&rational)
+        );
         assert_eq!(canonical_point_key(&rational), canonical_point_key(&scaled));
     }
 }
@@ -72,6 +602,8 @@ pub struct BoardAdapter {
     pub units_per_mm: f64,
     source_protected_copper: BTreeSet<i32>,
     authorized_explicit_drills: BTreeMap<(String, String), u64>,
+    /// AWX-only rule for same-net via contact on a multilayer pad.
+    awx_same_net_via_pad_contact: bool,
     /// Board-outline rings retained by the native DSN loader, in board units.
     pub board_outline_polygons: Vec<Vec<[i32; 2]>>,
     /// True nested DSN outline rings which enclose fewer than two pad centers.
@@ -81,6 +613,14 @@ pub struct BoardAdapter {
     pub board_edge_contours: Vec<Vec<[i32; 2]>>,
 }
 impl BoardAdapter {
+    /// Apply the AWX source policy only when the job disables H2H and the native
+    /// board has no copper-to-hole clearance rule. Unknown source drill sizes
+    /// remain unverified; this does not establish hole safety.
+    pub(crate) fn configure_awx_hole_rules(&mut self, job_hole_to_hole_clearance_mm: f64) {
+        self.awx_same_net_via_pad_contact =
+            job_hole_to_hole_clearance_mm == 0.0 && self.board.rules.get_hole_clearance() == 0;
+    }
+
     pub fn load(bytes: &[u8]) -> Result<Self, String> {
         Self::load_inner(bytes, None, true)
     }
@@ -93,7 +633,9 @@ impl BoardAdapter {
     /// Replay serialized copper against the source DSN plus explicitly authorized
     /// physical via rules. Candidate drills must come from configuration metadata.
     pub fn load_session_with_via_candidates(
-        bytes: &[u8], session: &[u8], candidates: &[(String, f64, f64)],
+        bytes: &[u8],
+        session: &[u8],
+        candidates: &[(String, f64, f64)],
     ) -> Result<Self, String> {
         let mut loaded = Self::load(bytes)?;
         let known_explicit_drills: BTreeMap<_, _> = loaded
@@ -246,6 +788,7 @@ impl BoardAdapter {
             units_per_mm,
             source_protected_copper: protected_ids,
             authorized_explicit_drills: BTreeMap::new(),
+            awx_same_net_via_pad_contact: false,
             board_outline_polygons,
             board_cutouts,
             board_edge_contours,
@@ -300,11 +843,7 @@ impl BoardAdapter {
         if padstack.get_explicit_drill_radius().is_some() || item.net_numbers().len() != 1 {
             return None;
         }
-        let net = source
-            .board
-            .rules
-            .nets
-            .get(item.net_numbers()[0])?;
+        let net = source.board.rules.nets.get(item.net_numbers()[0])?;
         self.authorized_explicit_drills
             .get(&(net.name.clone(), padstack.name.clone()))
             .copied()
@@ -662,29 +1201,96 @@ impl BoardAdapter {
             .board
             .insert_trace_without_cleaning(poly, layer, half, &[n], cl, FixedState::UserFixed)
             .ok_or("engine rejected trace insertion")?;
-        if !clearance_violations(&self.board, key).is_empty() {
+        if clearance_violations(&self.board, key)
+            .iter()
+            .any(|v| retain_clearance_candidate(&self.board, v, self.awx_same_net_via_pad_contact, None))
+        {
             return Err(format!("{}: inserted candidate violates DRC", leg.net));
         }
         self.board.rules_mut().clearance_tolerance_um = previous_tolerance;
         Ok(key)
     }
     pub fn violations(&self) -> BTreeSet<(i32, i32, i32, u64, u64)> {
-        self.board
-            .item_repository()
-            .iter()
-            .flat_map(|k| clearance_violations(&self.board, k))
-            .map(|v| {
+        self.violations_for_scan(None)
+    }
+    fn violations_for_scan(
+        &self,
+        scan: Option<BoardScan>,
+    ) -> BTreeSet<(i32, i32, i32, u64, u64)> {
+        let _timer = Timer::start(Metric::Violations);
+        const ITEM_BATCH: usize = 128;
+        let mut keys = self.board.item_repository().iter();
+        let mut result = BTreeSet::new();
+        loop {
+            let batch: Vec<_> = keys.by_ref().take(ITEM_BATCH).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let generation_start = Instant::now();
+            let mut candidates = Vec::new();
+            let mut traces = 0;
+            let mut pads = 0;
+            let mut vias = 0;
+            for &key in &batch {
+                let item = self.board.item(key);
+                traces += item.is_trace() as u64;
+                pads += item.is_pin() as u64;
+                vias += item.is_via() as u64;
+                candidates.extend(clearance_violations(&self.board, key));
+            }
+            let generation_ns = generation_start.elapsed().as_nanos() as u64;
+            let candidate_count = candidates.len() as u64;
+            record_phase_ns(DetailPhase::DrcCandidateGeneration, generation_ns);
+            update_detail(|d| d.drc_clearance_candidates += candidate_count);
+            if let Some(scan) = scan {
+                record_board_scan(scan, batch.len() as u64, traces, pads, vias);
+            }
+
+            let retain_start = Instant::now();
+            let mut retained = Vec::new();
+            let mut exact_copper_checks = 0u64;
+            for candidate in candidates {
+                if retain_clearance_candidate(
+                    &self.board,
+                    &candidate,
+                    self.awx_same_net_via_pad_contact,
+                    Some(&mut exact_copper_checks),
+                ) {
+                    retained.push(candidate);
+                }
+            }
+            let retain_ns = retain_start.elapsed().as_nanos() as u64;
+            let retained_count = retained.len() as u64;
+            let rejected_count = candidate_count.saturating_sub(retained_count);
+            record_phase_ns(DetailPhase::DrcRetain, retain_ns);
+            update_detail(|d| {
+                d.drc_retained_candidates += retained_count;
+                d.drc_rejected_candidates += rejected_count;
+                d.retain_exact_copper_gap_checks += exact_copper_checks;
+            });
+
+            let key_start = Instant::now();
+            let mut key_candidates = 0u64;
+            let mut unique_keys = 0u64;
+            for v in retained {
                 let a = self.board.item(v.first_item).id().0;
                 let b = self.board.item(v.second_item).id().0;
-                (
+                key_candidates += 1;
+                unique_keys += result.insert((
                     a.min(b),
                     a.max(b),
                     v.layer,
                     v.expected_clearance.to_bits(),
                     v.actual_clearance.to_bits(),
-                )
-            })
-            .collect()
+                )) as u64;
+            }
+            record_phase_ns(DetailPhase::DrcKeys, key_start.elapsed().as_nanos() as u64);
+            update_detail(|d| {
+                d.drc_result_key_candidates += key_candidates;
+                d.drc_unique_result_keys += unique_keys;
+            });
+        }
+        result
     }
     /// Clearance violations with item identity replaced by canonical geometry
     /// signatures, so SES replay can compare inherited violations after re-ID.
@@ -709,6 +1315,14 @@ impl BoardAdapter {
             .item_repository()
             .iter()
             .flat_map(|key| clearance_violations(&source.board, key))
+            .filter(|violation| {
+                retain_clearance_candidate(
+                    &source.board,
+                    violation,
+                    self.awx_same_net_via_pad_contact && source.awx_same_net_via_pad_contact,
+                    None,
+                )
+            })
             .map(|violation| {
                 let mut items = [
                     session_item_signature(
@@ -752,20 +1366,36 @@ impl BoardAdapter {
             .collect()
     }
     pub fn connectivity(&self) -> BTreeMap<String, Vec<Vec<i32>>> {
-        self.board
+        let _detail_timer = DetailTimer::start(DetailPhase::ConnectivityBuild);
+        let mut net_iterations = 0u64;
+        let mut connected_calls = 0u64;
+        let mut groups = 0u64;
+        let mut members = 0u64;
+        let mut pin_checks = 0u64;
+        let mut pins = 0u64;
+        let result = self.board
             .rules
             .nets
             .iter()
             .map(|n| {
-                let mut groups: Vec<Vec<i32>> = self
-                    .board
-                    .get_connected_sets(n.net_number)
+                net_iterations += 1;
+                connected_calls += 1;
+                let connected_sets = self.board.get_connected_sets(n.net_number);
+                groups += connected_sets.len() as u64;
+                let mut groups: Vec<Vec<i32>> = connected_sets
                     .into_iter()
                     .map(|s| {
                         let mut ids: Vec<_> = s
                             .iter()
-                            .filter(|&k| self.board.item(k).is_pin())
-                            .map(|k| self.board.item(k).id().0)
+                            .filter(|&k| {
+                                members += 1;
+                                pin_checks += 1;
+                                self.board.item(k).is_pin()
+                            })
+                            .map(|k| {
+                                pins += 1;
+                                self.board.item(k).id().0
+                            })
                             .collect();
                         ids.sort();
                         ids
@@ -775,7 +1405,19 @@ impl BoardAdapter {
                 groups.sort();
                 (n.name.clone(), groups)
             })
-            .collect()
+            .collect();
+        // `connectivity()` uses get_connected_sets; it does not invoke the
+        // NetIncompletes/airline calculator.
+        update_detail(|d| {
+            d.connectivity_calls += 1;
+            d.connectivity_net_iterations += net_iterations;
+            d.connectivity_get_connected_sets_calls += connected_calls;
+            d.connectivity_groups += groups;
+            d.connectivity_item_members += members;
+            d.connectivity_pin_checks += pin_checks;
+            d.connectivity_pins_emitted += pins;
+        });
+        result
     }
     pub fn assert_preserved(&self, before: &Self) -> Result<(), String> {
         self.assert_invariants(before, &BTreeSet::new(), true)
@@ -862,7 +1504,11 @@ impl BoardAdapter {
                 if strict || item.fixed_state() != FixedState::Unfixed || protected_item {
                     add_count(
                         &mut required,
-                        copper_signature(before, item, self.authorized_drill_upgrade(before, item))?,
+                        copper_signature(
+                            before,
+                            item,
+                            self.authorized_drill_upgrade(before, item),
+                        )?,
                     );
                 }
                 if protected_item {
@@ -955,14 +1601,44 @@ impl BoardAdapter {
         strict: bool,
         moved_components: &BTreeSet<String>,
     ) -> Result<(), String> {
+        let _total_timer = Timer::start(Metric::Invariant);
+        let preservation_timer = Timer::start(Metric::Preserve);
+        let _after_map_timer = DetailTimer::start(DetailPhase::AfterMap);
+        let mut after_items = 0u64;
+        let mut after_traces = 0u64;
+        let mut after_pads = 0u64;
+        let mut after_vias = 0u64;
         let after: BTreeMap<_, _> = self
             .board
             .item_repository()
             .iter()
-            .map(|k| (self.board.item(k).id().0, k))
+            .map(|k| {
+                let item = self.board.item(k);
+                after_items += 1;
+                after_traces += item.is_trace() as u64;
+                after_pads += item.is_pin() as u64;
+                after_vias += item.is_via() as u64;
+                (item.id().0, k)
+            })
             .collect();
+        update_detail(|d| d.invariant_after_map_entries += after.len() as u64);
+        record_board_scan(BoardScan::AfterMap, after_items, after_traces, after_pads, after_vias);
+        drop(_after_map_timer);
+        let _baseline_compare_timer = DetailTimer::start(DetailPhase::BaselineCompare);
+        let mut baseline_items = 0u64;
+        let mut baseline_traces = 0u64;
+        let mut baseline_pads = 0u64;
+        let mut baseline_vias = 0u64;
+        let mut baseline_id_lookups = 0u64;
+        let mut protected_net_checks = 0u64;
+        let mut geometry_debug_fast_path_hits = 0u64;
+        let mut geometry_debug_fast_path_misses = 0u64;
         for k in before.board.item_repository().iter() {
             let item = before.board.item(k);
+            baseline_items += 1;
+            baseline_traces += item.is_trace() as u64;
+            baseline_pads += item.is_pin() as u64;
+            baseline_vias += item.is_via() as u64;
             let component_no = item.component_no();
             let moved_component = if component_no <= 0 {
                 false
@@ -978,6 +1654,7 @@ impl BoardAdapter {
                 && (item.is_trace() || item.is_via())
                 && item.fixed_state() == FixedState::Unfixed
                 && !item.net_numbers().iter().any(|&n| {
+                    protected_net_checks += 1;
                     before
                         .board
                         .rules
@@ -988,22 +1665,54 @@ impl BoardAdapter {
             {
                 continue;
             }
+            baseline_id_lookups += 1;
             let a = after.get(&item.id().0).ok_or("original item removed")?;
             let now = self.board.item(*a);
+            let debug_geometry_unchanged = if moved_component {
+                false
+            } else {
+                let unchanged = unchanged_debug_geometry_inputs(
+                    &before.board,
+                    &self.board,
+                    k,
+                    *a,
+                );
+                if unchanged {
+                    geometry_debug_fast_path_hits += 1;
+                } else {
+                    geometry_debug_fast_path_misses += 1;
+                }
+                unchanged
+            };
             if item.board_item_type() != now.board_item_type()
                 || item.component_no() != now.component_no()
                 || item.first_layer(&before.board) != now.first_layer(&self.board)
                 || item.last_layer(&before.board) != now.last_layer(&self.board)
                 || (!moved_component
-                    && format!("{:?}", before.board.item_tile_shapes(item))
-                        != format!("{:?}", self.board.item_tile_shapes(now)))
+                    && !debug_geometry_unchanged
+                    && cached_baseline_debug(
+                        before,
+                        k,
+                        BaselineDebugField::TileShapes,
+                        &before.board.item_tile_shapes(item),
+                    )
+                    .as_ref()
+                        != profiled_debug(&self.board.item_tile_shapes(now)).as_str())
             {
                 return Err("frozen original item type/shape/layers changed".into());
             }
             if !moved_component
+                && !debug_geometry_unchanged
                 && !item.is_trace()
                 && !item.is_via()
-                && format!("{:?}", item.kind) != format!("{:?}", now.kind)
+                && cached_baseline_debug(
+                    before,
+                    k,
+                    BaselineDebugField::Kind,
+                    &item.kind,
+                )
+                .as_ref()
+                    != profiled_debug(&now.kind).as_str()
             {
                 return Err("original non-routing entity properties changed".into());
             }
@@ -1059,15 +1768,34 @@ impl BoardAdapter {
                 }
             }
         }
+        record_board_scan(BoardScan::BaselineCompare, baseline_items, baseline_traces, baseline_pads, baseline_vias);
+        update_detail(|d| {
+            d.invariant_baseline_id_lookups += baseline_id_lookups;
+            d.invariant_protected_net_membership_checks += protected_net_checks;
+            d.invariant_geometry_debug_fast_path_hits += geometry_debug_fast_path_hits;
+            d.invariant_geometry_debug_fast_path_misses += geometry_debug_fast_path_misses;
+        });
+        drop(_baseline_compare_timer);
+        let _baseline_ids_timer = DetailTimer::start(DetailPhase::BaselineIds);
+        let mut baseline_id_items = 0u64;
         let original_ids: BTreeSet<_> = before
             .board
             .item_repository()
             .iter()
-            .map(|k| before.board.item(k).id())
+            .map(|k| {
+                baseline_id_items += 1;
+                before.board.item(k).id()
+            })
             .collect();
-        if self.board.item_repository().iter().any(|k| {
+        record_board_scan(BoardScan::BaselineIds, baseline_id_items, 0, 0, 0);
+        drop(_baseline_ids_timer);
+        let _foreign_guard_timer = DetailTimer::start(DetailPhase::NewForeignGuard);
+        let mut foreign_guard_items = 0u64;
+        let mut protected_copper_found = false;
+        for k in self.board.item_repository().iter() {
+            foreign_guard_items += 1;
             let item = self.board.item(k);
-            !original_ids.contains(&item.id())
+            if !original_ids.contains(&item.id())
                 && (item.is_trace() || item.is_via())
                 && item.net_numbers().iter().any(|&n| {
                     self.board
@@ -1076,23 +1804,80 @@ impl BoardAdapter {
                         .get(n)
                         .is_some_and(|net| protected.contains(&net.name))
                 })
-        }) {
+            {
+                protected_copper_found = true;
+                break;
+            }
+        }
+        record_board_scan(BoardScan::NewForeignGuard, foreign_guard_items, 0, 0, 0);
+        drop(_foreign_guard_timer);
+        if protected_copper_found {
             return Err("protected net acquired new copper".into());
         }
-        if !self.violations().is_subset(&before.violations()) {
+        drop(preservation_timer);
+        let drc_timer = Timer::start(Metric::Drc);
+        let after_violations = {
+            let _timer = Timer::start(Metric::After);
+            self.violations_for_scan(Some(BoardScan::DrcAfter))
+        };
+        let before_violations = {
+            let _timer = Timer::start(Metric::Before);
+            cached_baseline_violations(before)
+        };
+        let has_new_violation = {
+            let _timer = Timer::start(Metric::Diff);
+            !after_violations.is_subset(&before_violations)
+        };
+        drop(drc_timer);
+        if has_new_violation {
             return Err("new full-board clearance violation".into());
         }
-        let previous = before.connectivity();
+        let _connectivity_timer = Timer::start(Metric::Connectivity);
+        let previous = cached_baseline_connectivity(before);
         let current = self.connectivity();
-        for (net, groups) in previous {
+        let _connectivity_compare_timer = DetailTimer::start(DetailPhase::ConnectivityCompare);
+        let mut previous_groups_compared = 0u64;
+        let mut set_comparisons = 0u64;
+        let mut pin_membership_probes = 0u64;
+        for (net, groups) in previous.iter() {
             for connected in groups {
-                if !current.get(&net).is_some_and(|sets| {
-                    sets.iter().any(|s| connected.iter().all(|i| s.contains(i)))
-                }) {
+                previous_groups_compared += 1;
+                let mut found = false;
+                if let Some(sets) = current.get(net) {
+                    for set in sets {
+                        set_comparisons += 1;
+                        let mut contains_all = true;
+                        for id in connected {
+                            pin_membership_probes += 1;
+                            // `connectivity()` sorts every pin-id vector before returning it,
+                            // so use logarithmic lookup when checking whether an old group is
+                            // still contained in a current group.
+                            if set.binary_search(id).is_err() {
+                                contains_all = false;
+                                break;
+                            }
+                        }
+                        if contains_all {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if !found {
+                    update_detail(|d| {
+                        d.connectivity_previous_groups_compared += previous_groups_compared;
+                        d.connectivity_set_comparisons += set_comparisons;
+                        d.connectivity_pin_membership_probes += pin_membership_probes;
+                    });
                     return Err(format!("existing {net} connectivity split"));
                 }
             }
         }
+        update_detail(|d| {
+            d.connectivity_previous_groups_compared += previous_groups_compared;
+            d.connectivity_set_comparisons += set_comparisons;
+            d.connectivity_pin_membership_probes += pin_membership_probes;
+        });
         Ok(())
     }
 }
@@ -1331,14 +2116,15 @@ fn checked_size(value: f64) -> Result<i32, String> {
     }
     Ok(v as i32)
 }
-fn source_protected_copper_counts(
-    board: &RoutingBoard,
-) -> Result<BTreeMap<String, usize>, String> {
+fn source_protected_copper_counts(board: &RoutingBoard) -> Result<BTreeMap<String, usize>, String> {
     let mut counts = BTreeMap::new();
     for key in board.item_repository().iter() {
         let item = board.item(key);
         if (item.is_trace() || item.is_via())
-            && matches!(item.fixed_state(), FixedState::UserFixed | FixedState::SystemFixed)
+            && matches!(
+                item.fixed_state(),
+                FixedState::UserFixed | FixedState::SystemFixed
+            )
         {
             *counts
                 .entry(source_copper_signature(board, item)?)
@@ -1458,7 +2244,11 @@ fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
 
 /// Full-session materialization is distinct from the upstream append-style SES import.
 /// Copper classes come from the source DSN; SES carries geometry and fixed flags only.
-fn replay_full_session(board: &mut RoutingBoard, src: &[u8], authorized_vias: &BTreeMap<(NetNo, fr_engine::ids::PadstackNo), fr_engine::rules::ViaInfoId>) -> Result<(), String> {
+fn replay_full_session(
+    board: &mut RoutingBoard,
+    src: &[u8],
+    authorized_vias: &BTreeMap<(NetNo, fr_engine::ids::PadstackNo), fr_engine::rules::ViaInfoId>,
+) -> Result<(), String> {
     use fr_dsn::sexpr::{List, Sexpr};
     let expressions = fr_dsn::sexpr::parse(src).map_err(|e| format!("SES parse: {e}"))?;
     if expressions.len() != 1 {
@@ -1519,31 +2309,65 @@ fn replay_full_session(board: &mut RoutingBoard, src: &[u8], authorized_vias: &B
     }
     // Explicit candidates authorize this replay only. Serialized library copper
     // must match their independently registered physical dimensions and span.
-    let mut validated_padstacks=BTreeSet::new();
-    if let Some(library)=routes.find("library_out") {
-        for definition in library.sublists().filter(|l|l.is("padstack")) {
-            let name=definition.args().first().and_then(Sexpr::as_atom).ok_or("SES library padstack name missing")?;
-            let Some(pad)=board.library.padstacks.get_by_name(&name.text) else {continue};
-            if !authorized_vias.keys().any(|(_,id)|*id==pad.id) {continue}
-            if !validated_padstacks.insert(pad.id) {return Err("duplicate authorized SES library padstack".into())}
-            let mut declared_layers=BTreeSet::new();
-            for shape in definition.sublists().filter(|l|l.is("shape")) {
-                if shape.args().len()!=1 {return Err("unsupported authorized SES via shape".into())}
-                let circle=shape.args().first().and_then(Sexpr::as_list).filter(|l|l.is("circle")).ok_or("authorized SES via must have circular copper")?;
-                if circle.args().len()!=4 {return Err("authorized SES via circle needs diameter and center".into())}
-                let layer_name=circle.args().first().and_then(Sexpr::as_atom).ok_or("SES via copper layer missing")?;
-                let layer=board.layer_structure.get_no(&layer_name.text);
-                if layer<0 || !declared_layers.insert(layer) {return Err("invalid or duplicate SES via copper layer".into())}
-                let expected=pad.get_shape(layer).ok_or("SES via copper extends outside authorized span")?;
-                let diameter=coordinate(number(circle,1)?,den)?;
-                if (diameter as f64-expected.max_width()).abs()>1.0
-                    || coordinate(number(circle,2)?,den)?.abs()>1
-                    || coordinate(number(circle,3)?,den)?.abs()>1 {
+    let mut validated_padstacks = BTreeSet::new();
+    if let Some(library) = routes.find("library_out") {
+        for definition in library.sublists().filter(|l| l.is("padstack")) {
+            let name = definition
+                .args()
+                .first()
+                .and_then(Sexpr::as_atom)
+                .ok_or("SES library padstack name missing")?;
+            let Some(pad) = board.library.padstacks.get_by_name(&name.text) else {
+                continue;
+            };
+            if !authorized_vias.keys().any(|(_, id)| *id == pad.id) {
+                continue;
+            }
+            if !validated_padstacks.insert(pad.id) {
+                return Err("duplicate authorized SES library padstack".into());
+            }
+            let mut declared_layers = BTreeSet::new();
+            for shape in definition.sublists().filter(|l| l.is("shape")) {
+                if shape.args().len() != 1 {
+                    return Err("unsupported authorized SES via shape".into());
+                }
+                let circle = shape
+                    .args()
+                    .first()
+                    .and_then(Sexpr::as_list)
+                    .filter(|l| l.is("circle"))
+                    .ok_or("authorized SES via must have circular copper")?;
+                if circle.args().len() != 4 {
+                    return Err("authorized SES via circle needs diameter and center".into());
+                }
+                let layer_name = circle
+                    .args()
+                    .first()
+                    .and_then(Sexpr::as_atom)
+                    .ok_or("SES via copper layer missing")?;
+                let layer = board.layer_structure.get_no(&layer_name.text);
+                if layer < 0 || !declared_layers.insert(layer) {
+                    return Err("invalid or duplicate SES via copper layer".into());
+                }
+                let expected = pad
+                    .get_shape(layer)
+                    .ok_or("SES via copper extends outside authorized span")?;
+                let diameter = coordinate(number(circle, 1)?, den)?;
+                if (diameter as f64 - expected.max_width()).abs() > 1.0
+                    || coordinate(number(circle, 2)?, den)?.abs() > 1
+                    || coordinate(number(circle, 3)?, den)?.abs() > 1
+                {
                     return Err("SES library copper differs from authorized physical via".into());
                 }
             }
-            let expected_layers: BTreeSet<_>=(pad.from_layer()..=pad.to_layer()).filter(|l|pad.get_shape(*l).is_some()).collect();
-            if declared_layers!=expected_layers {return Err("SES library via copper layer span differs from authorized candidate".into())}
+            let expected_layers: BTreeSet<_> = (pad.from_layer()..=pad.to_layer())
+                .filter(|l| pad.get_shape(*l).is_some())
+                .collect();
+            if declared_layers != expected_layers {
+                return Err(
+                    "SES library via copper layer span differs from authorized candidate".into(),
+                );
+            }
         }
     }
     // SES placement is part of the authoritative session state just like route copper. Apply
@@ -1831,7 +2655,13 @@ fn replay_full_session(board: &mut RoutingBoard, src: &[u8], authorized_vias: &B
                 let via_rule = net_class
                     .get_via_rule()
                     .or_else(|| board.rules.via_rules.get_first());
-                if authorized_vias.contains_key(&(net,pad.id)) && !validated_padstacks.contains(&pad.id) {return Err("new SES via is missing its validated library_out definition".into())}
+                if authorized_vias.contains_key(&(net, pad.id))
+                    && !validated_padstacks.contains(&pad.id)
+                {
+                    return Err(
+                        "new SES via is missing its validated library_out definition".into(),
+                    );
+                }
                 let info = via_rule
                     .and_then(|r| {
                         board.rules.via_rules[r]
@@ -1840,7 +2670,7 @@ fn replay_full_session(board: &mut RoutingBoard, src: &[u8], authorized_vias: &B
                             .copied()
                             .find(|&id| board.rules.via_infos[id].get_padstack() == pad.id)
                     })
-                    .or_else(|| authorized_vias.get(&(net,pad.id)).copied())
+                    .or_else(|| authorized_vias.get(&(net, pad.id)).copied())
                     .map(|id| &board.rules.via_infos[id]);
                 let class = if let Some(source) = source {
                     source.0

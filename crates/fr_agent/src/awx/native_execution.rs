@@ -155,13 +155,15 @@ pub fn ensure_via_candidate(
                 "native AWX via padstack name collision for {padstack_name}"
             ));
         }
-        board
-            .board
-            .library_mut()
-            .padstacks
-            .get_mut(id)
-            .ok_or("native AWX via padstack mutation failed")?
-            .set_explicit_drill_radius(Some(drill_radius))?;
+        if stack.get_explicit_drill_radius() != Some(drill_radius) {
+            board
+                .board
+                .library_mut()
+                .padstacks
+                .get_mut(id)
+                .ok_or("native AWX via padstack mutation failed")?
+                .set_explicit_drill_radius(Some(drill_radius))?;
+        }
         id
     } else {
         let layers = board.board.layer_count() as usize;
@@ -183,7 +185,14 @@ pub fn ensure_via_candidate(
             .set_explicit_drill_radius(Some(drill_radius))?;
         id
     };
-    board.board.library_mut().add_via_padstack(padstack);
+    if board
+        .board
+        .library
+        .get_via_padstack_by_name(&padstack_name)
+        .is_none()
+    {
+        board.board.library_mut().add_via_padstack(padstack);
+    }
 
     let via_clearance = board.board.rules.net_classes[net_class]
         .default_item_clearance_classes

@@ -156,8 +156,7 @@ fn new_violation_nets(
     before: &BoardAdapter,
     after: &BoardAdapter,
 ) -> Result<BTreeSet<String>, String> {
-    let previous = before.violations();
-    let current = after.violations();
+    let current = after.new_violations_since(before);
     let mut item_nets = std::collections::BTreeMap::<i32, BTreeSet<String>>::new();
     for key in after.board.get_items() {
         let item = after.board.item(key);
@@ -169,7 +168,7 @@ fn new_violation_nets(
         }
     }
     let mut nets = BTreeSet::new();
-    for (first, second, _, _, _) in current.difference(&previous) {
+    for (first, second, _, _, _) in &current {
         if let Some(names) = item_nets.get(first) {
             nets.extend(names.iter().cloned());
         }

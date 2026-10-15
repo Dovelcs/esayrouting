@@ -52,6 +52,121 @@ pub(crate) fn actual_copper_gap(
     gap.is_finite().then_some(gap.max(0.0))
 }
 
+/// Return true only when a same-net trace endpoint bridge is wholly contained in one real pin's
+/// copper on `layer`. This is a geometric fact predicate; callers still decide whether that
+/// containment is relevant to a DRC difference.
+pub(crate) fn contained_pad_center_bridge(
+    board: &BasicBoard,
+    trace_key: ItemKey,
+    pin_key: ItemKey,
+    layer: i32,
+) -> bool {
+    let trace_item = board.item(trace_key);
+    let pin_item = board.item(pin_key);
+    if !trace_item.is_trace()
+        || !trace_item.is_on_board()
+        || !pin_item.is_pin()
+        || !pin_item.is_on_board()
+        || trace_item.net_numbers().len() != 1
+        || pin_item.net_numbers() != trace_item.net_numbers()
+    {
+        return false;
+    }
+
+    let trace = trace_item.trace();
+    if trace.layer() != layer || trace.half_width() <= 0 || !pin_item.is_on_layer(board, layer) {
+        return false;
+    }
+    let corners = trace.polyline().corners();
+    if corners.len() != 2 || corners[0] == corners[1] {
+        return false;
+    }
+    let endpoints = [corners[0].to_float(), corners[1].to_float()];
+    if endpoints.iter().any(|point| !finite_point(*point)) || endpoints[0] == endpoints[1] {
+        return false;
+    }
+
+    let pin_center = pin_item.center(board);
+    if corners[0] != pin_center && corners[1] != pin_center {
+        return false;
+    }
+
+    let Some(shape) = pin_item.drill_shape_on_layer(board, layer) else {
+        return false;
+    };
+    if shape.is_empty() || !shape.is_bounded() || shape.dimension() != 2 {
+        return false;
+    }
+
+    let radius = trace.half_width() as f64;
+    endpoints
+        .iter()
+        .all(|center| shape_contains_disk(&shape, center, radius))
+}
+
+/// Prove that a closed disk is contained in one bounded convex copper shape. For a convex shape,
+/// a disk centered inside it is contained exactly when its radius does not exceed the center's
+/// distance to every boundary feature.
+fn shape_contains_disk(shape: &Shape, center: &FloatPoint, radius: f64) -> bool {
+    if !finite_point(*center) || !radius.is_finite() || radius <= 0.0 || !shape.contains_float(center)
+    {
+        return false;
+    }
+
+    if shape.as_circle().is_some() || shape.as_tile_shape().is_some() {
+        if shape.to_convex_shape().is_none() {
+            return false;
+        }
+        let distance = shape.border_distance(center);
+        return distance.is_finite() && distance >= radius;
+    }
+
+    let Some(polygon) = shape.as_polygon_shape() else {
+        return false;
+    };
+    if !polygon.is_convex() {
+        return false;
+    }
+    let vertices = shape.corner_approx_arr();
+    if vertices.len() < 3 || vertices.iter().any(|point| !finite_point(*point)) {
+        return false;
+    }
+
+    let mut nearest_boundary = f64::INFINITY;
+    for index in 0..vertices.len() {
+        let edge = Segment {
+            a: vertices[index],
+            b: vertices[(index + 1) % vertices.len()],
+        };
+        let dx = edge.b.x - edge.a.x;
+        let dy = edge.b.y - edge.a.y;
+        let length_squared = dx * dx + dy * dy;
+        if !length_squared.is_finite() || length_squared <= 0.0 {
+            return false;
+        }
+        let distance = point_segment_distance_exact(*center, edge);
+        if !distance.is_finite() {
+            return false;
+        }
+        nearest_boundary = nearest_boundary.min(distance);
+    }
+    nearest_boundary >= radius
+}
+
+fn point_segment_distance_exact(point: FloatPoint, segment: Segment) -> f64 {
+    let dx = segment.b.x - segment.a.x;
+    let dy = segment.b.y - segment.a.y;
+    let length_squared = dx * dx + dy * dy;
+    if !length_squared.is_finite() || length_squared <= 0.0 {
+        return f64::NAN;
+    }
+    let projection = (((point.x - segment.a.x) * dx + (point.y - segment.a.y) * dy)
+        / length_squared)
+        .clamp(0.0, 1.0);
+    let nearest = FloatPoint::new(segment.a.x + projection * dx, segment.a.y + projection * dy);
+    distance(point, nearest)
+}
+
 fn copper_for_item(board: &BasicBoard, key: ItemKey, layer: i32) -> Option<Copper> {
     let item = board.item(key);
     if !item.is_on_board() {

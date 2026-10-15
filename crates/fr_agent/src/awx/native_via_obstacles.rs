@@ -370,9 +370,19 @@ fn stamp_item_via_cells(
         .unwrap_or(config.clearance);
     let margin = new_diameter as f64 / 2.0 + clearance as f64 + config.extra_clearance as f64;
     let step = config.grid_step;
-    // Source `_add_pad_obstacle`/`_pad_via_keepout_cells` buffers the pad corners
-    // by half a grid step (three quarters once an extra clearance is in force).
-    let corner_buffer_fraction = if config.extra_clearance > 0.0 {
+    // Source pad-corner buffering is retained for normal mode. In opt-in pad-area
+    // contact mode, foreign-pin copper is checked against fixed global-grid via
+    // centers as a circle; the existing radius+clearance margin and final exact
+    // copper DRC remain authoritative, so no trace-edge corner buffer applies.
+    // AWX candidate radius is rounded separately; an odd native diameter does not
+    // exactly match that integer-radius circle, so retain the conservative buffer.
+    let pin_area_mode = board.board.pad_area_contacts()
+        && item.is_pin()
+        && new_diameter > 0
+        && new_diameter % 2 == 0;
+    let corner_buffer_fraction = if pin_area_mode {
+        0.0
+    } else if config.extra_clearance > 0.0 {
         EXTRA_CORNER_BUFFER_FRACTION
     } else {
         REGULAR_CORNER_BUFFER_FRACTION

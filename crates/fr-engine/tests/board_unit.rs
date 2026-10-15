@@ -4,7 +4,7 @@
 use fr_engine::board::*;
 use fr_engine::datastructures::ItemIdGenerator;
 use fr_engine::ids::{FixedState, ItemId};
-use fr_engine::library::{BoardLibrary, Packages, Padstacks};
+use fr_engine::library::{BoardLibrary, PackagePin, Packages, Padstacks};
 use fr_engine::rules::{BoardRules, ClearanceMatrix};
 use fr_engine::structure::{Communication, Components, CoordinateTransform, Layer, LayerStructure, SpecctraParserInfo, Unit};
 use fr_geom::*;
@@ -35,6 +35,61 @@ fn board() -> BasicBoard {
 fn segment(board: &mut BasicBoard, x0: i32, y0: i32, x1: i32, y1: i32, net: i32) -> ItemKey {
     let p = Polyline::from_int_points(&[IntPoint::new(x0, y0), IntPoint::new(x1, y1)]);
     board.insert_trace_without_cleaning(p, 0, 100, &[net], 1, FixedState::Unfixed).unwrap()
+}
+
+fn board_with_pin(pin_nets: &[i32], pad_layer: i32) -> (BasicBoard, ItemKey) {
+    let ls = LayerStructure::new(vec![Layer::new("F.Cu", true), Layer::new("B.Cu", true)]);
+    let matrix = ClearanceMatrix::get_default_instance(&ls, 200);
+    let mut rules = BoardRules::new(ls.clone(), matrix);
+    let class = rules.net_classes.append("default", &ls, false);
+    for name in ["a", "b", "c"] {
+        rules.nets.add(name, 1, false, class);
+    }
+
+    let mut padstacks = Padstacks::new(&ls);
+    let shape = ConvexShape::Circle(Circle::new(IntPoint::new(0, 0), 1000));
+    let padstack = padstacks.add_shape_range(&shape, pad_layer, pad_layer);
+    let mut packages = Packages::new();
+    packages.add(
+        "pkg",
+        vec![PackagePin::new("1", padstack, Vector::ZERO, 0.0)],
+        None,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        true,
+    );
+    let library = BoardLibrary::new(padstacks, packages);
+    let mut components = Components::new();
+    let component = components.add_unnamed(Some(Point::Int(IntPoint::new(5000, 5000))), 0.0, true, 1);
+    let comm = Communication::new(Unit::Mil, 1, Some(SpecctraParserInfo::default()), CoordinateTransform::new(1.0, 0.0, 0.0), ItemIdGenerator::new());
+    let outline = PolylineShape::Tile(TileShape::IntBox(IntBox::new(0, 0, 100_000, 100_000)));
+    let mut board = BasicBoard::new(
+        IntBox::new(-1000, -1000, 101_000, 101_000),
+        ls,
+        vec![outline],
+        1,
+        rules,
+        library,
+        components,
+        comm,
+    );
+    let pin = board.insert_pin(component, 0, pin_nets, 1, FixedState::Unfixed);
+    (board, pin)
+}
+
+fn segment_on_layer(board: &mut BasicBoard, x0: i32, y0: i32, x1: i32, y1: i32, layer: i32, nets: &[i32]) -> ItemKey {
+    let p = Polyline::from_int_points(&[IntPoint::new(x0, y0), IntPoint::new(x1, y1)]);
+    board.insert_trace_without_cleaning(p, layer, 100, nets, 1, FixedState::Unfixed).unwrap()
+}
+
+fn cached_sets_contain_pair(board: &BasicBoard, net: i32, a: ItemKey, b: ItemKey) -> bool {
+    board
+        .get_connected_sets_cached(net)
+        .iter()
+        .any(|set| set.contains(board.item(a).id()) && set.contains(board.item(b).id()))
 }
 
 #[test]
@@ -146,6 +201,62 @@ fn crossing_traces_of_one_net_are_split() {
         let item = b.item(t);
         assert!(item.first_corner() == center || item.last_corner() == center);
     }
+}
+
+#[test]
+fn pad_area_contacts_are_opt_in_and_mode_switch_invalidates_warm_caches() {
+    let (mut b, pin) = board_with_pin(&[1], 0);
+    let trace = segment_on_layer(&mut b, 5500, 5000, 8000, 5000, 0, &[1]);
+    assert!(!b.normal_contacts(trace).contains(b.item(pin).id()));
+    assert!(!cached_sets_contain_pair(&b, 1, trace, pin));
+
+    b.set_pad_area_contacts(true);
+    assert!(cached_sets_contain_pair(&b, 1, trace, pin));
+    b.set_pad_area_contacts(false);
+    assert!(!cached_sets_contain_pair(&b, 1, trace, pin));
+    b.set_pad_area_contacts(true);
+    assert!(cached_sets_contain_pair(&b, 1, trace, pin));
+}
+
+#[test]
+fn pad_area_mode_preserves_centered_multi_net_pin_contacts() {
+    let (mut b, pin) = board_with_pin(&[1, 2], 0);
+    let trace = segment_on_layer(&mut b, 5000, 5000, 8000, 5000, 0, &[1]);
+
+    assert!(b.normal_contacts(trace).contains(b.item(pin).id()));
+    assert!(b.normal_contacts(pin).contains(b.item(trace).id()));
+    assert!(b.connected_set(trace, 1, false).contains(b.item(pin).id()));
+    assert!(b.connected_set(pin, 1, false).contains(b.item(trace).id()));
+
+    b.set_pad_area_contacts(true);
+    assert!(b.normal_contacts(trace).contains(b.item(pin).id()));
+    assert!(b.normal_contacts(pin).contains(b.item(trace).id()));
+    assert!(b.connected_set(trace, 1, false).contains(b.item(pin).id()));
+    assert!(b.connected_set(pin, 1, false).contains(b.item(trace).id()));
+}
+
+#[test]
+fn pad_area_contacts_require_shared_net_and_copper_layer() {
+    let (mut wrong_net, wrong_net_pin) = board_with_pin(&[1], 0);
+    let foreign_trace = segment_on_layer(&mut wrong_net, 5500, 5000, 8000, 5000, 0, &[2]);
+    wrong_net.set_pad_area_contacts(true);
+    assert!(!wrong_net.connected_set(foreign_trace, 2, false).contains(wrong_net.item(wrong_net_pin).id()));
+
+    let (mut wrong_layer, wrong_layer_pin) = board_with_pin(&[1], 0);
+    let back_trace = segment_on_layer(&mut wrong_layer, 5500, 5000, 8000, 5000, 1, &[1]);
+    wrong_layer.set_pad_area_contacts(true);
+    assert!(!wrong_layer.connected_set(back_trace, 1, false).contains(wrong_layer.item(wrong_layer_pin).id()));
+}
+
+#[test]
+fn pad_area_contact_rejects_endpoint_outside_actual_copper() {
+    let (mut b, pin) = board_with_pin(&[1], 0);
+    let trace = segment_on_layer(&mut b, 5900, 5900, 8000, 5900, 0, &[1]);
+    b.set_pad_area_contacts(true);
+
+    assert!(!b.connected_set(trace, 1, false).contains(b.item(pin).id()));
+    assert!(!b.connected_set(pin, 1, false).contains(b.item(trace).id()));
+    assert!(!cached_sets_contain_pair(&b, 1, trace, pin));
 }
 
 /// A board whose padstack 0 is a through via of radius `r` (circle) on both layers.

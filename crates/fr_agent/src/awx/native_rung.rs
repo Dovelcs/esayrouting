@@ -312,11 +312,15 @@ struct GridSearchResult {
     native_config: super::native_obstacles::NativeGridConfig,
     source_cells: Vec<(i32, i32, u8)>,
     target_cells: Vec<(i32, i32, u8)>,
-    /// #479 blocked-terminal seeding: each seeded free on-pad grid cell mapped
-    /// to the pad's exact native Pin-centre endpoint. The route lands on the
-    /// cell (source semantics, geometry unchanged); the centre is the ONLY
-    /// extra same-net connector materialized so native trace contact holds.
+    /// #479 blocked-terminal seeding: each seeded free pad grid cell mapped to
+    /// its exact native Pin centre. Legacy mode adds a same-net connector; the
+    /// opt-in area-contact mode can omit it when native Pin copper contains the
+    /// selected endpoint.
     landing_aliases: BTreeMap<(i32, i32, u8), RungEndpoint>,
+    /// Exact native Pin owner for area contacts enabled by the engine flag.
+    landing_owners: BTreeMap<(i32, i32, u8), fr_engine::board::ItemKey>,
+    pad_area_retry: bool,
+    pad_area_retry_cells: usize,
     /// Source `pcb_data._via_unblock_blame` keystone (single_ended_routing
     /// `2850..2859`): the exact foreign net whose mature Trace/Via copper boxes a
     /// pad when the in-pad tap DECLINED and nothing was in flight yet. Populated
@@ -647,33 +651,15 @@ fn source_grid_search(
         via_clearance_class,
         &sources,
         &targets,
+        PadEndpointSeedingPolicy::PerBlockedEndpoint,
     )
 }
 
-/// The pad's RAW copper cross-section on one native layer, straight from the
-/// endpoint metadata (`copper_shapes`), never a bounding box or a shape-name
-/// guess. Endpoint metadata frequently carries an empty `shape` with
-/// `rect_rotation == 0`, which must NOT make a circle or custom pad masquerade
-/// as a rectangle.
-fn pad_layer_copper<'a>(
-    pad: &'a super::whole_context::ContextPad,
-    layer: &str,
-) -> Vec<&'a super::whole_context::CopperShape> {
-    pad.copper_shapes
-        .iter()
-        .filter(|copper| copper.layer == layer)
-        .map(|copper| &copper.shape)
-        .collect()
-}
-
-/// Source `net_queries.pad_landing_extent` over the ACTUAL layer copper: the
-/// copper inset by `track_width/2` so a whole track cross-section stays inside,
-/// expressed as the region the track centre may occupy. A circle becomes an
-/// inset disc and a non-rotated rounded rectangle an inset rectangle. Rotated
-/// rectangles and custom polygons keep the source EXCLUDE semantics (`None`) and
-/// are never reinterpreted from a bounding box.
+/// The centerline landing region from source `net_queries.pad_landing_extent`:
+/// inset half-dimensions from endpoint metadata, with circles and ovals using
+/// the source ellipse test and every other unrotated shape using a rectangle.
 enum PadLanding {
-    Disc { center: [f64; 2], radius: f64 },
+    Ellipse { center: [f64; 2], half: [f64; 2] },
     Rect { center: [f64; 2], half: [f64; 2] },
 }
 
@@ -683,65 +669,75 @@ fn pad_landing(
     track_width_mm: f64,
 ) -> Option<PadLanding> {
     let inset = track_width_mm / 2.0;
-    match pad_layer_copper(pad, layer).as_slice() {
-        [super::whole_context::CopperShape::Circle { center, radius }] => {
-            let radius = radius - inset;
-            (radius > 0.0).then_some(PadLanding::Disc {
-                center: *center,
-                radius,
-            })
-        }
-        [super::whole_context::CopperShape::RoundedRectangle {
-            center,
-            half_size,
-            rotation,
-            ..
-        }] => {
-            if *rotation != 0.0 {
-                return None;
+    let mut size = pad.size;
+    let mut rect_rotation = pad.rect_rotation;
+    let declared_shape = pad.shape.as_str();
+    let mut shape_is_circle_or_oval = matches!(declared_shape, "circle" | "oval");
+
+    if declared_shape.is_empty() {
+        let layer_shapes = pad
+            .copper_shapes
+            .iter()
+            .filter(|copper| copper.layer == layer)
+            .map(|copper| &copper.shape)
+            .collect::<Vec<_>>();
+        match layer_shapes.as_slice() {
+            [super::whole_context::CopperShape::RoundedRectangle {
+                half_size,
+                rotation,
+                ..
+            }] => {
+                size = [2.0 * half_size[0], 2.0 * half_size[1]];
+                let normalized = resolve_source_pad_rect(size, *rotation);
+                size = normalized.0;
+                rect_rotation = normalized.1;
             }
-            let half = [half_size[0] - inset, half_size[1] - inset];
-            (half[0] > 0.0 && half[1] > 0.0).then_some(PadLanding::Rect {
-                center: *center,
-                half,
-            })
-        }
-        // Custom polygons and ambiguous/multi-shape metadata are excluded
-        // rather than guessed from a bounding box.
-        _ => None,
-    }
-}
-
-/// A same-net bridge from a seeded landing cell to the pad's exact Pin centre is
-/// only emitted when the whole segment stays inside the pad's own layer copper
-/// (`copper_shapes`). This is the source bridge qualification and avoids a fake
-/// contact riding outside the real copper.
-fn bridge_inside_copper(
-    copper: &[&super::whole_context::CopperShape],
-    from_mm: [f64; 2],
-    to_mm: [f64; 2],
-) -> bool {
-    if copper.is_empty() {
-        return false;
-    }
-    for step in 0..=8 {
-        let t = step as f64 / 8.0;
-        let p = [
-            from_mm[0] + (to_mm[0] - from_mm[0]) * t,
-            from_mm[1] + (to_mm[1] - from_mm[1]) * t,
-        ];
-        if !copper.iter().any(|shape| shape.signed_distance(p) <= 0.0) {
-            return false;
+            [super::whole_context::CopperShape::Circle { radius, .. }] => {
+                size = [2.0 * radius, 2.0 * radius];
+                shape_is_circle_or_oval = true;
+            }
+            _ => {}
         }
     }
-    true
+
+    if rect_rotation != 0.0 {
+        return None;
+    }
+    let half = [size[0] / 2.0 - inset, size[1] / 2.0 - inset];
+    if half[0] <= 0.0 || half[1] <= 0.0 {
+        return None;
+    }
+    let center = pad.point;
+    Some(if shape_is_circle_or_oval {
+        PadLanding::Ellipse { center, half }
+    } else {
+        PadLanding::Rect { center, half }
+    })
 }
 
-/// Source `single_ended_routing._free_on_pad_cells` (#479): grid cells on a
-/// pad's own LAYER copper that are FREE for a track on `layer`, keeping the
-/// whole track cross-section inside the real copper. Cell indices are global
-/// board grid cells so the skip cell and obstacle indices match the search map.
-/// `bounds` is the source `bounds` window: seeded cells outside it are dropped.
+/// Port of `kicad_parser._resolve_pad_rect` for one native rectangle's measured
+/// dimensions and rotation, including its orthogonal-angle normalization.
+fn resolve_source_pad_rect(size: [f64; 2], rotation_deg: f64) -> ([f64; 2], f64) {
+    let t = rotation_deg.rem_euclid(180.0);
+    if (t - 90.0).abs() <= 1.0 {
+        return ([size[1], size[0]], 0.0);
+    }
+    if t <= 1.0 || t >= 180.0 - 1.0 {
+        return (size, 0.0);
+    }
+    let global_tilt = (-rotation_deg).rem_euclid(180.0);
+    let rect_rotation = if global_tilt <= 90.0 {
+        global_tilt
+    } else {
+        global_tilt - 180.0
+    };
+    (size, rect_rotation)
+}
+
+/// Source `single_ended_routing._free_on_pad_cells` (#479): free grid cells in
+/// the pad landing region on `layer`. Cell indices are global board grid cells
+/// so the skip cell and obstacle indices match the search map. `bounds` is the
+/// source window: seeded cells outside it are dropped.
 #[allow(clippy::too_many_arguments)]
 fn free_on_pad_cells(
     pad: &super::whole_context::ContextPad,
@@ -758,7 +754,7 @@ fn free_on_pad_cells(
         return Vec::new();
     };
     let (center, extent) = match &landing {
-        PadLanding::Disc { center, radius } => (*center, [*radius, *radius]),
+        PadLanding::Ellipse { center, half } => (*center, *half),
         PadLanding::Rect { center, half } => (*center, *half),
     };
     let step_mm = grid_step_board as f64 / units_per_mm;
@@ -782,8 +778,10 @@ fn free_on_pad_cells(
             if (cy - center[1]).abs() > extent[1] {
                 continue;
             }
-            if let PadLanding::Disc { center, radius } = &landing {
-                if (cx - center[0]).powi(2) + (cy - center[1]).powi(2) > radius * radius {
+            if let PadLanding::Ellipse { center, half } = &landing {
+                let dx = (cx - center[0]) / half[0].max(1e-9);
+                let dy = (cy - center[1]) / half[1].max(1e-9);
+                if dx * dx + dy * dy > 1.0 {
                     continue;
                 }
             }
@@ -797,6 +795,234 @@ fn free_on_pad_cells(
         }
     }
     cells
+}
+
+/// Free global grid cells whose native points lie in the actual Pin copper.
+/// The bounding box only limits enumeration; `Shape::contains` is the copper test.
+#[allow(clippy::too_many_arguments)]
+fn free_on_pad_area_cells(
+    owner: fr_engine::board::ItemKey,
+    layer_index: usize,
+    obstacles: &GridObstacleMap,
+    board: &BoardAdapter,
+    grid_step_board: i32,
+    skip_cell: Option<(i32, i32)>,
+    bounds: (i32, i32, i32, i32),
+    net: NetNo,
+    layer: &str,
+) -> Vec<(i32, i32)> {
+    let pin = board.board.item(owner);
+    let layer_no = board.board.layer_structure.get_no(layer);
+    if !pin.is_pin()
+        || !pin.is_on_board()
+        || pin.net_numbers().len() != 1
+        || pin.net_numbers()[0] != net
+        || layer_no < 0
+        || !pin.is_on_layer(&board.board, layer_no)
+    {
+        return Vec::new();
+    }
+    let Some(shape) = pin.drill_shape_on_layer(&board.board, layer_no) else {
+        return Vec::new();
+    };
+    let bbox = shape.bounding_box();
+    let step = grid_step_board as f64;
+    let (bx0, by0, bx1, by1) = bounds;
+    let gx0 = ((bbox.ll.x as f64 / step).ceil() as i32).max(bx0);
+    let gy0 = ((bbox.ll.y as f64 / step).ceil() as i32).max(by0);
+    let gx1 = ((bbox.ur.x as f64 / step).floor() as i32).min(bx1);
+    let gy1 = ((bbox.ur.y as f64 / step).floor() as i32).min(by1);
+    if gx0 > gx1 || gy0 > gy1 {
+        return Vec::new();
+    }
+    let step_mm = grid_step_board as f64 / board.units_per_mm;
+    let mut cells = Vec::new();
+    for gx in gx0..=gx1 {
+        for gy in gy0..=gy1 {
+            if skip_cell == Some((gx, gy)) || obstacles.is_blocked(gx, gy, layer_index) {
+                continue;
+            }
+            let point_mm = [gx as f64 * step_mm, gy as f64 * step_mm];
+            let Ok(point) = board.point(point_mm) else {
+                continue;
+            };
+            if shape.contains(&point) {
+                cells.push((gx, gy));
+            }
+        }
+    }
+    cells
+}
+
+struct PadAreaLanding {
+    cell: (i32, i32, u8),
+    center: RungEndpoint,
+    owner: fr_engine::board::ItemKey,
+}
+
+/// Area APs are emitted only where one ContextPad row and one exact native Pin
+/// owner identify the same endpoint; ambiguous or unsupported pads stay legacy.
+#[allow(clippy::too_many_arguments)]
+fn area_landing_cells_for_endpoints(
+    endpoints: &[RungEndpoint],
+    pads: &[super::whole_context::ContextPad],
+    net: NetNo,
+    obstacles: &GridObstacleMap,
+    board: &BoardAdapter,
+    route_layers: &[String],
+    grid_step_board: i32,
+    bounds: (i32, i32, i32, i32),
+    only_blocked_centers: bool,
+) -> Vec<PadAreaLanding> {
+    let upm = board.units_per_mm;
+    let native_pads = board.pads();
+    let endpoint_cells = endpoints.iter().filter_map(|endpoint| {
+        let layer = route_layers.iter().position(|name| name == &endpoint.layer)?;
+        let EnginePoint::Int(point) = board.point(endpoint.point).ok()? else {
+            return None;
+        };
+        Some((
+            super::native_obstacles::grid_round(point.x, grid_step_board),
+            super::native_obstacles::grid_round(point.y, grid_step_board),
+            layer as u8,
+        ))
+    }).collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    let mut output = Vec::new();
+    for endpoint in endpoints {
+        let Some(layer_index) = route_layers.iter().position(|name| name == &endpoint.layer) else {
+            continue;
+        };
+        let Ok(EnginePoint::Int(center_point)) = board.point(endpoint.point) else {
+            continue;
+        };
+        let center_cell = (
+            super::native_obstacles::grid_round(center_point.x, grid_step_board),
+            super::native_obstacles::grid_round(center_point.y, grid_step_board),
+        );
+        if only_blocked_centers && !obstacles.is_blocked(center_cell.0, center_cell.1, layer_index) {
+            continue;
+        }
+        let matching = pads.iter().filter(|pad| {
+            pad.net_id == net
+                && pad.layers.contains(&endpoint.layer)
+                && (pad.point[0] - endpoint.point[0]).abs() <= 1e-3
+                && (pad.point[1] - endpoint.point[1]).abs() <= 1e-3
+        }).collect::<Vec<_>>();
+        let [pad] = matching.as_slice() else {
+            continue;
+        };
+        let mut owners = native_pads
+            .iter()
+            .filter(|native| {
+                native.reference == pad.key && native.net == pad.net && native.point == pad.point
+            })
+            .filter_map(|native| native.key)
+            .collect::<Vec<_>>();
+        owners.sort_unstable();
+        owners.dedup();
+        let [owner] = owners.as_slice() else {
+            continue;
+        };
+        let owner = *owner;
+        let pin = board.board.item(owner);
+        let layer_no = board.board.layer_structure.get_no(&endpoint.layer);
+        if !pin.is_pin()
+            || pin.net_numbers().len() != 1
+            || pin.net_numbers()[0] != net
+            || layer_no < 0
+            || !pin.is_on_layer(&board.board, layer_no)
+        {
+            continue;
+        }
+        let center = pin.center(&board.board).to_float();
+        let center_endpoint = RungEndpoint {
+            point: [center.x / upm, center.y / upm],
+            layer: endpoint.layer.clone(),
+        };
+        for (gx, gy) in free_on_pad_area_cells(
+            owner,
+            layer_index,
+            obstacles,
+            board,
+            grid_step_board,
+            Some(center_cell),
+            bounds,
+            net,
+            &endpoint.layer,
+        ) {
+            let cell = (gx, gy, layer_index as u8);
+            if endpoint_cells.contains(&cell) {
+                continue;
+            }
+            if seen.insert((owner, cell)) {
+                output.push(PadAreaLanding {
+                    cell,
+                    center: center_endpoint.clone(),
+                    owner,
+                });
+            }
+        }
+    }
+    output
+}
+
+fn side_has_free_endpoint_cell(
+    endpoints: &[RungEndpoint],
+    obstacles: &GridObstacleMap,
+    board: &BoardAdapter,
+    route_layers: &[String],
+    grid_step_board: i32,
+) -> bool {
+    endpoints.iter().any(|endpoint| {
+        let Some(layer_index) = route_layers.iter().position(|name| name == &endpoint.layer) else {
+            return false;
+        };
+        let Ok(EnginePoint::Int(point)) = board.point(endpoint.point) else {
+            return false;
+        };
+        let gx = super::native_obstacles::grid_round(point.x, grid_step_board);
+        let gy = super::native_obstacles::grid_round(point.y, grid_step_board);
+        !obstacles.is_blocked(gx, gy, layer_index)
+    })
+}
+
+fn merge_pad_area_landings(
+    landings: Vec<PadAreaLanding>,
+    cells: &mut Vec<(i32, i32, u8)>,
+    aliases: &mut BTreeMap<(i32, i32, u8), RungEndpoint>,
+    owners: &mut BTreeMap<(i32, i32, u8), fr_engine::board::ItemKey>,
+) -> Vec<(i32, i32, u8)> {
+    let mut by_cell = BTreeMap::<(i32, i32, u8), PadAreaLanding>::new();
+    let mut ambiguous = BTreeSet::new();
+    for landing in landings {
+        if let Some(existing) = by_cell.get(&landing.cell) {
+            if existing.owner != landing.owner {
+                ambiguous.insert(landing.cell);
+            }
+        } else {
+            by_cell.insert(landing.cell, landing);
+        }
+    }
+    let mut added = Vec::new();
+    let mut present = cells.iter().copied().collect::<BTreeSet<_>>();
+    for (cell, landing) in by_cell {
+        if ambiguous.contains(&cell) {
+            continue;
+        }
+        if aliases.get(&cell).is_some_and(|existing| {
+            existing.layer != landing.center.layer || existing.point != landing.center.point
+        }) {
+            continue;
+        }
+        if present.insert(cell) {
+            cells.push(cell);
+            added.push(cell);
+        }
+        aliases.insert(cell, landing.center);
+        owners.insert(cell, landing.owner);
+    }
+    added
 }
 
 /// Exact native Pin centre for `net` nearest `near_mm`, in board millimetres.
@@ -820,13 +1046,19 @@ fn native_pin_center_mm(board: &BoardAdapter, net: NetNo, near_mm: [f64; 2]) -> 
     best.map(|(_, point)| point)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PadEndpointSeedingPolicy {
+    /// Ordinary source endpoint behavior: augment each blocked pad endpoint.
+    PerBlockedEndpoint,
+    /// Multipoint source behavior: augment only when no endpoint on this side
+    /// has an initially free grid cell.
+    OnlyWhenEntireSideBlocked,
+}
+
 /// Source `single_ended_routing._augment_blocked_pad_terminals` (#479): when a
 /// PAD endpoint's grid cell is hard-blocked -- a foreign keep-out reaching over
-/// the pad centre -- seed the pad's FREE on-copper cells on that layer as extra
-/// endpoint cells, so the route terminates on pad copper instead of failing at
-/// an unsteppable start. No-op for the overwhelmingly common free-cell case.
-/// Returns the extra `(gx, gy, layer)` cells and the landing alias mapping each
-/// seeded cell to the pad's exact native Pin-centre endpoint.
+/// the pad centre -- seed free cells in the pad landing region as extra endpoint
+/// cells. Returns those cells and aliases each to the exact native Pin centre.
 #[allow(clippy::too_many_arguments)]
 fn augment_blocked_pad_terminals(
     endpoints: &[RungEndpoint],
@@ -838,8 +1070,26 @@ fn augment_blocked_pad_terminals(
     track_width_mm: f64,
     grid_step_board: i32,
     bounds: (i32, i32, i32, i32),
+    seeding_policy: PadEndpointSeedingPolicy,
 ) -> Result<(Vec<(i32, i32, u8)>, BTreeMap<(i32, i32, u8), RungEndpoint>), String> {
     let upm = board.units_per_mm;
+    if seeding_policy == PadEndpointSeedingPolicy::OnlyWhenEntireSideBlocked {
+        let has_free_cell = endpoints.iter().any(|endpoint| {
+            let Some(layer_index) = route_layers.iter().position(|name| name == &endpoint.layer)
+            else {
+                return false;
+            };
+            let Ok(EnginePoint::Int(point)) = board.point(endpoint.point) else {
+                return false;
+            };
+            let gx = super::native_obstacles::grid_round(point.x, grid_step_board);
+            let gy = super::native_obstacles::grid_round(point.y, grid_step_board);
+            !obstacles.is_blocked(gx, gy, layer_index)
+        });
+        if has_free_cell {
+            return Ok((Vec::new(), BTreeMap::new()));
+        }
+    }
     let mut extra = Vec::new();
     let mut aliases = BTreeMap::new();
     let mut seen = BTreeSet::<(i64, i64, u8)>::new();
@@ -885,16 +1135,7 @@ fn augment_blocked_pad_terminals(
                         point: native_pin_center_mm(board, net, pad.point).unwrap_or(pad.point),
                         layer: endpoint.layer.clone(),
                     };
-                    // #479 bridge qualification: a seeded landing only counts
-                    // when the same-net connector to the pad's exact Pin centre
-                    // stays inside the pad's own LAYER copper.
-                    let copper = pad_layer_copper(pad, &endpoint.layer);
-                    let step_mm = grid_step_board as f64 / upm;
                     for (cgx, cgy) in free {
-                        let cell_mm = [cgx as f64 * step_mm, cgy as f64 * step_mm];
-                        if !bridge_inside_copper(&copper, cell_mm, center.point) {
-                            continue;
-                        }
                         let cell = (cgx, cgy, layer_index as u8);
                         extra.push(cell);
                         aliases.entry(cell).or_insert_with(|| center.clone());
@@ -907,8 +1148,7 @@ fn augment_blocked_pad_terminals(
     Ok((extra, aliases))
 }
 
-/// Materialize the ONLY extra copper a #479 seeded landing needs: a same-net
-/// full-width connector, strictly inside the pad copper, from the landed grid
+/// Materialize the extra same-net full-width connector from a seeded landing
 /// cell to the pad's exact native Pin centre (the native trace-contact point).
 /// The grid path geometry itself stays untouched at the landing.
 fn push_landing_connector(
@@ -917,7 +1157,15 @@ fn push_landing_connector(
     center: &RungEndpoint,
     board: &BoardAdapter,
     net: NetNo,
+    area_owner: Option<fr_engine::board::ItemKey>,
 ) -> Result<(), String> {
+    if board.board.pad_area_contacts()
+        && area_owner.is_some_and(|owner| {
+            native_pin_area_contains_endpoint(board, owner, landing, center, net)
+        })
+    {
+        return Ok(());
+    }
     if (landing.point[0] - center.point[0]).abs() <= 1e-9
         && (landing.point[1] - center.point[1]).abs() <= 1e-9
     {
@@ -944,6 +1192,68 @@ fn push_landing_connector(
     Ok(())
 }
 
+fn native_pin_area_contains_endpoint(
+    board: &BoardAdapter,
+    owner: fr_engine::board::ItemKey,
+    endpoint: &RungEndpoint,
+    center: &RungEndpoint,
+    net: NetNo,
+) -> bool {
+    if endpoint.layer != center.layer {
+        return false;
+    }
+    let layer = board.board.layer_structure.get_no(&endpoint.layer);
+    if layer < 0 {
+        return false;
+    }
+    let pin = board.board.item(owner);
+    if !pin.is_pin()
+        || !pin.is_on_board()
+        || !pin.is_on_layer(&board.board, layer)
+        || pin.net_numbers().len() != 1
+        || pin.net_numbers()[0] != net
+    {
+        return false;
+    }
+    let (Ok(native_endpoint), Ok(native_center)) =
+        (board.point(endpoint.point), board.point(center.point))
+    else {
+        return false;
+    };
+    if pin.center(&board.board) != native_center {
+        return false;
+    }
+    pin.drill_shape_on_layer(&board.board, layer)
+        .is_some_and(|shape| shape.contains(&native_endpoint))
+}
+
+fn trace_has_area_pin_contact(
+    board: &BoardAdapter,
+    trace_key: fr_engine::board::ItemKey,
+    point: &EnginePoint,
+    net: NetNo,
+    layer: i32,
+) -> bool {
+    if !board.board.pad_area_contacts() {
+        return false;
+    }
+    board
+        .board
+        .trace_pad_area_contacts_at(trace_key, point)
+        .iter()
+        .any(|key| {
+            let pin = board.board.item(key);
+            pin.is_pin()
+                && pin.is_on_board()
+                && pin.is_on_layer(&board.board, layer)
+                && pin.net_numbers().len() == 1
+                && pin.net_numbers()[0] == net
+                && pin
+                    .drill_shape_on_layer(&board.board, layer)
+                    .is_some_and(|shape| shape.contains(point))
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn source_grid_search_with_endpoints(
     request: &RungRequest,
@@ -956,6 +1266,7 @@ fn source_grid_search_with_endpoints(
     via_clearance_class: i32,
     source_endpoints: &[RungEndpoint],
     target_endpoints: &[RungEndpoint],
+    pad_seeding_policy: PadEndpointSeedingPolicy,
 ) -> Result<GridSearchResult, String> {
     if request.route_layers.is_empty() || request.max_iterations == 0 {
         return Err("native AWX grid route needs layers and a positive budget".into());
@@ -1147,31 +1458,89 @@ fn source_grid_search_with_endpoints(
     // fully stamped map, in source `route_net_with_obstacles` order: augment
     // endpoints -> endpoint_exempt -> allowed rects -> source/target override.
     let bounds = (gx0, gy0, gx1, gy1);
-    let (extra_sources, mut landing_aliases) = augment_blocked_pad_terminals(
-        source_endpoints,
-        &request.same_net_pads,
-        request.net_id,
-        &obstacles,
-        board,
-        &request.route_layers,
-        request.rules.track_width,
-        grid_step_board,
-        bounds,
-    )?;
+    let pad_area_mode = board.board.pad_area_contacts();
+    let (extra_sources, mut landing_aliases) = if pad_area_mode {
+        (Vec::new(), BTreeMap::new())
+    } else {
+        augment_blocked_pad_terminals(
+            source_endpoints,
+            &request.same_net_pads,
+            request.net_id,
+            &obstacles,
+            board,
+            &request.route_layers,
+            request.rules.track_width,
+            grid_step_board,
+            bounds,
+            pad_seeding_policy,
+        )?
+    };
     source_cells.extend(extra_sources);
-    let (extra_targets, target_aliases) = augment_blocked_pad_terminals(
-        target_endpoints,
-        &request.same_net_pads,
-        request.net_id,
-        &obstacles,
-        board,
-        &request.route_layers,
-        request.rules.track_width,
-        grid_step_board,
-        bounds,
-    )?;
+    let mut landing_owners = BTreeMap::new();
+    if pad_area_mode
+        && (pad_seeding_policy == PadEndpointSeedingPolicy::PerBlockedEndpoint
+            || !side_has_free_endpoint_cell(
+                source_endpoints,
+                &obstacles,
+                board,
+                &request.route_layers,
+                grid_step_board,
+            ))
+    {
+        let area = area_landing_cells_for_endpoints(
+            source_endpoints,
+            &request.same_net_pads,
+            request.net_id,
+            &obstacles,
+            board,
+            &request.route_layers,
+            grid_step_board,
+            bounds,
+            true,
+        );
+        merge_pad_area_landings(area, &mut source_cells, &mut landing_aliases, &mut landing_owners);
+    }
+    let (extra_targets, target_aliases) = if pad_area_mode {
+        (Vec::new(), BTreeMap::new())
+    } else {
+        augment_blocked_pad_terminals(
+            target_endpoints,
+            &request.same_net_pads,
+            request.net_id,
+            &obstacles,
+            board,
+            &request.route_layers,
+            request.rules.track_width,
+            grid_step_board,
+            bounds,
+            pad_seeding_policy,
+        )?
+    };
     targets.extend(extra_targets);
     landing_aliases.extend(target_aliases);
+    if pad_area_mode
+        && (pad_seeding_policy == PadEndpointSeedingPolicy::PerBlockedEndpoint
+            || !side_has_free_endpoint_cell(
+                target_endpoints,
+                &obstacles,
+                board,
+                &request.route_layers,
+                grid_step_board,
+            ))
+    {
+        let area = area_landing_cells_for_endpoints(
+            target_endpoints,
+            &request.same_net_pads,
+            request.net_id,
+            &obstacles,
+            board,
+            &request.route_layers,
+            grid_step_board,
+            bounds,
+            true,
+        );
+        merge_pad_area_landings(area, &mut targets, &mut landing_aliases, &mut landing_owners);
+    }
     let exempt_radius = (((request.rules.track_width + request.rules.clearance) * upm)
         / grid_step_board as f64) as i32;
     let exempt_positions = source_cells
@@ -1216,6 +1585,93 @@ fn source_grid_search_with_endpoints(
         grid_step_mm,
     );
     let mut iterations = attempt.iterations;
+    let mut pad_area_retry = false;
+    let mut pad_area_retry_cells = 0usize;
+    if pad_area_mode && attempt.path.is_none() && !request.deadline.is_some_and(|d| Instant::now() >= d) {
+        let source_area = area_landing_cells_for_endpoints(
+            source_endpoints,
+            &request.same_net_pads,
+            request.net_id,
+            &obstacles,
+            board,
+            &request.route_layers,
+            grid_step_board,
+            bounds,
+            false,
+        );
+        let target_area = area_landing_cells_for_endpoints(
+            target_endpoints,
+            &request.same_net_pads,
+            request.net_id,
+            &obstacles,
+            board,
+            &request.route_layers,
+            grid_step_board,
+            bounds,
+            false,
+        );
+        if !request.deadline.is_some_and(|d| Instant::now() >= d) {
+        let extra_sources = merge_pad_area_landings(
+            source_area,
+            &mut source_cells,
+            &mut landing_aliases,
+            &mut landing_owners,
+        );
+        let extra_targets = merge_pad_area_landings(
+            target_area,
+            &mut targets,
+            &mut landing_aliases,
+            &mut landing_owners,
+        );
+        pad_area_retry_cells = extra_sources.len() + extra_targets.len();
+        if pad_area_retry_cells > 0 {
+            pad_area_retry = true;
+            let endpoint_positions = source_cells
+                .iter()
+                .chain(&targets)
+                .map(|&(x, y, _)| (x, y))
+                .collect::<Vec<_>>();
+            obstacles.set_endpoint_exempt(endpoint_positions, exempt_radius);
+            for &(x, y, _) in extra_sources.iter().chain(&extra_targets) {
+                obstacles.add_allowed_rect(
+                    x.saturating_sub(allow_radius).max(gx0),
+                    y.saturating_sub(allow_radius).max(gy0),
+                    x.saturating_add(allow_radius).min(gx1),
+                    y.saturating_add(allow_radius).min(gy1),
+                );
+            }
+            for &(x, y, layer) in extra_sources.iter().chain(&extra_targets) {
+                obstacles.add_source_target_cell(x, y, layer as usize);
+            }
+            let previous = attempt;
+            let mut retry = source_route_attempt(
+                &router,
+                &obstacles,
+                &source_cells,
+                &targets,
+                request.max_iterations,
+                0,
+                request.rules.via_drill,
+                request.rules.hole_to_hole_clearance,
+                grid_step_mm,
+            );
+            iterations += retry.iterations;
+            retry.iterations = iterations;
+            retry.forward_iterations += previous.forward_iterations;
+            retry.backward_iterations += previous.backward_iterations;
+            retry.frontier.extend(previous.frontier);
+            retry.forward_frontier.extend(previous.forward_frontier);
+            retry.backward_frontier.extend(previous.backward_frontier);
+            retry.frontier.sort_unstable();
+            retry.frontier.dedup();
+            retry.forward_frontier.sort_unstable();
+            retry.forward_frontier.dedup();
+            retry.backward_frontier.sort_unstable();
+            retry.backward_frontier.dedup();
+            attempt = retry;
+        }
+        }
+    }
     let forward_probe_iterations = attempt.forward_probe_iterations;
     let backward_probe_iterations = attempt.backward_probe_iterations;
     let mut registered_via_sizes = BTreeMap::new();
@@ -1279,6 +1735,9 @@ fn source_grid_search_with_endpoints(
         source_cells,
         target_cells: targets,
         landing_aliases,
+        landing_owners,
+        pad_area_retry,
+        pad_area_retry_cells,
         via_unblock_blame: BTreeSet::new(),
     })
 }
@@ -2194,13 +2653,27 @@ fn execute_single(
         through_hole_positions: &through_hole_positions,
     })?;
     // #479: for a seeded blocked-pad landing, bridge the landed cell to the
-    // pad's exact native Pin centre with a same-net full-width connector that
-    // stays inside the pad copper. The grid geometry itself stays land-exact.
+    // exact native Pin centre with a same-net full-width connector. Final
+    // geometry acceptance still checks connectivity and DRC.
     if let Some(center) = outcome.landing_aliases.get(&path_start) {
-        push_landing_connector(&mut geometry, &start, center, &trial, request.net_id)?;
+        push_landing_connector(
+            &mut geometry,
+            &start,
+            center,
+            &trial,
+            request.net_id,
+            outcome.landing_owners.get(&path_start).copied(),
+        )?;
     }
     if let Some(center) = outcome.landing_aliases.get(&path_end) {
-        push_landing_connector(&mut geometry, &target, center, &trial, request.net_id)?;
+        push_landing_connector(
+            &mut geometry,
+            &target,
+            center,
+            &trial,
+            request.net_id,
+            outcome.landing_owners.get(&path_end).copied(),
+        )?;
     }
     let source_trace_ids = request
         .board
@@ -2216,18 +2689,19 @@ fn execute_single(
     // trace end that sits in the same-net pin/via copper but not exactly at the
     // centre is physically connected yet not contact-connected. Bridge only the
     // traces this transaction just added (difference against the source board),
-    // to the exact drill centre, width clamped to the room inside the pad's
-    // copper. Previously existing source/runtime traces are never rescanned or
-    // modified.
+    // at the owner trace's full width. Final DRC and connectivity checks decide
+    // whether the connector can be accepted.
     let new_trace_ids = trial
         .board
         .get_traces()
         .into_iter()
         .filter(|key| !source_trace_ids.contains(key))
         .collect::<Vec<_>>();
-    let _bridges = trial
-        .board
-        .bridge_trace_ends_to_drill_centers_for(&new_trace_ids);
+    let _bridges = bridge_welded_trace_ends_to_drill_centers(
+        &mut trial,
+        &new_trace_ids,
+        request.net_id,
+    );
     if let Err(e) = trial.assert_invariants(&request.board, &BTreeSet::new(), true) {
         return Ok(refused(&format!("native rung board delta invalid: {e}")));
     }
@@ -2344,7 +2818,8 @@ fn endpoint_for_grid_cell(
 /// path's actual arrival layer; the existing tap materialization and stub
 /// copper complete the pad connection. A seeded landing resolves to the ACTUAL
 /// landing endpoint at the selected grid cell (NOT the pad centre -- that would
-/// drag source geometry); its native Pin-centre bridge is materialized later.
+/// drag source geometry); contact completion is decided after native ownership
+/// is resolved.
 fn endpoint_for_path_terminal(
     net: NetNo,
     candidates: &[RungEndpoint],
@@ -2432,8 +2907,8 @@ fn materialize_grid_geometry(
 }
 
 /// Bridge endpoints of the provided transaction-created traces to same-net
-/// pin or via centres only when the clamped-width bridge fits inside the
-/// native drill item's actual copper shape on that layer.
+/// pin or via centres at the owner trace's full width. Final DRC and
+/// connectivity checks decide whether the connector can be accepted.
 fn bridge_welded_trace_ends_to_drill_centers(
     board: &mut BoardAdapter,
     split_pieces: &[fr_engine::board::ItemKey],
@@ -2473,6 +2948,9 @@ fn bridge_welded_trace_ends_to_drill_centers(
                 let item = board.board.item(contact);
                 item.is_pin() || item.is_via()
             }) {
+                continue;
+            }
+            if trace_has_area_pin_contact(board, key, &end, net, layer) {
                 continue;
             }
             let candidates = board.board.pick_items(&end, layer, None);
@@ -2525,15 +3003,6 @@ fn bridge_welded_trace_ends_to_drill_centers(
                 }) {
                     break;
                 }
-                let center_float = center.to_float();
-                let end_float = end.to_float();
-                let room = shape
-                    .border_distance(&center_float)
-                    .min(shape.border_distance(&end_float));
-                let bridge_half_width = half_width.min(room.floor() as i32);
-                if bridge_half_width <= 0 {
-                    continue;
-                }
                 if !bridges.iter().any(|(a, b, bridge_layer, ..)| {
                     *bridge_layer == layer
                         && ((*a == end && *b == center) || (*a == center && *b == end))
@@ -2542,7 +3011,7 @@ fn bridge_welded_trace_ends_to_drill_centers(
                         end.clone(),
                         center,
                         layer,
-                        bridge_half_width,
+                        half_width,
                         nets.clone(),
                         clearance_class,
                         fixed_state,
@@ -3121,6 +3590,11 @@ fn route_multilayer_endpoint_sets_inner(
     let (mut trial, control, _) = {
         prepare_control(&request)?
     };
+    let pad_seeding_policy = if request.stage.starts_with("multipoint_") {
+        PadEndpointSeedingPolicy::OnlyWhenEntireSideBlocked
+    } else {
+        PadEndpointSeedingPolicy::PerBlockedEndpoint
+    };
     let mut outcome = {
         source_grid_search_with_endpoints(
             &request,
@@ -3133,6 +3607,7 @@ fn route_multilayer_endpoint_sets_inner(
             class,
             &starts,
             &targets,
+            pad_seeding_policy,
         )?
     };
     let mut report = serde_json::json!({"expanded":outcome.iterations,"path_cells":outcome.path.as_ref().map_or(0,Vec::len),"accepted":false});
@@ -3153,6 +3628,9 @@ fn route_multilayer_endpoint_sets_inner(
             "backward_iterations": outcome.backward_iterations,
             "sources_cell_count": outcome.source_cells.len(),
             "targets_cell_count": outcome.target_cells.len(),
+            "pad_area_contacts_enabled": trial.board.pad_area_contacts(),
+            "pad_area_retry": outcome.pad_area_retry,
+            "pad_area_retry_cells": outcome.pad_area_retry_cells,
             "window_board": [outcome.window.ll.x, outcome.window.ll.y, outcome.window.ur.x, outcome.window.ur.y],
             "grid_step_board": outcome.grid_step_board,
             "early_frontier_exhausted_below_probe_budget": outcome.path.is_none() && (outcome.forward_probe_iterations < 5_000 || outcome.backward_probe_iterations < 5_000),
@@ -3564,13 +4042,28 @@ fn route_multilayer_endpoint_sets_inner(
         "segments": geometry.segments.iter().map(|s| serde_json::json!({"start_mm":s.start_mm,"end_mm":s.end_mm,"layer":s.layer,"width_mm":s.width_mm})).collect::<Vec<_>>(),
         "vias": geometry.vias.iter().map(|v| serde_json::json!({"point_mm":v.point_mm,"from_layer":v.from_layer,"to_layer":v.to_layer})).collect::<Vec<_>>(),
     });
-    // #479: bridge a seeded blocked-pad landing to the pad's exact native Pin
-    // centre (same-net, inside the pad copper); grid geometry stays land-exact.
+    // #479: bridge a seeded blocked-pad landing to the exact native Pin centre
+    // with a same-net full-width connector; final acceptance checks connectivity
+    // and DRC. Grid geometry stays land-exact.
     if let Some(center) = outcome.landing_aliases.get(&path_start) {
-        push_landing_connector(&mut geometry, &start, center, &trial, net)?;
+        push_landing_connector(
+            &mut geometry,
+            &start,
+            center,
+            &trial,
+            net,
+            outcome.landing_owners.get(&path_start).copied(),
+        )?;
     }
     if let Some(center) = outcome.landing_aliases.get(&path_end) {
-        push_landing_connector(&mut geometry, &target, center, &trial, net)?;
+        push_landing_connector(
+            &mut geometry,
+            &target,
+            center,
+            &trial,
+            net,
+            outcome.landing_owners.get(&path_end).copied(),
+        )?;
     }
     // Commit the kept unblock copper, then the grid geometry, so the landed
     // board carries the tapped vias the retry actually reached (#803).
@@ -3589,9 +4082,9 @@ fn route_multilayer_endpoint_sets_inner(
     // trace end that sits in the same-net pin/via copper but not exactly at the
     // centre is physically connected yet not contact-connected. Bridge only the
     // traces this transaction just added (difference against the source board),
-    // to the exact drill centre, width clamped to the room inside the pad's
-    // copper. Previously existing source/runtime traces are never rescanned or
-    // modified.
+    // at the owner trace's full width. Final DRC and connectivity checks decide
+    // whether the connector can be accepted. Previously existing source/runtime
+    // traces are never rescanned or modified.
     let new_trace_ids = trial
         .board
         .get_traces()
@@ -4488,10 +4981,10 @@ fn weld_island_tap_endpoint(
     )))
 }
 
-/// Insert a same-net copper bridge from a newly selected split point to a
-/// real pin/via centre when the point lies inside that item's true drill-layer
-/// copper shape. The bridge stays wholly inside the pad and is no wider than
-/// either the owner trace or the room available at both ends.
+/// Insert a same-net full-width bridge from a newly selected split point to a
+/// real pin/via centre when both endpoints lie inside that item's true
+/// drill-layer copper shape. Final DRC and connectivity checks decide whether
+/// the connector can be accepted.
 fn bridge_welded_point_to_drill_center(
     board: &mut BoardAdapter,
     owner: fr_engine::board::ItemKey,
@@ -4505,6 +4998,9 @@ fn bridge_welded_point_to_drill_center(
     let nets = trace.net_numbers().to_vec();
     let clearance_class = trace.clearance_class();
     let contacts = board.board.trace_normal_contacts_at(owner, point, false);
+    if trace_has_area_pin_contact(board, owner, point, net, layer) {
+        return None;
+    }
     let pads = board
         .board
         .get_pins()
@@ -4530,15 +5026,6 @@ fn bridge_welded_point_to_drill_center(
         {
             continue;
         }
-        let center_float = center.to_float();
-        let point_float = point.to_float();
-        let room = shape
-            .border_distance(&center_float)
-            .min(shape.border_distance(&point_float));
-        let bridge_half_width = half_width.min(room.floor() as i32);
-        if bridge_half_width <= 0 {
-            continue;
-        }
         if contacts.iter().any(|contact| {
             let item = board.board.item(contact);
             if !item.is_trace()
@@ -4556,7 +5043,7 @@ fn bridge_welded_point_to_drill_center(
         return board.board.insert_trace_without_cleaning(
             Polyline::from_two_points(point, &center),
             layer,
-            bridge_half_width,
+            half_width,
             &nets,
             clearance_class,
             fixed_state,

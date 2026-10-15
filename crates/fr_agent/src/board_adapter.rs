@@ -3,7 +3,7 @@ use crate::{
     spec::{ChannelRegion, NetRule, RouteSpec},
 };
 use fr_engine::{
-    board::{connectivity::clear_connected_sets_cache, BasicBoard, ItemKey, JavaVariant, RoutingBoard, TreeKind},
+    board::{connectivity::clear_connected_sets_cache, BasicBoard, ItemKey, ItemKind, JavaVariant, RoutingBoard, TreeKind},
     drc::clearance_violation::{clearance_violations, ClearanceViolation},
     ids::{FixedState, NetNo},
     library::BoardLibrary,
@@ -35,6 +35,7 @@ struct ValidationBaselineWitness {
     java_variant: JavaVariant,
     stitching_vias: bool,
     awx_same_net_via_pad_contact: bool,
+    pad_area_contacts: bool,
 }
 
 impl ValidationBaselineWitness {
@@ -57,6 +58,7 @@ impl ValidationBaselineWitness {
             java_variant: board.java_variant,
             stitching_vias: board.stitching_vias,
             awx_same_net_via_pad_contact: adapter.awx_same_net_via_pad_contact,
+            pad_area_contacts: board.pad_area_contacts(),
         }
     }
 
@@ -78,6 +80,7 @@ impl ValidationBaselineWitness {
             && self.java_variant == board.java_variant
             && self.stitching_vias == board.stitching_vias
             && self.awx_same_net_via_pad_contact == adapter.awx_same_net_via_pad_contact
+            && self.pad_area_contacts == board.pad_area_contacts()
     }
 }
 
@@ -1019,6 +1022,161 @@ impl BoardAdapter {
         }
         result
     }
+    /// Exact-copper DRC additions relative to `before`, excluding only a
+    /// redundant full-width center bridge into an unchanged source pad when
+    /// the same owner/other pin pair already violated clearance at baseline.
+    pub fn new_violations_since(
+        &self,
+        before: &BoardAdapter,
+    ) -> BTreeSet<(i32, i32, i32, u64, u64)> {
+        let baseline = cached_baseline_violations(before);
+        let after = self.violations_for_scan();
+        let mut added = after.difference(&baseline).copied().collect::<BTreeSet<_>>();
+        if self.board.rules.get_hole_clearance() > 0
+            || before.board.rules.get_hole_clearance() > 0
+            || added.is_empty()
+        {
+            return added;
+        }
+
+        let after_items = self
+            .board
+            .get_items()
+            .into_iter()
+            .map(|key| (self.board.item(key).id().0, key))
+            .collect::<BTreeMap<_, _>>();
+        let before_items = before
+            .board
+            .get_items()
+            .into_iter()
+            .map(|key| (before.board.item(key).id().0, key))
+            .collect::<BTreeMap<_, _>>();
+        let additions = added.iter().copied().collect::<Vec<_>>();
+        for entry @ (_, _, layer, expected_bits, _) in additions {
+            let (Some(&first), Some(&second)) =
+                (after_items.get(&entry.0), after_items.get(&entry.1))
+            else {
+                continue;
+            };
+            let first_item = self.board.item(first);
+            let second_item = self.board.item(second);
+            let (trace, other_pin) = if first_item.is_trace() && second_item.is_pin() {
+                (first, second)
+            } else if second_item.is_trace() && first_item.is_pin() {
+                (second, first)
+            } else {
+                continue;
+            };
+            if self.center_bridge_pair_is_baseline_proven(
+                before,
+                trace,
+                other_pin,
+                layer,
+                f64::from_bits(expected_bits),
+                &baseline,
+                &before_items,
+            ) {
+                added.remove(&entry);
+            }
+        }
+        added
+    }
+
+    fn center_bridge_pair_is_baseline_proven(
+        &self,
+        before: &BoardAdapter,
+        trace_key: ItemKey,
+        other_pin_key: ItemKey,
+        layer: i32,
+        expected_clearance: f64,
+        baseline_violations: &BTreeSet<(i32, i32, i32, u64, u64)>,
+        before_items: &BTreeMap<i32, ItemKey>,
+    ) -> bool {
+        if before.board.rules.get_hole_clearance() > 0
+            || self.board.rules.get_hole_clearance() > 0
+            || !other_pin_key_is_unchanged(self, before, other_pin_key, before_items)
+        {
+            return false;
+        }
+        let trace = self.board.item(trace_key);
+        let other_pin = self.board.item(other_pin_key);
+        if !trace.is_trace()
+            || !trace.is_on_board()
+            || trace.net_numbers().len() != 1
+            || !other_pin.is_pin()
+            || other_pin.net_numbers().len() != 1
+            || trace.net_numbers()[0] == other_pin.net_numbers()[0]
+        {
+            return false;
+        }
+        let endpoints = [trace.first_corner(), trace.last_corner()];
+        let mut owners = BTreeSet::new();
+        for endpoint in endpoints {
+            for owner_key in self.board.pick_items(&endpoint, layer, None).iter() {
+                let owner = self.board.item(owner_key);
+                if owner.is_pin()
+                    && owner.is_on_layer(&self.board, layer)
+                    && owner.center(&self.board) == endpoint
+                    && owner.net_numbers() == trace.net_numbers()
+                    && owner_key != other_pin_key
+                {
+                    owners.insert(owner_key);
+                }
+            }
+        }
+        for owner_key in owners {
+            if !crate::copper_clearance::contained_pad_center_bridge(
+                &self.board,
+                trace_key,
+                owner_key,
+                layer,
+            ) {
+                continue;
+            }
+            if !other_pin_key_is_unchanged(self, before, owner_key, before_items) {
+                continue;
+            }
+            let Some(before_owner) = matching_baseline_pin(self, before, owner_key, before_items)
+            else {
+                continue;
+            };
+            let Some(before_other) = matching_baseline_pin(self, before, other_pin_key, before_items)
+            else {
+                continue;
+            };
+            if before_owner == before_other {
+                continue;
+            }
+            let layer_name = self
+                .board
+                .layer_structure
+                .layers
+                .get(layer as usize)
+                .map(|layer| layer.name.as_str());
+            let Some(before_layer) = layer_name.map(|name| before.board.layer_structure.get_no(name))
+            else {
+                continue;
+            };
+            if before_layer < 0 {
+                continue;
+            }
+            let owner_id = before.board.item(before_owner).id().0;
+            let other_id = before.board.item(before_other).id().0;
+            let pair = (owner_id.min(other_id), owner_id.max(other_id));
+            let has_baseline_pin_pair = baseline_violations.iter().any(
+                |(a, b, old_layer, expected_bits, _)| {
+                    (*a, *b) == pair
+                        && *old_layer == before_layer
+                        && f64::from_bits(*expected_bits) >= expected_clearance
+                },
+            );
+            if has_baseline_pin_pair {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Clearance violations with item identity replaced by canonical geometry
     /// signatures, so SES replay can compare inherited violations after re-ID.
     pub fn session_violations(&self) -> BTreeSet<String> {
@@ -1027,10 +1185,64 @@ impl BoardAdapter {
     /// Stable clearance violations newly introduced since a source snapshot,
     /// applying only this replay's explicitly authorized drill enrichment.
     pub fn new_session_violations_since(&self, before: &BoardAdapter) -> BTreeSet<String> {
-        self.session_violations()
+        let mut added = self
+            .session_violations()
             .difference(&self.session_violations_for(before, true))
             .cloned()
-            .collect()
+            .collect::<BTreeSet<_>>();
+        if self.board.rules.get_hole_clearance() > 0
+            || before.board.rules.get_hole_clearance() > 0
+            || added.is_empty()
+        {
+            return added;
+        }
+        let baseline = cached_baseline_violations(before);
+        let before_items = before
+            .board
+            .get_items()
+            .into_iter()
+            .map(|key| (before.board.item(key).id().0, key))
+            .collect::<BTreeMap<_, _>>();
+        for trace_key in self.board.get_traces() {
+            for violation in clearance_violations(&self.board, trace_key) {
+                if !retain_clearance_candidate(
+                    &self.board,
+                    &violation,
+                    self.awx_same_net_via_pad_contact,
+                ) {
+                    continue;
+                }
+                let first = self.board.item(violation.first_item);
+                let second = self.board.item(violation.second_item);
+                let (trace, other_pin) =
+                    if first.is_trace() && second.is_pin() {
+                        (violation.first_item, violation.second_item)
+                    } else if second.is_trace() && first.is_pin() {
+                        (violation.second_item, violation.first_item)
+                    } else {
+                        continue;
+                    };
+                let signature = self.session_violation_signature(
+                    self,
+                    &violation,
+                    false,
+                );
+                if added.contains(&signature)
+                    && self.center_bridge_pair_is_baseline_proven(
+                        before,
+                        trace,
+                        other_pin,
+                        violation.layer,
+                        violation.expected_clearance,
+                        &baseline,
+                        &before_items,
+                    )
+                {
+                    added.remove(&signature);
+                }
+            }
+        }
+        added
     }
     fn session_violations_for(
         &self,
@@ -1050,46 +1262,36 @@ impl BoardAdapter {
                 )
             })
             .map(|violation| {
-                let mut items = [
-                    session_item_signature(
-                        &source.board,
-                        source.board.item(violation.first_item),
-                        allow_trusted_drill_upgrade
-                            .then(|| {
-                                self.authorized_drill_upgrade(
-                                    source,
-                                    source.board.item(violation.first_item),
-                                )
-                            })
-                            .flatten(),
-                    ),
-                    session_item_signature(
-                        &source.board,
-                        source.board.item(violation.second_item),
-                        allow_trusted_drill_upgrade
-                            .then(|| {
-                                self.authorized_drill_upgrade(
-                                    source,
-                                    source.board.item(violation.second_item),
-                                )
-                            })
-                            .flatten(),
-                    ),
-                ];
-                items.sort();
-                let layer = source.board.layer_structure.layers[violation.layer as usize]
-                    .name
-                    .clone();
-                format!(
-                    "{}|{}|{}|{:016x}|{:016x}",
-                    items[0],
-                    items[1],
-                    layer,
-                    violation.expected_clearance.to_bits(),
-                    violation.actual_clearance.to_bits()
-                )
+                self.session_violation_signature(source, &violation, allow_trusted_drill_upgrade)
             })
             .collect()
+    }
+    fn session_violation_signature(
+        &self,
+        source: &BoardAdapter,
+        violation: &ClearanceViolation,
+        allow_trusted_drill_upgrade: bool,
+    ) -> String {
+        let signature = |key| {
+            let item = source.board.item(key);
+            let authorized = allow_trusted_drill_upgrade
+                .then(|| self.authorized_drill_upgrade(source, item))
+                .flatten();
+            session_item_signature(&source.board, item, authorized)
+        };
+        let mut items = [signature(violation.first_item), signature(violation.second_item)];
+        items.sort();
+        let layer = source.board.layer_structure.layers[violation.layer as usize]
+            .name
+            .clone();
+        format!(
+            "{}|{}|{}|{:016x}|{:016x}",
+            items[0],
+            items[1],
+            layer,
+            violation.expected_clearance.to_bits(),
+            violation.actual_clearance.to_bits()
+        )
     }
     pub fn connectivity(&self) -> BTreeMap<String, Vec<Vec<i32>>> {
         self.board
@@ -1263,10 +1465,7 @@ impl BoardAdapter {
         if protected_original != protected_actual {
             return Err("protected copper changed or acquired new geometry".into());
         }
-        if !self
-            .session_violations()
-            .is_subset(&self.session_violations_for(before, true))
-        {
+        if !self.new_session_violations_since(before).is_empty() {
             return Err("new full-board clearance violation".into());
         }
         let previous = before.connectivity();
@@ -1457,10 +1656,7 @@ impl BoardAdapter {
         if protected_copper_found {
             return Err("protected net acquired new copper".into());
         }
-        let after_violations = self.violations_for_scan();
-        let before_violations = cached_baseline_violations(before);
-        let has_new_violation = !after_violations.is_subset(&before_violations);
-        if has_new_violation {
+        if !self.new_violations_since(before).is_empty() {
             return Err("new full-board clearance violation".into());
         }
         let previous = cached_baseline_connectivity(before);
@@ -1828,6 +2024,72 @@ fn session_item_signature(
         item.clearance_class()
     )
 }
+
+fn stable_pin_identity(board: &RoutingBoard, item: &fr_engine::board::Item) -> Option<String> {
+    let ItemKind::Pin(pin) = &item.kind else {
+        return None;
+    };
+    let component_no = item.component_no();
+    if component_no <= 0 || component_no > board.components.count() {
+        return None;
+    }
+    let component = board.components.get(component_no);
+    let package = board.library.packages.get(component.get_package());
+    Some(format!("{}-{}", component.name, package.get_pin(pin.pin_index)?.name))
+}
+
+fn matching_baseline_pin(
+    current: &BoardAdapter,
+    before: &BoardAdapter,
+    current_key: ItemKey,
+    before_items: &BTreeMap<i32, ItemKey>,
+) -> Option<ItemKey> {
+    let current_item = current.board.item(current_key);
+    if !current_item.is_pin() || !current_item.is_on_board() {
+        return None;
+    }
+    let identity = stable_pin_identity(&current.board, current_item)?;
+    let signature = session_item_signature(&current.board, current_item, None);
+    let unchanged = |before_key: ItemKey| {
+        let before_item = before.board.item(before_key);
+        before_item.is_pin()
+            && before_item.is_on_board()
+            && before_item.center(&before.board) == current_item.center(&current.board)
+            && stable_pin_identity(&before.board, before_item).as_deref() == Some(identity.as_str())
+            && session_item_signature(&before.board, before_item, None) == signature
+    };
+
+    if let Some(before_key) = before_items.get(&current_item.id().0).copied() {
+        if unchanged(before_key) {
+            return Some(before_key);
+        }
+    }
+
+    let mut matching = None;
+    for before_key in before.board.get_pins() {
+        let item = before.board.item(before_key);
+        if stable_pin_identity(&before.board, item).as_deref() != Some(identity.as_str()) {
+            continue;
+        }
+        if !unchanged(before_key) {
+            continue;
+        }
+        if matching.replace(before_key).is_some() {
+            return None;
+        }
+    }
+    matching
+}
+
+fn other_pin_key_is_unchanged(
+    current: &BoardAdapter,
+    before: &BoardAdapter,
+    current_key: ItemKey,
+    before_items: &BTreeMap<i32, ItemKey>,
+) -> bool {
+    matching_baseline_pin(current, before, current_key, before_items).is_some()
+}
+
 fn via_physical_signature(
     board: &RoutingBoard,
     item: &fr_engine::board::Item,

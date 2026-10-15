@@ -32,6 +32,7 @@ use crate::{
         endpoint_recovery::{try_source_ripup, RecoveryState, RipAccepted},
         fab_rules::{EscalationPolicy, FabTier},
         native_rung::route_multilayer_endpoint_sets_in_run,
+        net_rescue::{plan_rescue, RescuePlan},
         net_multipoint::{plan_native_multipoint, MultipointPlan, MultipointTerminal},
         whole_context::RoutingRules,
     },
@@ -59,6 +60,113 @@ use std::{
 /// Source `route_multipoint_main` main-edge attempt bound.
 const MAX_MAIN_ATTEMPTS: usize = 8;
 const RECORD_BEST_FULLCHECK_EVERY: u64 = 64;
+
+#[derive(Clone)]
+struct RescueComponent {
+    group: ItemSet,
+    pin_count: usize,
+    tie_id: i32,
+    points: Vec<[f64; 2]>,
+    candidates: Vec<RungEndpoint>,
+}
+
+fn rescue_components(
+    board: &BoardAdapter,
+    net: NetNo,
+    route_layers: &[(i32, String)],
+) -> Vec<RescueComponent> {
+    let mut components = board
+        .board
+        .get_connected_sets(net)
+        .into_iter()
+        .map(|group| {
+            let mut ids: Vec<i32> = group
+                .iter()
+                .map(|key| board.board.item(key).id().0)
+                .collect();
+            ids.sort_unstable();
+            let pin_count = group
+                .iter()
+                .filter(|key| board.board.item(*key).is_pin())
+                .count();
+            RescueComponent {
+                group: group.clone(),
+                tie_id: ids.first().copied().unwrap_or(i32::MAX),
+                pin_count,
+                points: rescue_component_points(board, &group),
+                candidates: connected_group_candidates(board, &group, route_layers),
+            }
+        })
+        .collect::<Vec<_>>();
+    components.retain(|component| {
+        component.pin_count > 0 && !component.points.is_empty() && !component.candidates.is_empty()
+    });
+    components.sort_by_key(|component| component.tie_id);
+    components
+}
+
+fn rescue_component_points(board: &BoardAdapter, group: &ItemSet) -> Vec<[f64; 2]> {
+    let mm = |point: Point| {
+        let exact = point.to_float();
+        [exact.x / board.units_per_mm, exact.y / board.units_per_mm]
+    };
+    let mut points = Vec::new();
+    // Source ordering: pad centers, member segment endpoints, then via centers.
+    for member in group.iter().filter(|key| board.board.item(*key).is_pin()) {
+        points.push(mm(board.board.item(member).center(&board.board)));
+    }
+    for member in group.iter().filter(|key| board.board.item(*key).is_trace()) {
+        let item = board.board.item(member);
+        points.push(mm(item.first_corner()));
+        points.push(mm(item.last_corner()));
+    }
+    for member in group.iter().filter(|key| board.board.item(*key).is_via()) {
+        points.push(mm(board.board.item(member).center(&board.board)));
+    }
+    points
+}
+
+fn rescue_pair(a: &[[f64; 2]], b: &[[f64; 2]]) -> Option<(f64, [f64; 2], [f64; 2])> {
+    let sample = |points: &[[f64; 2]]| {
+        if points.len() > 300 {
+            let step = points.len() / 300 + 1;
+            points.iter().step_by(step).copied().collect()
+        } else {
+            points.to_vec()
+        }
+    };
+    let a = sample(a);
+    let b = sample(b);
+    let mut best: Option<(f64, [f64; 2], [f64; 2])> = None;
+    for from in &a {
+        for to in &b {
+            let distance = (to[0] - from[0]).hypot(to[1] - from[1]);
+            // Preserve the first equal-distance pair, matching the source's
+            // strict-minimum traversal over its ordered point lists.
+            let replace = best
+                .as_ref()
+                .map_or(true, |(best_distance, _, _)| distance < *best_distance);
+            if replace {
+                best = Some((distance, *from, *to));
+            }
+        }
+    }
+    best
+}
+
+fn rescue_midpoint_key(a: [f64; 2], b: [f64; 2]) -> (i64, i64) {
+    (
+        (((a[0] + b[0]) * 50.0).round_ties_even()) as i64,
+        (((a[1] + b[1]) * 50.0).round_ties_even()) as i64,
+    )
+}
+
+fn point_in_rescue_window(point: [f64; 2], window: [f64; 4]) -> bool {
+    point[0] >= window[0]
+        && point[0] <= window[2]
+        && point[1] >= window[1]
+        && point[1] <= window[3]
+}
 
 pub fn endpoint_pad_metadata(
     board: &BoardAdapter,
@@ -249,6 +357,32 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PadAccess {
+    Legacy,
+    CopperArea,
+}
+
+impl Default for PadAccess {
+    fn default() -> Self {
+        Self::CopperArea
+    }
+}
+
+impl PadAccess {
+    fn uses_copper_area(self) -> bool {
+        matches!(self, Self::CopperArea)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::CopperArea => "copper_area",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EndpointJob {
@@ -256,12 +390,15 @@ struct EndpointJob {
     output: String,
     log: String,
     budget_ms: u64,
+    #[serde(default = "default_grid_step_mm")]
     grid_step_mm: f64,
     max_iterations: usize,
     threads: usize,
     via_drill_mm: f64,
     min_annular_ring_mm: f64,
     hole_to_hole_clearance_mm: f64,
+    #[serde(default)]
+    pad_access: PadAccess,
     #[serde(default)]
     protected_nets: BTreeSet<String>,
 }
@@ -276,6 +413,7 @@ struct ResidualJob {
     #[serde(default)]
     nets: Vec<String>,
     budget_ms: u64,
+    #[serde(default = "default_grid_step_mm")]
     grid_step_mm: f64,
     max_iterations: usize,
     threads: usize,
@@ -283,7 +421,13 @@ struct ResidualJob {
     min_annular_ring_mm: f64,
     hole_to_hole_clearance_mm: f64,
     #[serde(default)]
+    pad_access: PadAccess,
+    #[serde(default)]
     protected_nets: BTreeSet<String>,
+}
+
+fn default_grid_step_mm() -> f64 {
+    crate::awx::routing_defaults::CONNECTION_GRID_STEP_MM
 }
 
 fn rules_for_layer(
@@ -854,11 +998,31 @@ impl Driver<'_> {
         targets: &[RungEndpoint],
         route_layers: &[(i32, String)],
     ) -> Result<(Option<BoardAdapter>, Option<RungReport>), String> {
+        self.route_endpoint_set_with_plan(
+            board, net, name, stage, from_item, to_item, starts, targets, route_layers, None,
+        )
+    }
+
+    /// Same native endpoint route with an optional exact scoped rescue plan.
+    #[allow(clippy::too_many_arguments)]
+    fn route_endpoint_set_with_plan(
+        &mut self,
+        board: &BoardAdapter,
+        net: NetNo,
+        name: &str,
+        stage: &str,
+        from_item: ItemKey,
+        to_item: ItemKey,
+        starts: &[RungEndpoint],
+        targets: &[RungEndpoint],
+        route_layers: &[(i32, String)],
+        rescue: Option<&RescuePlan>,
+    ) -> Result<(Option<BoardAdapter>, Option<RungReport>), String> {
         let route_started = Instant::now();
         if starts.is_empty() || targets.is_empty() {
             return Ok((None, None));
         }
-        let request = build_endpoint_request(
+        let mut request = build_endpoint_request(
             board,
             &self.ctx,
             net,
@@ -868,6 +1032,17 @@ impl Driver<'_> {
             targets[0].clone(),
             route_layers,
         )?;
+        if let Some(plan) = rescue {
+            request.rules.grid_step = plan.grid_step_mm;
+            request.max_iterations = plan.max_iterations;
+            request.spec.margin = 0.0;
+            request.window_points = Some(vec![
+                [plan.window_mm[0], plan.window_mm[1]],
+                [plan.window_mm[2], plan.window_mm[1]],
+                [plan.window_mm[2], plan.window_mm[3]],
+                [plan.window_mm[0], plan.window_mm[3]],
+            ]);
+        }
         let mut event = serde_json::json!({"event":"attempt_start","net":name,"stage":stage,
             "from_item":board.board.item(from_item).id().0,"to_item":board.board.item(to_item).id().0,
             "start":starts[0].point,"end":targets[0].point,
@@ -1195,6 +1370,196 @@ impl Driver<'_> {
                 return Ok(false);
             }
         }
+    }
+
+    /// Last-chance exact-nominal-geometry rescue. This pass has no rip-up
+    /// authority and only commits a route that joins its selected native
+    /// components while reducing the authoritative incomplete count.
+    fn fine_grid_rescue(
+        &mut self,
+        board: &mut BoardAdapter,
+        nets: &[(NetNo, String)],
+    ) -> Result<serde_json::Value, String> {
+        let mut ordered = nets.to_vec();
+        ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let mut summaries = serde_json::Map::new();
+        for (net, name) in ordered {
+            if self.protected.contains(&name) {
+                continue;
+            }
+            let route_layers = net_route_layers(board, net);
+            if route_layers.is_empty() {
+                let remaining = NetIncompletes::new(
+                    &board.board,
+                    net,
+                    &board.board.get_connectable_items(net),
+                )
+                .count();
+                if remaining > 0 {
+                    summaries.insert(
+                        name,
+                        serde_json::json!({"attempted":0,"accepted":0,"remaining":remaining,"grids_mm":[]}),
+                    );
+                }
+                continue;
+            }
+            let mut attempts = 0usize;
+            let mut accepted = 0usize;
+            let mut failed_gaps = BTreeSet::new();
+            let mut grids = Vec::new();
+            while attempts < crate::awx::routing_defaults::RESCUE_MAX_EDGES_PER_NET
+                && Instant::now() < self.ctx.deadline
+            {
+                let live = NetIncompletes::new(
+                    &board.board,
+                    net,
+                    &board.board.get_connectable_items(net),
+                );
+                if live.count() == 0 {
+                    break;
+                }
+                let components = rescue_components(board, net, &route_layers);
+                if components.len() < 2 {
+                    break;
+                }
+                let main_index = components
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        b.pin_count
+                            .cmp(&a.pin_count)
+                            .then_with(|| a.tie_id.cmp(&b.tie_id))
+                    })
+                    .map(|(index, _)| index)
+                    .ok_or("rescue has no eligible component")?;
+                let main = &components[main_index];
+                let mut gaps = Vec::new();
+                for (island_index, island) in components.iter().enumerate() {
+                    if island_index == main_index {
+                        continue;
+                    }
+                    let Some((distance, from, to)) = rescue_pair(&main.points, &island.points)
+                    else {
+                        continue;
+                    };
+                    let key = rescue_midpoint_key(from, to);
+                    if !failed_gaps.contains(&key) {
+                        gaps.push((distance, island.tie_id, key, from, to, island.clone()));
+                    }
+                }
+                // Python's stable distance-only sort preserves component order
+                // for equal gaps; our component order is deterministic by id.
+                gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let Some((_distance, _tie_id, key, from, to, island)) = gaps.into_iter().next()
+                else {
+                    break;
+                };
+                let plan = plan_rescue(
+                    self.ctx.grid_step_mm,
+                    self.ctx.max_iterations,
+                    from,
+                    to,
+                )?;
+                attempts += 1;
+                if !grids.contains(&plan.grid_step_mm) {
+                    grids.push(plan.grid_step_mm);
+                }
+                let starts: Vec<_> = main
+                    .candidates
+                    .iter()
+                    .filter(|endpoint| point_in_rescue_window(endpoint.point, plan.window_mm))
+                    .cloned()
+                    .collect();
+                let targets: Vec<_> = island
+                    .candidates
+                    .iter()
+                    .filter(|endpoint| point_in_rescue_window(endpoint.point, plan.window_mm))
+                    .cloned()
+                    .collect();
+                let intended_endpoints_in_window = point_in_rescue_window(from, plan.window_mm)
+                    && point_in_rescue_window(to, plan.window_mm)
+                    && starts.iter().any(|point| point.point == from)
+                    && targets.iter().any(|point| point.point == to);
+                if !intended_endpoints_in_window || starts.is_empty() || targets.is_empty() {
+                    failed_gaps.insert(key);
+                    continue;
+                }
+                let from_item = main
+                    .group
+                    .iter()
+                    .find(|key| board.board.item(*key).is_pin())
+                    .ok_or("rescue source group has no pin")?;
+                let to_item = island
+                    .group
+                    .iter()
+                    .find(|key| board.board.item(*key).is_pin())
+                    .ok_or("rescue target group has no pin")?;
+                let before_count = live.count();
+                let (candidate, _frontier) = self.route_endpoint_set_with_plan(
+                    board,
+                    net,
+                    &name,
+                    "fine_grid_rescue",
+                    from_item,
+                    to_item,
+                    &starts,
+                    &targets,
+                    &route_layers,
+                    Some(&plan),
+                )?;
+                let Some(candidate) = candidate else {
+                    failed_gaps.insert(key);
+                    continue;
+                };
+                let intended_groups_merged = candidate
+                    .board
+                    .connected_set(from_item, net, false)
+                    .contains(candidate.board.item(to_item).id());
+                let after_count = NetIncompletes::new(
+                    &candidate.board,
+                    net,
+                    &candidate.board.get_connectable_items(net),
+                )
+                .count();
+                if !intended_groups_merged || after_count >= before_count {
+                    failed_gaps.insert(key);
+                    continue;
+                }
+                if candidate
+                    .assert_invariants(self.baseline, self.protected, true)
+                    .is_err()
+                {
+                    failed_gaps.insert(key);
+                    continue;
+                }
+                *board = candidate;
+                self.accepted += 1;
+                accepted += 1;
+                self.record_best(board, &[net])?;
+                // Accepted merges invalidate the prior failed-pair set only
+                // through new component geometry; historical failed keys stay
+                // fenced exactly as in the source loop.
+            }
+            let remaining = NetIncompletes::new(
+                &board.board,
+                net,
+                &board.board.get_connectable_items(net),
+            )
+            .count();
+            if attempts > 0 || remaining > 0 {
+                grids.sort_by(f64::total_cmp);
+                summaries.insert(
+                    name,
+                    serde_json::json!({
+                        "attempted":attempts,
+                        "accepted":accepted,
+                        "remaining":remaining,
+                        "grids_mm":grids,
+                    }),
+                );
+            }
+        }
+        Ok(serde_json::Value::Object(summaries))
     }
 
     /// Source phase-3 tap pass for one pending multipoint net (source
@@ -1998,6 +2363,9 @@ pub fn run(path: &Path) -> Result<(), String> {
     let input = fs::read(&input_path).map_err(|e| e.to_string())?;
     let mut board = BoardAdapter::load(&input)?;
     board.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
+    board
+        .board
+        .set_pad_area_contacts(job.pad_access.uses_copper_area());
     let (free_via_pads, same_net_pads) =
         endpoint_pad_metadata(&board, job.hole_to_hole_clearance_mm > 0.0)?;
     let baseline = board.clone();
@@ -2156,13 +2524,36 @@ pub fn run(path: &Path) -> Result<(), String> {
         driver.incomplete_total = total;
         driver.count_witness = IncompleteCountWitness::new(&board);
     }
+    let full_live_count_before_rescue =
+        fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+    if full_live_count_before_rescue != driver.incomplete_total {
+        return Err(format!(
+            "record_best count disagrees after best-board restore: cached={}, full={full_live_count_before_rescue}",
+            driver.incomplete_total
+        ));
+    }
+    let fine_grid_rescue = driver.fine_grid_rescue(&mut board, &nets)?;
+    let final_board_incompletes =
+        fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+    if final_board_incompletes != driver.incomplete_total {
+        return Err(format!(
+            "record_best final count disagrees after fine-grid rescue: cached={}, full={final_board_incompletes}",
+            driver.incomplete_total
+        ));
+    }
     let record_best_final_check = serde_json::json!({
-        "full_live_count":final_live_incompletes,
-        "driver_count_before_restore":final_live_cached_total,
-        "final_diff":final_live_diff,
-        "best_board_restored":best_board_restored,
-        "driver_count_scope":if best_board_restored {"best_board_after_sync"} else {"live_board"},
+        "full_live_count":final_board_incompletes,
         "driver_count_after_restore":driver.incomplete_total,
+        "final_diff":i64::from(final_board_incompletes) - i64::from(driver.incomplete_total),
+        "driver_count_scope":"final_board_after_rescue",
+        "full_live_count_before_rescue":full_live_count_before_rescue,
+        "driver_count_before_restore":final_live_cached_total,
+        "live_final_diff_before_rescue":final_live_diff,
+        "best_board_restored":best_board_restored,
+        "driver_count_scope_before_rescue":if best_board_restored {"best_board_after_sync"} else {"live_board"},
+        "driver_count_after_restore_and_rescue":driver.incomplete_total,
+        "full_final_count_after_rescue":final_board_incompletes,
+        "final_diff_after_rescue":i64::from(final_board_incompletes) - i64::from(driver.incomplete_total),
     });
 
     board.assert_invariants(&baseline, &job.protected_nets, true)?;
@@ -2200,6 +2591,9 @@ pub fn run(path: &Path) -> Result<(), String> {
         BoardAdapter::load_session_with_via_candidates(&input, &session, &replay_candidates)?;
 
     replay.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
+    replay
+        .board
+        .set_pad_area_contacts(job.pad_access.uses_copper_area());
     replay.assert_session_invariants(&baseline, &job.protected_nets, true)?;
 
     let session_replay_new_violations = replay.new_session_violations_since(&baseline).len();
@@ -2220,21 +2614,21 @@ pub fn run(path: &Path) -> Result<(), String> {
     let attempts = driver.attempts;
     let accepted = driver.accepted;
     let skips = driver.skips;
-    let new_violations = board
-        .violations()
-        .difference(&baseline.violations())
-        .count();
+    let new_violations = board.new_violations_since(&baseline).len();
 
     let legacy_wall_seconds = started.elapsed().as_secs_f64();
     let final_unconnected =
         final_unconnected_inventory(&board, &nets, &attempts, &skips, &driver.retry_counts);
     let report = serde_json::json!({
         "actual_solver":"awx_grid::GridRouter","scope":"all native incompletes; active signal stack and native via transitions",
+        "pad_access":job.pad_access.as_str(),
+        "grid_step_mm":job.grid_step_mm,
         "scheduler":"native NetIncompletes Delaunay/Kruskal airlines; recomputed after each accepted transaction",
         "whole_bga_bus_stages":"not applicable: flattened component identity",
         "budget_ms":job.budget_ms,"requested_threads":job.threads,"effective_threads":1,
         "parallel_policy":"serial board transactions","wall_seconds":legacy_wall_seconds,
         "record_best_final_check":record_best_final_check,
+        "fine_grid_rescue":fine_grid_rescue,
         "final_unconnected_nets":final_unconnected,
         "before_incompletes":before,"after_incompletes":fr_engine::pipeline::stats::incomplete_count(&board.board,None),
         "session_replay_incompletes":fr_engine::pipeline::stats::incomplete_count(&replay.board,None),
@@ -2302,6 +2696,9 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
     let session_input = fs::read(&session_path).map_err(|e| e.to_string())?;
     let mut dsn_board = BoardAdapter::load(&input)?;
     dsn_board.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
+    dsn_board
+        .board
+        .set_pad_area_contacts(job.pad_access.uses_copper_area());
     let replay_layer = dsn_board
         .board
         .layer_structure
@@ -2330,6 +2727,9 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
     let mut board =
         BoardAdapter::load_session_with_via_candidates(&input, &session_input, &via_candidates)?;
     board.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
+    board
+        .board
+        .set_pad_area_contacts(job.pad_access.uses_copper_area());
     let (free_via_pads, same_net_pads) =
         endpoint_pad_metadata(&board, job.hole_to_hole_clearance_mm > 0.0)?;
     let baseline = board.clone();
@@ -2531,6 +2931,9 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
     let mut replay =
         BoardAdapter::load_session_with_via_candidates(&input, &session, &via_candidates)?;
     replay.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
+    replay
+        .board
+        .set_pad_area_contacts(job.pad_access.uses_copper_area());
     replay.assert_session_invariants(&baseline, &job.protected_nets, true)?;
     replay.assert_session_invariants(&board, &job.protected_nets, true)?;
     let replay_new_violations = replay.new_session_violations_since(&baseline).len();
@@ -2592,12 +2995,13 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
         .collect();
     let complete = after_by_net.values().all(|count| *count == 0);
     let output = serde_json::json!({"scope":"frozen initial residual airlines only","nets":if selected.is_empty(){"all".to_string()}else{job.nets.join(",")},
+        "pad_access":job.pad_access.as_str(),
         "initial_net_incompletes":initial_by_net,"after_net_incompletes":after_by_net,
         "routing_complete":complete,"success":complete,
         "record_best_final_check":{"full_count":final_board_incompletes,"driver_count":driver.incomplete_total,"final_diff":final_diff},
         "ses_replay_net_incompletes":replay_by_net,
         "ses_replay_new_violations":replay_new_violations,
-        "accepted":driver.accepted,"budget_ms":job.budget_ms,"requested_threads":job.threads,"effective_threads":1,
+        "accepted":driver.accepted,"grid_step_mm":job.grid_step_mm,"budget_ms":job.budget_ms,"requested_threads":job.threads,"effective_threads":1,
         "elapsed_seconds":started.elapsed().as_secs_f64(),"gap_outcomes":outcomes,
         "attempts":driver.attempts,"frozen_initial_airline_count":initial_gaps.len(),
         "net_skips":net_skips,
@@ -2609,4 +3013,52 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
         serde_json::to_string_pretty(&output).map_err(|e| e.to_string())?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod pad_access_tests {
+    use super::{EndpointJob, PadAccess, ResidualJob};
+
+    fn endpoint_job_toml(pad_access: Option<&str>) -> String {
+        let pad_access = pad_access
+            .map(|mode| format!("pad_access = \"{mode}\"\n"))
+            .unwrap_or_default();
+        format!(
+            "input = \"board.dsn\"\noutput = \"routed.ses\"\nlog = \"routing.jsonl\"\nbudget_ms = 300000\ngrid_step_mm = 0.05\nmax_iterations = 200000\nthreads = 1\nvia_drill_mm = 0.3\nmin_annular_ring_mm = 0.1\nhole_to_hole_clearance_mm = 0\n{pad_access}protected_nets = []\n"
+        )
+    }
+
+    fn residual_job_toml(pad_access: Option<&str>) -> String {
+        let pad_access = pad_access
+            .map(|mode| format!("pad_access = \"{mode}\"\n"))
+            .unwrap_or_default();
+        format!(
+            "input = \"board.dsn\"\nsession = \"routed.ses\"\noutput = \"residual.ses\"\nlog = \"residual.json\"\nnets = []\nbudget_ms = 300000\ngrid_step_mm = 0.05\nmax_iterations = 200000\nthreads = 1\nvia_drill_mm = 0.3\nmin_annular_ring_mm = 0.1\nhole_to_hole_clearance_mm = 0\n{pad_access}protected_nets = []\n"
+        )
+    }
+
+    #[test]
+    fn endpoint_and_residual_jobs_default_to_copper_area() {
+        let endpoint: EndpointJob = toml::from_str(&endpoint_job_toml(None)).unwrap();
+        let residual: ResidualJob = toml::from_str(&residual_job_toml(None)).unwrap();
+
+        assert!(matches!(endpoint.pad_access, PadAccess::CopperArea));
+        assert!(matches!(residual.pad_access, PadAccess::CopperArea));
+    }
+
+    #[test]
+    fn endpoint_job_accepts_explicit_legacy_mode() {
+        let endpoint: EndpointJob =
+            toml::from_str(&endpoint_job_toml(Some("legacy"))).unwrap();
+
+        assert!(matches!(endpoint.pad_access, PadAccess::Legacy));
+    }
+
+    #[test]
+    fn residual_job_accepts_explicit_copper_area_mode() {
+        let residual: ResidualJob =
+            toml::from_str(&residual_job_toml(Some("copper_area"))).unwrap();
+
+        assert!(matches!(residual.pad_access, PadAccess::CopperArea));
+    }
 }

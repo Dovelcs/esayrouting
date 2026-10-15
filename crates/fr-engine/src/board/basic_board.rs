@@ -86,6 +86,9 @@ pub struct BasicBoard {
     /// fastroute: pins and vias of a net whose copper overlaps on a common layer are in contact
     /// (Freerouting requires equal centers). See [`Self::set_overlap_contacts`].
     pub(crate) overlap_contacts: bool,
+    /// fastroute: same-net trace endpoints inside a pin's copper are electrical contacts for
+    /// connected-set grouping, without changing normal trace contacts.
+    pub(crate) pad_area_contacts: bool,
     /// fastroute: the fanout's fallback to the board's default vias only takes vias of the
     /// net's own via clearance class (see `RoutingBoard::fanout`).
     pub fallback_vias_own_class: bool,
@@ -147,6 +150,19 @@ impl BasicBoard {
         self.items.touch_global();
     }
 
+    /// Enable same-net trace-endpoint contacts anywhere inside a pin's copper shape when
+    /// computing electrical connected sets. Normal contacts used by routing geometry are
+    /// unchanged.
+    pub fn set_pad_area_contacts(&mut self, on: bool) {
+        self.pad_area_contacts = on;
+        self.items.touch_global();
+    }
+
+    /// Whether connected-set grouping recognizes trace endpoints inside pin copper.
+    pub fn pad_area_contacts(&self) -> bool {
+        self.pad_area_contacts
+    }
+
     /// Java `new BasicBoard(boundingBox, layerStructure, outlineShapes, outlineClClassNo, rules,
     /// communication)`. The library and components are passed in here (Java creates empty ones
     /// that the loader fills). Inserts the outline.
@@ -181,6 +197,7 @@ impl BasicBoard {
             autoroute_maintenance: None,
             java_variant: JavaVariant::Source,
             overlap_contacts: false,
+            pad_area_contacts: false,
             fallback_vias_own_class: false,
             stitching_vias: false,
             stitching_via_ids: HashSet::new(),

@@ -1,4 +1,6 @@
 //! Complete AWX port in progress; unfinished stages reject execution explicitly.
+pub(crate) mod routing_defaults;
+pub(crate) mod net_rescue;
 pub mod conflict_groups;
 pub mod corridor;
 pub mod cp_model;

@@ -1,0 +1,11 @@
+input = "board.dsn"
+output = "routed.ses"
+log = "routing.jsonl"
+budget_ms = 300000
+grid_step_mm = 0.05
+max_iterations = 200000
+threads = 1
+via_drill_mm = 0.3
+min_annular_ring_mm = 0.1
+hole_to_hole_clearance_mm = 0
+protected_nets = []

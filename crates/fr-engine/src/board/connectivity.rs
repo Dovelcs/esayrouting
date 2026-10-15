@@ -25,6 +25,10 @@ thread_local! {
 }
 
 thread_local! {
+    static PAD_AREA_CONTACTS: RefCell<ContactsCache> = RefCell::new(ContactsCache::default());
+}
+
+thread_local! {
     static CONNECTED_SETS: RefCell<BTreeMap<NetNo, Vec<ConnectedSetsMemo>>> = RefCell::new(BTreeMap::new());
 }
 
@@ -46,6 +50,7 @@ struct ConnectedSetsWitness {
     tree_clearance_class: i32,
     java_variant: super::basic_board::JavaVariant,
     overlap_contacts: bool,
+    pad_area_contacts: bool,
     stitching_vias: bool,
     members: Vec<ConnectedSetsMemberWitness>,
 }
@@ -137,6 +142,7 @@ impl ConnectedSetsWitness {
             tree_clearance_class: tree.compensated_clearance_class_no,
             java_variant: board.java_variant,
             overlap_contacts: board.overlap_contacts,
+            pad_area_contacts: board.pad_area_contacts,
             stitching_vias: board.stitching_vias,
             members,
         })
@@ -159,6 +165,7 @@ impl ConnectedSetsWitness {
             && self.tree_clearance_class == current.tree_clearance_class
             && self.java_variant == current.java_variant
             && self.overlap_contacts == current.overlap_contacts
+            && self.pad_area_contacts == current.pad_area_contacts
             && self.stitching_vias == current.stitching_vias
             && self.members.len() == current.members.len()
             && self.members.iter().zip(&current.members).all(|(old, new)| {
@@ -173,6 +180,7 @@ impl ConnectedSetsWitness {
 /// Clear per-net connected-set results between validation runs.
 pub fn clear_connected_sets_cache() {
     CONNECTED_SETS.with(|cache| cache.borrow_mut().clear());
+    PAD_AREA_CONTACTS.with(|cache| *cache.borrow_mut() = ContactsCache::default());
 }
 
 /// Per thread cache of normal contacts for the last few board contents (keyed by the epochs of
@@ -250,6 +258,132 @@ impl BasicBoard {
             }
         }
         result
+    }
+
+    /// Same-net electrical contacts from a trace endpoint inside a pin's real copper shape.
+    /// This is intentionally separate from normal contacts: routing geometry and pull-tight
+    /// continue to require the exact pin center unless a caller opts into pad-area grouping.
+    pub fn trace_pad_area_contacts_at(&self, key: ItemKey, point: &Point) -> ItemSet {
+        let mut result = ItemSet::new();
+        if !self.pad_area_contacts {
+            return result;
+        }
+        let trace = self.item(key);
+        if !trace.is_trace() {
+            return result;
+        }
+        let candidates = self.all_contacts(key, Some(trace.trace().layer));
+        for candidate in candidates.iter() {
+            if self.trace_end_in_pin_copper(key, candidate, point) {
+                let pin = self.item(candidate);
+                result.insert(pin.id(), candidate);
+            }
+        }
+        result
+    }
+
+    fn trace_end_in_pin_copper(&self, trace_key: ItemKey, pin_key: ItemKey, point: &Point) -> bool {
+        if !self.pad_area_contacts {
+            return false;
+        }
+        let trace = self.item(trace_key);
+        if !trace.is_trace() || !trace.is_on_board() || trace.trace().half_width <= 0 {
+            return false;
+        }
+        if !(*point == trace.first_corner() || *point == trace.last_corner()) {
+            return false;
+        }
+        let pin = self.item(pin_key);
+        if !self.supports_pad_area_pair(trace, pin) {
+            return false;
+        }
+        let layer = trace.trace().layer;
+        pin.is_on_layer(self, layer)
+            && pin
+                .drill_shape_on_layer(self, layer)
+                .is_some_and(|shape| shape.contains(point))
+    }
+
+    /// Whether the opt-in pad-area rule supports this trace/pin net pair. Keep this separate
+    /// from the copper containment check so unsupported multi-net items retain legacy contacts.
+    fn supports_pad_area_pair(&self, trace: &Item, pin: &Item) -> bool {
+        matches!(trace.kind, ItemKind::Trace(_))
+            && matches!(pin.kind, ItemKind::Pin(_))
+            && trace.is_on_board()
+            && trace.trace().half_width > 0
+            && pin.is_on_board()
+            && trace.net_numbers().len() == 1
+            && trace.net_numbers()[0] > 0
+            && pin.net_numbers().len() == 1
+            && pin.net_numbers()[0] == trace.net_numbers()[0]
+    }
+
+    /// Contacts used only by electrical connected-set grouping. The optional pad-area mode adds
+    /// symmetric trace-end-to-pin copper contacts while preserving normal-contact behavior.
+    fn electrical_contacts_keys(&self, key: ItemKey) -> Rc<[ItemKey]> {
+        if !self.pad_area_contacts {
+            return self.normal_contacts_keys(key);
+        }
+        let epochs = (self.items.epoch(), self.default_tree().item_epoch());
+        if let Some(hit) = PAD_AREA_CONTACTS.with(|cache| cache.borrow_mut().get(epochs, key)) {
+            if verify_caches() {
+                let fresh = self.electrical_contacts_uncached(key);
+                assert_eq!(&fresh[..], &hit[..], "pad-area contacts cache out of date");
+            }
+            return hit;
+        }
+        let contacts = self.electrical_contacts_uncached(key);
+        PAD_AREA_CONTACTS.with(|cache| cache.borrow_mut().put(epochs, key, contacts.clone()));
+        contacts
+    }
+
+    fn electrical_contacts_uncached(&self, key: ItemKey) -> Rc<[ItemKey]> {
+        let mut result = ItemSet::new();
+        let item = self.item(key);
+        for &contact in self.normal_contacts_keys(key).iter() {
+            let other = self.item(contact);
+            let keep = match (&item.kind, &other.kind) {
+                (ItemKind::Trace(_), ItemKind::Pin(_)) => {
+                    !self.supports_pad_area_pair(item, other)
+                        || [item.first_corner(), item.last_corner()]
+                            .iter()
+                            .any(|endpoint| self.trace_end_in_pin_copper(key, contact, endpoint))
+                }
+                (ItemKind::Pin(_), ItemKind::Trace(_)) => {
+                    !self.supports_pad_area_pair(other, item)
+                        || [other.first_corner(), other.last_corner()]
+                            .iter()
+                            .any(|endpoint| self.trace_end_in_pin_copper(contact, key, endpoint))
+                }
+                _ => true,
+            };
+            if keep {
+                result.insert(other.id(), contact);
+            }
+        }
+        match &item.kind {
+            ItemKind::Trace(_) => {
+                for endpoint in [item.first_corner(), item.last_corner()] {
+                    result.extend_from(&self.trace_pad_area_contacts_at(key, &endpoint));
+                }
+            }
+            ItemKind::Pin(_) => {
+                for candidate in self.all_contacts(key, None).iter() {
+                    if !self.item(candidate).is_trace() {
+                        continue;
+                    }
+                    let candidate_item = self.item(candidate);
+                    for endpoint in [candidate_item.first_corner(), candidate_item.last_corner()] {
+                        if self.trace_end_in_pin_copper(candidate, key, &endpoint) {
+                            result.insert(candidate_item.id(), candidate);
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        result.iter().collect::<Vec<_>>().into()
     }
 
     /// Java `Trace.getStartContacts()`.
@@ -459,7 +593,7 @@ impl BasicBoard {
         }
         result.insert(this.id(), key);
         // iterative version of getConnectedSetRecu
-        let mut stack: Vec<(Rc<[ItemKey]>, usize)> = vec![(self.normal_contacts_keys(key), 0)];
+        let mut stack: Vec<(Rc<[ItemKey]>, usize)> = vec![(self.electrical_contacts_keys(key), 0)];
         if self.is_stitching_via(key) {
             stack.push((self.stitching_via_contacts(key, net_number), 0));
         }
@@ -478,7 +612,7 @@ impl BasicBoard {
                 continue;
             }
             if result.insert(c.id(), contact) {
-                stack.push((self.normal_contacts_keys(contact), 0));
+                stack.push((self.electrical_contacts_keys(contact), 0));
                 if self.is_stitching_via(contact) {
                     stack.push((self.stitching_via_contacts(contact, net_number), 0));
                 }

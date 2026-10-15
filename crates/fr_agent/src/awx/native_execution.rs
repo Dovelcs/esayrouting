@@ -308,9 +308,8 @@ pub fn grade(
             open.push(name.clone());
         }
     }
-    let before_violations = before.violations();
-    let violations = after.violations();
-    let new_violations = violations.difference(&before_violations).count();
+    let new_violations = after.new_violations_since(before).len();
+    let native_violations = after.violations().len();
     let ids: BTreeSet<_> = names
         .iter()
         .map(|n| after.net_number(n))
@@ -346,7 +345,7 @@ pub fn grade(
         connected,
         open,
         new_violations,
-        native_violations: violations.len(),
+        native_violations,
         vias,
         copper_mm,
     })

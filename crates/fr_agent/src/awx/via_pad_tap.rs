@@ -221,47 +221,30 @@ fn tap_window(
     Ok(IntBox::new(x0, y0, x1, y1))
 }
 
-fn clamp_candidate_to_pad(
-    request: &TapRequest<'_>,
-    pad: &ContextPad,
-    candidate: TapViaCandidate,
-) -> TapViaCandidate {
-    let floors = request
-        .fab_candidates
-        .iter()
-        .map(|floor| super::fab_rules::FabFloor {
-            clearance: 0.0,
-            track_width: 0.0,
-            via_diameter: floor.diameter_mm,
-            via_drill: floor.drill_mm,
-            hole_to_hole: 0.0,
-            pad_hole_to_hole: 0.0,
-            annular: (floor.diameter_mm - floor.drill_mm) / 2.0,
-            board_edge: 0.0,
-        })
-        .collect::<Vec<_>>();
-    let source_pad = super::escape_moves::Pad {
-        key: pad.key.clone(),
-        net: pad.net.clone(),
-        net_id: pad.net_id,
-        component_ref: pad.component_ref.clone(),
-        pad_number: pad.pad_number.clone(),
-        point: pad.point,
-        layers: pad.layers.clone(),
-        size: pad.size,
-    };
-    let clamped = super::fab_rules::clamp_via_to_pad(
-        candidate.diameter_mm,
-        candidate.drill_mm,
-        &source_pad,
-        &floors,
-        None,
-    );
-    TapViaCandidate {
-        diameter_mm: round_mm(clamped.diameter, 3),
-        drill_mm: round_mm(clamped.drill, 3),
-        escalated: candidate.escalated || clamped.rung > 0,
+fn filter_authorized_candidates(
+    candidates: impl IntoIterator<Item = TapViaCandidate>,
+    authorized_sizes: &[[f64; 2]],
+) -> Vec<TapViaCandidate> {
+    let mut result = Vec::new();
+    for candidate in candidates {
+        if !candidate.diameter_mm.is_finite()
+            || !candidate.drill_mm.is_finite()
+            || candidate.drill_mm <= 0.0
+            || candidate.drill_mm >= candidate.diameter_mm
+            || !authorized_sizes.iter().any(|[diameter, drill]| {
+                (candidate.diameter_mm - *diameter).abs() <= 1e-9
+                    && (candidate.drill_mm - *drill).abs() <= 1e-9
+            })
+        {
+            continue;
+        }
+        if !result.iter().any(|old: &TapViaCandidate| {
+            old.diameter_mm == candidate.diameter_mm && old.drill_mm == candidate.drill_mm
+        }) {
+            result.push(candidate);
+        }
     }
+    result
 }
 
 fn build_tap_maps(
@@ -280,24 +263,26 @@ fn build_tap_maps(
 > {
     let config = tap_native_config(request, candidate, fine)?;
     let window = tap_window(request.board, request.pad, radius_mm, fine, candidate)?;
-    let via_built = super::native_obstacles::build_obstacle_map_with_config(
+    let via_built = super::native_obstacles::build_obstacle_map_with_config_projected(
         request.board,
         request.rung,
         window,
         &[request.rung.net_id],
         config.clone(),
+        super::native_obstacles::MapProjection::ViaOnly,
     )?;
     let mut route_config = config;
     // Source try_tap_pad(routing_clearance_cushion=True): routing maps add a
     // half-cell reserve; the separate via-placement map remains exact.
     route_config.extra_clearance += route_config.grid_step as f64 / 2.0;
-    let route_built = super::native_obstacles::build_obstacle_map_on_layer(
+    let route_built = super::native_obstacles::build_obstacle_map_on_layer_projected(
         request.board,
         request.rung,
         window,
         &[request.rung.net_id],
         route_config,
         pad_layer,
+        super::native_obstacles::MapProjection::TrackOnly,
     )?;
     Ok((
         via_built.obstacles,
@@ -406,24 +391,12 @@ pub fn place_shrunk_via_in_pad(request: TapRequest<'_>) -> Result<Option<TapResu
     let mut candidates = Vec::with_capacity(request.fab_candidates.len() + 1);
     candidates.push(configured);
     candidates.extend_from_slice(request.fab_candidates);
-    let mut seen_diameter = Vec::new();
-    candidates.retain_mut(|candidate| {
-        candidate.diameter_mm = round_mm(candidate.diameter_mm, 3);
-        candidate.drill_mm = round_mm(candidate.drill_mm, 3);
-        if !candidate.diameter_mm.is_finite()
-            || !candidate.drill_mm.is_finite()
-            || candidate.drill_mm <= 0.0
-            || candidate.drill_mm >= candidate.diameter_mm
-            || candidate.diameter_mm > request.rung.rules.via_size + 1e-9
-            || seen_diameter
-                .iter()
-                .any(|diameter: &f64| (*diameter - candidate.diameter_mm).abs() <= 1e-12)
-        {
-            return false;
-        }
-        seen_diameter.push(candidate.diameter_mm);
-        true
-    });
+    let authorized_sizes = super::native_rung::allowed_through_via_sizes(
+        request.board,
+        request.rung.net_id,
+        request.rung.min_annular_ring_mm,
+    )?;
+    let candidates = filter_authorized_candidates(candidates, &authorized_sizes);
 
     let mut map_releases = Vec::new();
     let copper_layers = request
@@ -438,14 +411,7 @@ pub fn place_shrunk_via_in_pad(request: TapRequest<'_>) -> Result<Option<TapResu
         return Err("via-pad tap requires explicit board copper layers".into());
     }
     for radius in radii {
-        for source_candidate in candidates.iter().copied() {
-            let candidate = clamp_candidate_to_pad(&request, pad, source_candidate);
-            if candidate.drill_mm <= 0.0
-                || candidate.drill_mm >= candidate.diameter_mm
-                || candidate.diameter_mm > request.rung.rules.via_size + 1e-9
-            {
-                continue;
-            }
+        for candidate in candidates.iter().copied() {
             for fine in fine_tap_configs(&request, pad) {
                 let (via_map, route_map, native_config) =
                     build_tap_maps(&request, pad_layer, candidate, radius.min(3.0), fine)?;
@@ -654,6 +620,22 @@ fn point_segment_distance(point: Point, a: Point, b: Point) -> f64 {
     squared_distance(point, [a[0] + t * dx, a[1] + t * dy]).sqrt()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{filter_authorized_candidates, TapViaCandidate};
+
+    #[test]
+    fn native_resolution_candidate_is_not_rounded_or_clamped_out() {
+        let candidate = TapViaCandidate {
+            diameter_mm: 0.6096,
+            drill_mm: 0.3,
+            escalated: false,
+        };
+        let retained = filter_authorized_candidates([candidate], &[[0.6096, 0.3]]);
+        assert_eq!(retained, vec![candidate]);
+    }
+}
+
 fn inflight_blocks(
     point: Point,
     candidate: TapViaCandidate,
@@ -729,10 +711,15 @@ fn route_escape_candidates(
     local_config.layer_costs = vec![layer_cost];
     local_config.layer_direction_preferences = vec![direction];
     let router = local_config.router();
+    let mut local_route_map = attempt.route_map.py_clone();
+    for &(gx, gy) in candidates {
+        local_route_map.add_source_target_cell(gx, gy, layer as usize);
+    }
+    local_route_map.add_source_target_cell(pad_cell.0, pad_cell.1, layer as usize);
     let sources = candidates.iter().map(|&(gx, gy)| (gx, gy, layer)).collect();
     let (path, _, _) = fr_engine::autoroute::point_router::route_with_frontier(
         &router,
-        attempt.route_map,
+        &local_route_map,
         sources,
         vec![(pad_cell.0, pad_cell.1, layer)],
         attempt.rung.max_iterations.min(u32::MAX as usize) as u32,

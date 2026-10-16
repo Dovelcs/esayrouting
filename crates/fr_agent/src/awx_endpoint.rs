@@ -31,6 +31,9 @@ use crate::{
         braid_connect::{rung_specs, LadderMode, RungEndpoint, RungReport, RungRequest},
         endpoint_recovery::{try_source_ripup, RecoveryState, RipAccepted},
         fab_rules::{EscalationPolicy, FabTier},
+        native_fanout_stage::{
+            self, NativeFanoutConfig, NativeRescueConfig, NativeRescueStage, NativeRescueSummary,
+        },
         native_rung::route_multilayer_endpoint_sets_in_run,
         net_rescue::{plan_rescue, RescuePlan},
         net_multipoint::{plan_native_multipoint, MultipointPlan, MultipointTerminal},
@@ -359,7 +362,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PadAccess {
+pub enum PadAccess {
     Legacy,
     CopperArea,
 }
@@ -371,11 +374,11 @@ impl Default for PadAccess {
 }
 
 impl PadAccess {
-    fn uses_copper_area(self) -> bool {
+    pub fn uses_copper_area(self) -> bool {
         matches!(self, Self::CopperArea)
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Legacy => "legacy",
             Self::CopperArea => "copper_area",
@@ -399,6 +402,10 @@ struct EndpointJob {
     hole_to_hole_clearance_mm: f64,
     #[serde(default)]
     pad_access: PadAccess,
+    #[serde(default)]
+    pre_fanout: NativeFanoutConfig,
+    #[serde(default)]
+    native_rescue: NativeRescueConfig,
     #[serde(default)]
     protected_nets: BTreeSet<String>,
 }
@@ -446,23 +453,37 @@ fn rules_for_layer(
         .board
         .clearance_value(clearance_class, clearance_class, layer) as f64
         / board.units_per_mm;
-    let via_size = board
-        .board
-        .rules
-        .via_infos
-        .iter()
-        .filter_map(|id| {
-            board
-                .board
-                .library
-                .padstacks
-                .get(board.board.rules.via_infos[id].get_padstack())
-        })
-        .filter_map(|p| p.get_shape(layer))
-        .map(|s| s.max_width() / board.units_per_mm)
-        .fold(0_f64, f64::max);
+    let legal_through = crate::awx::native_rung::allowed_through_via_sizes(
+        board,
+        net,
+        min_annular,
+    )?;
+    let class_via_size = class.get_via_rule().and_then(|rule_id| {
+        board.board.rules.via_rules[rule_id]
+            .vias()
+            .iter()
+            .find_map(|via_id| {
+                let info = &board.board.rules.via_infos[*via_id];
+                board
+                    .board
+                    .library
+                    .padstacks
+                    .get(info.get_padstack())?
+                    .get_shape(layer)
+                    .map(|shape| shape.max_width() / board.units_per_mm)
+            })
+    });
+    let via_size = legal_through
+        .first()
+        .map(|sizes| sizes[0])
+        .or(class_via_size)
+        .unwrap_or(drill + 2.0 * min_annular);
+    let via_drill = legal_through
+        .first()
+        .map(|sizes| sizes[1])
+        .unwrap_or(drill);
     if via_size <= 0.0 {
-        return Err("DSN has no native via copper envelope".into());
+        return Err("source net class has no via copper envelope".into());
     }
     if !drill.is_finite()
         || drill <= 0.0
@@ -470,16 +491,15 @@ fn rules_for_layer(
         || min_annular < 0.0
         || !hole_clearance.is_finite()
         || hole_clearance < 0.0
-        || via_size - drill < 2.0 * min_annular
     {
-        return Err("explicit test drill violates native via annular ring".into());
+        return Err("invalid native via drill or clearance input".into());
     }
     Ok(RoutingRules {
         grid_step: grid,
         track_width: width,
         clearance,
         via_size,
-        via_drill: drill,
+        via_drill,
         pair_gap: clearance,
         lane_pitch: width + clearance,
         lane_min: width,
@@ -493,7 +513,10 @@ fn rules_for_layer(
         geometry_pair_room: false,
         geometry_pair_turn_room_steps: None,
         same_net_pad_clearance: 0.0,
-        net_via_sizes: BTreeMap::new(),
+        net_via_sizes: legal_through
+            .first()
+            .map(|sizes| BTreeMap::from([(net as i32, *sizes)]))
+            .unwrap_or_default(),
     })
 }
 
@@ -716,6 +739,7 @@ fn final_unconnected_inventory(
                 return None;
             }
             let diagnostic = &result["_endpoint_diagnostic"];
+            let search = &diagnostic["search_evidence"];
             let failure_stage = diagnostic["stage"].as_str();
             let raw = result["reason"].as_str();
             let lower = raw.unwrap_or_default().to_ascii_lowercase();
@@ -727,11 +751,32 @@ fn final_unconnected_inventory(
                 _ if lower.contains("budget_exhaustion") => "budget_exhaustion",
                 _ => "unknown_decline",
             };
+            let search_summary = search.as_object().map(|_| {
+                serde_json::json!({
+                    "search_graph_scope": search["search_graph_scope"],
+                    "search_termination": search["search_termination"],
+                    "forward_probe_termination": search["forward_probe_termination"],
+                    "backward_probe_termination": search["backward_probe_termination"],
+                    "forward_full_termination": search["forward_full_termination"],
+                    "backward_full_termination": search["backward_full_termination"],
+                    "probe_policy_early_stop": search["probe_policy_early_stop"],
+                    "small_via_rung_retry_ran": search["small_via_rung_retry_ran"],
+                    "small_via_rung_forward_termination": search["small_via_rung_forward_termination"],
+                    "small_via_rung_backward_termination": search["small_via_rung_backward_termination"],
+                    "small_via_rung_forward_full_termination": search["small_via_rung_forward_full_termination"],
+                    "small_via_rung_backward_full_termination": search["small_via_rung_backward_full_termination"],
+                    "small_via_rung_probe_policy_early_stop": search["small_via_rung_probe_policy_early_stop"],
+                    "via_pad_unblock": search["via_pad_unblock"],
+                })
+            });
             Some(serde_json::json!({
                 "route_stage": event["stage"], "failure_stage": failure_stage,
                 "reason": raw, "category": category,
                 "expanded": result.get("expanded").or_else(|| result.get("expanded_nodes")),
                 "evidence_scope": "net_history",
+                "search_graph_scope": search["search_graph_scope"],
+                "search_termination": search["search_termination"],
+                "search_evidence": search_summary,
             }))
         });
         let skip = skips
@@ -815,6 +860,14 @@ enum Phase1Outcome {
     Plain,
     /// No main edge landed and no existing-copper deferral applied.
     Failed,
+}
+
+/// Distinguishes a complete reroute from an accepted main route whose taps
+/// remain open, and from a reroute that landed no main copper.
+enum RecoveryRouteOutcome {
+    Complete,
+    PartialMain,
+    NoMain,
 }
 
 struct Driver<'a> {
@@ -1173,7 +1226,11 @@ impl Driver<'_> {
         name: &str,
         route_layers: &[(i32, String)],
     ) -> Result<Phase1Outcome, String> {
-        self.phase1_route_inner(board, net, name, route_layers)
+        let outcome = self.phase1_route_inner(board, net, name, route_layers)?;
+        if matches!(&outcome, Phase1Outcome::Plain | Phase1Outcome::Pending { .. }) {
+            self.recovery.note_routed_result(net);
+        }
+        Ok(outcome)
     }
 
     fn phase1_route_inner(
@@ -1379,6 +1436,7 @@ impl Driver<'_> {
         &mut self,
         board: &mut BoardAdapter,
         nets: &[(NetNo, String)],
+        pin_scope: Option<&BTreeSet<i32>>,
     ) -> Result<serde_json::Value, String> {
         let mut ordered = nets.to_vec();
         ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
@@ -1433,10 +1491,25 @@ impl Driver<'_> {
                     .map(|(index, _)| index)
                     .ok_or("rescue has no eligible component")?;
                 let main = &components[main_index];
+                let main_has_scope_pin = pin_scope.is_some_and(|scope| {
+                    main.group.iter().any(|key| {
+                        let item = board.board.item(key);
+                        item.is_pin() && scope.contains(&item.id().0)
+                    })
+                });
                 let mut gaps = Vec::new();
                 for (island_index, island) in components.iter().enumerate() {
                     if island_index == main_index {
                         continue;
+                    }
+                    if let Some(scope) = pin_scope {
+                        let island_has_scope_pin = island.group.iter().any(|key| {
+                            let item = board.board.item(key);
+                            item.is_pin() && scope.contains(&item.id().0)
+                        });
+                        if !main_has_scope_pin && !island_has_scope_pin {
+                            continue;
+                        }
                     }
                     let Some((distance, from, to)) = rescue_pair(&main.points, &island.points)
                     else {
@@ -1560,6 +1633,193 @@ impl Driver<'_> {
             }
         }
         Ok(serde_json::Value::Object(summaries))
+    }
+
+    /// Final single pass using the current native incomplete edges and both
+    /// complete connected groups, matching the residual-only endpoint policy.
+    /// The initial edge list is frozen so each airline is attempted at most once;
+    /// group membership is refreshed after every accepted connection.
+    fn connected_group_residual_rescue(
+        &mut self,
+        board: &mut BoardAdapter,
+        nets: &[(NetNo, String)],
+    ) -> Result<serde_json::Value, String> {
+        let mut edges = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (net, name) in nets {
+            if self.protected.contains(name) {
+                continue;
+            }
+            let layers = net_route_layers(board, *net);
+            if layers.is_empty() {
+                continue;
+            }
+            let incomplete = NetIncompletes::new(
+                &board.board,
+                *net,
+                &board.board.get_connectable_items(*net),
+            );
+            for edge in incomplete.incompletes {
+                let from_id = board.board.item(edge.from_item).id().0;
+                let to_id = board.board.item(edge.to_item).id().0;
+                if seen.insert((*net, from_id.min(to_id), from_id.max(to_id))) {
+                    let from_group = board.board.connected_set(edge.from_item, *net, false);
+                    let to_group = board.board.connected_set(edge.to_item, *net, false);
+                    let witness_id = |anchor: ItemKey, group: &ItemSet| {
+                        let item = board.board.item(anchor);
+                        if item.is_pin() || item.is_via() {
+                            item.id().0
+                        } else {
+                            group
+                                .iter()
+                                .filter_map(|key| {
+                                    let member = board.board.item(key);
+                                    (member.is_pin() || member.is_via())
+                                        .then_some(member.id().0)
+                                })
+                                .min()
+                                .unwrap_or(item.id().0)
+                        }
+                    };
+                    edges.push((
+                        *net,
+                        name.clone(),
+                        from_id,
+                        to_id,
+                        witness_id(edge.from_item, &from_group),
+                        witness_id(edge.to_item, &to_group),
+                        layers.clone(),
+                    ));
+                }
+            }
+        }
+
+        let mut attempted = 0usize;
+        let mut accepted = 0usize;
+        let mut outcomes = Vec::new();
+        for (net, name, initial_from_id, initial_to_id, from_witness, to_witness, layers) in edges {
+            if Instant::now() >= self.ctx.deadline {
+                break;
+            }
+            let Some(from_item) = board
+                .board
+                .item_repository()
+                .iter()
+                .find(|&key| board.board.item(key).id().0 == from_witness)
+            else {
+                outcomes.push(serde_json::json!({"net":name,"initial_from_item":initial_from_id,
+                    "initial_to_item":initial_to_id,"from_witness":from_witness,
+                    "to_witness":to_witness,"status":"from_witness_missing"}));
+                continue;
+            };
+            let Some(to_item) = board
+                .board
+                .item_repository()
+                .iter()
+                .find(|&key| board.board.item(key).id().0 == to_witness)
+            else {
+                outcomes.push(serde_json::json!({"net":name,"initial_from_item":initial_from_id,
+                    "initial_to_item":initial_to_id,"from_witness":from_witness,
+                    "to_witness":to_witness,"status":"to_witness_missing"}));
+                continue;
+            };
+            let from_id = board.board.item(from_item).id();
+            let to_id = board.board.item(to_item).id();
+            if !board.board.item(from_item).contains_net(net)
+                || !board.board.item(to_item).contains_net(net)
+            {
+                outcomes.push(serde_json::json!({"net":name,"initial_from_item":initial_from_id,
+                    "initial_to_item":initial_to_id,"from_witness":from_witness,
+                    "to_witness":to_witness,"status":"witness_net_mismatch"}));
+                continue;
+            }
+            let groups = board.board.get_connected_sets(net);
+            let from_group = groups.iter().find(|group| group.contains(from_id));
+            let to_group = groups.iter().find(|group| group.contains(to_id));
+            if from_group.is_none() || to_group.is_none() {
+                outcomes.push(serde_json::json!({"net":name,"initial_from_item":initial_from_id,
+                    "initial_to_item":initial_to_id,"from_witness":from_witness,
+                    "to_witness":to_witness,"status":"missing_connected_group"}));
+                continue;
+            }
+            if groups
+                .iter()
+                .any(|group| group.contains(from_id) && group.contains(to_id))
+            {
+                outcomes.push(serde_json::json!({"net":name,"initial_from_item":initial_from_id,
+                    "initial_to_item":initial_to_id,"from_witness":from_witness,
+                    "to_witness":to_witness,"status":"already_connected"}));
+                continue;
+            }
+            let starts = connected_group_candidates(board, from_group.unwrap(), &layers);
+            let targets = connected_group_candidates(board, to_group.unwrap(), &layers);
+            if starts.is_empty() || targets.is_empty() {
+                outcomes.push(serde_json::json!({"net":name,"initial_from_item":initial_from_id,
+                    "initial_to_item":initial_to_id,"from_witness":from_witness,
+                    "to_witness":to_witness,"status":"no_native_endpoint"}));
+                continue;
+            }
+
+            let before_net = NetIncompletes::new(
+                &board.board,
+                net,
+                &board.board.get_connectable_items(net),
+            )
+            .count();
+            let before_global =
+                fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+            attempted += 1;
+            let (candidate, _) = self.route_endpoint_set(
+                board,
+                net,
+                &name,
+                "residual_only",
+                from_item,
+                to_item,
+                &starts,
+                &targets,
+                &layers,
+            )?;
+            let Some(candidate) = candidate else {
+                outcomes.push(serde_json::json!({"net":name,"initial_from_item":initial_from_id,
+                    "initial_to_item":initial_to_id,"from_witness":from_witness,
+                    "to_witness":to_witness,"status":"native_declined",
+                    "start_candidates":starts.len(),"target_candidates":targets.len()}));
+                continue;
+            };
+            let after_net = NetIncompletes::new(
+                &candidate.board,
+                net,
+                &candidate.board.get_connectable_items(net),
+            )
+            .count();
+            let after_global =
+                fr_engine::pipeline::stats::incomplete_count(&candidate.board, None);
+            if after_net >= before_net
+                || after_global >= before_global
+                || candidate
+                    .assert_invariants(self.baseline, self.protected, true)
+                    .is_err()
+            {
+                outcomes.push(serde_json::json!({"net":name,"initial_from_item":initial_from_id,
+                    "initial_to_item":initial_to_id,"from_witness":from_witness,
+                    "to_witness":to_witness,"status":"rejected_validation",
+                    "net_incompletes_before":before_net,"net_incompletes_after":after_net,
+                    "board_incompletes_before":before_global,"board_incompletes_after":after_global}));
+                continue;
+            }
+            *board = candidate;
+            accepted += 1;
+            self.accepted += 1;
+            self.record_best(board, &[net])?;
+            outcomes.push(serde_json::json!({"net":name,"initial_from_item":initial_from_id,
+                "initial_to_item":initial_to_id,"from_witness":from_witness,
+                "to_witness":to_witness,"status":"accepted",
+                "start_candidates":starts.len(),"target_candidates":targets.len(),
+                "net_incompletes_before":before_net,"net_incompletes_after":after_net,
+                "board_incompletes_before":before_global,"board_incompletes_after":after_global}));
+        }
+        Ok(serde_json::json!({"attempted":attempted,"accepted":accepted,"outcomes":outcomes}))
     }
 
     /// Source phase-3 tap pass for one pending multipoint net (source
@@ -1824,7 +2084,7 @@ impl Driver<'_> {
         net: NetNo,
         name: &str,
         route_layers: &[(i32, String)],
-    ) -> Result<bool, String> {
+    ) -> Result<RecoveryRouteOutcome, String> {
         self.route_net_fully_inner(board, net, name, route_layers)
     }
 
@@ -1834,15 +2094,19 @@ impl Driver<'_> {
         net: NetNo,
         name: &str,
         route_layers: &[(i32, String)],
-    ) -> Result<bool, String> {
+    ) -> Result<RecoveryRouteOutcome, String> {
         match self.phase1_route(board, net, name, route_layers)? {
-            Phase1Outcome::Plain => Ok(true),
-            Phase1Outcome::Failed => Ok(false),
+            Phase1Outcome::Plain => Ok(RecoveryRouteOutcome::Complete),
+            Phase1Outcome::Failed => Ok(RecoveryRouteOutcome::NoMain),
             Phase1Outcome::Pending { plan, routed } => {
                 let mut routed = routed;
                 self.phase3_taps(board, net, name, &plan, &mut routed, route_layers)?;
                 let items = board.board.get_connectable_items(net);
-                Ok(NetIncompletes::new(&board.board, net, &items).count() == 0)
+                if NetIncompletes::new(&board.board, net, &items).count() == 0 {
+                    Ok(RecoveryRouteOutcome::Complete)
+                } else {
+                    Ok(RecoveryRouteOutcome::PartialMain)
+                }
             }
         }
     }
@@ -1874,24 +2138,120 @@ impl Driver<'_> {
             // reroute -- on a reroute failure no phantom main is left behind for
             // the tap pass to launch from.
             self.pending.retain(|entry| entry.net != victim);
-            let rerouted = Instant::now() < self.ctx.deadline
-                && !route_layers.is_empty()
-                && self.route_net_fully(board, victim, &name, &route_layers)?;
-            if !rerouted {
-                let mut restored = board.clone();
-                let names = BTreeSet::from([name.clone()]);
-                if crate::awx::native_execution::restore_nets(&saved_board, &mut restored, &names)
-                    .is_ok()
-                    && restored
-                        .assert_invariants(self.baseline, self.protected, true)
-                        .is_ok()
-                {
+            let outcome = if Instant::now() >= self.ctx.deadline || route_layers.is_empty() {
+                RecoveryRouteOutcome::NoMain
+            } else {
+                self.route_net_fully(board, victim, &name, &route_layers)?
+            };
+            if matches!(outcome, RecoveryRouteOutcome::NoMain) {
+                let restore = crate::awx::endpoint_recovery::restore_failed_victim(
+                    &saved_board,
+                    board,
+                    self.baseline,
+                    self.protected,
+                    victim,
+                );
+                let event = serde_json::json!({
+                    "event": "terminal_restore",
+                    "net": name,
+                    "status": restore.status,
+                    "full_restore_error": restore.full_restore_error,
+                    "full_invariant_error": restore.full_invariant_error,
+                    "stub_error": restore.stub_error,
+                    "restored_segments": restore.restored_segments,
+                    "restored_vias": restore.restored_vias,
+                    "drc_scope": "rejected_restore_candidates",
+                    "retained_new_drc": restore.retained_new_drc,
+                });
+                log_event(&mut self.log, &event)?;
+                if let Some(restored) = restore.board {
                     *board = restored;
                     self.record_best(board, &[victim])?;
                 }
+                self.recovery.record_terminal_restore(
+                    victim,
+                    Arc::clone(&saved_board),
+                    &restore.status,
+                );
             }
         }
         Ok(())
+    }
+
+    /// Run one bounded source-style nested pass on a frozen subset of nets.
+    fn scoped_lap(
+        &mut self,
+        board: &mut BoardAdapter,
+        scope: &[NetNo],
+        authorized: &BTreeSet<NetNo>,
+        source: &BoardAdapter,
+    ) -> Result<BTreeMap<NetNo, Vec<NetNo>>, String> {
+        self.recovery.begin_nested(board, authorized);
+        self.retry_counts.clear();
+        self.pending.clear();
+
+        for &net in scope {
+            if Instant::now() >= self.ctx.deadline { break; }
+            let Some(name) = board.board.rules.nets.get(net).map(|n| n.name.clone()) else { continue; };
+            if self.protected.contains(&name) { continue; }
+            let items = board.board.get_connectable_items(net);
+            if NetIncompletes::new(&board.board, net, &items).count() == 0 { continue; }
+            let route_layers = net_route_layers(board, net);
+            if route_layers.is_empty() { continue; }
+            if let Phase1Outcome::Pending { plan, routed } = self.phase1_route(board, net, &name, &route_layers)? {
+                self.pending.push(PendingNet { net, name, plan, routed, route_layers });
+            }
+        }
+        self.drain_reroute_queue(board)?;
+
+        let tap_order = boxed_in_risk_order(board, &self.pending);
+        for net in tap_order {
+            if Instant::now() >= self.ctx.deadline { break; }
+            let Some(position) = self.pending.iter().position(|entry| entry.net == net) else { continue; };
+            let mut entry = self.pending.remove(position);
+            let items = board.board.get_connectable_items(net);
+            if NetIncompletes::new(&board.board, net, &items).count() > 0 {
+                self.phase3_taps(board, entry.net, &entry.name, &entry.plan, &mut entry.routed, &entry.route_layers)?;
+            }
+            self.pending.push(entry);
+        }
+        self.drain_reroute_queue(board)?;
+
+        for (victim, saved) in self.recovery.take_priority_candidates() {
+            if Instant::now() >= self.ctx.deadline { break; }
+            let Some(candidate) = crate::awx::final_reconcile::prepare_priority_restore(
+                board, source, self.protected, victim, &saved,
+                self.recovery.routed_result_nets(), self.recovery.restore_protected_nets(),
+            )? else { continue; };
+            let before = board.clone();
+            let changed = candidate.owners.iter().copied().chain([candidate.victim]).collect::<Vec<_>>();
+            *board = candidate.board;
+            self.recovery.commit_priority_restore(candidate.victim, candidate.owners, &before);
+            self.accepted += 1;
+            self.record_best(board, &changed)?;
+            log_event(&mut self.log, &serde_json::json!({
+                "event":"nested_priority_restore", "victim":candidate.victim,
+                "owners":changed.iter().copied().filter(|n| *n != candidate.victim).collect::<Vec<_>>(),
+                "verdict":candidate.verdict
+            }))?;
+        }
+        self.drain_reroute_queue(board)?;
+
+        let live_count = fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+        if live_count > self.best_incompletes {
+            *board = self.best_board.clone();
+            let (counts, total) = full_incomplete_counts(board);
+            self.incomplete_counts = counts;
+            self.incomplete_total = total;
+            self.count_witness = IncompleteCountWitness::new(board);
+        }
+
+        let scoped = scope.iter().filter_map(|&net| {
+            board.board.rules.nets.get(net).map(|info| (net, info.name.clone()))
+        }).collect::<Vec<_>>();
+        self.fine_grid_rescue(board, &scoped, None)?;
+        self.connected_group_residual_rescue(board, &scoped)?;
+        Ok(self.recovery.take_preexisting_hints())
     }
 }
 
@@ -1951,6 +2311,7 @@ fn build_endpoint_request(
         fab_clearance_floor_mm: 0.0,
         fab_track_floor_mm: 0.0,
         may_narrow: false,
+        min_annular_ring_mm: ctx.min_annular_ring_mm,
         fab_via_rungs: Vec::new(),
         max_iterations: ctx.max_iterations,
         route_layers: route_layers.iter().map(|(_, n)| n.clone()).collect(),
@@ -2339,6 +2700,11 @@ pub fn run(path: &Path) -> Result<(), String> {
     crate::board_adapter::clear_validation_baseline_cache();
     let job: EndpointJob = toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
+    if job.native_rescue.post_awx_budget_ms > 0
+        && job.native_rescue.stage != NativeRescueStage::BeforeAwx
+    {
+        return Err("post_awx_budget_ms requires native_rescue.stage = before_awx".into());
+    }
     if job.budget_ms == 0
         || job.max_iterations == 0
         || job.threads == 0
@@ -2362,24 +2728,69 @@ pub fn run(path: &Path) -> Result<(), String> {
     }
     let input = fs::read(&input_path).map_err(|e| e.to_string())?;
     let mut board = BoardAdapter::load(&input)?;
+    crate::awx::board_snapshot::BoardSnapshot::apply_configured_via_drill(
+        &mut board,
+        job.via_drill_mm,
+    )?;
     board.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
     board
         .board
         .set_pad_area_contacts(job.pad_access.uses_copper_area());
+
+    // Preserve the configured-rule source as the invariant baseline. The
+    // optional guarded fanout stage may prepare Cu for the endpoint driver,
+    // but it does not redefine the source used for attribution and guards.
+    let baseline = board.clone();
+    let before = fr_engine::pipeline::stats::incomplete_count(&baseline.board, None);
+    let started = Instant::now();
+    let overall_deadline = started + Duration::from_millis(job.budget_ms);
+    let late_native_budget_ms = if job.native_rescue.stage == NativeRescueStage::BeforeAwx {
+        job.native_rescue.post_awx_budget_ms
+    } else {
+        job.native_rescue.budget_ms
+    };
+    let rescue_reserved_ms = if job.native_rescue.enabled {
+        late_native_budget_ms
+            .saturating_add(job.native_rescue.post_grid_budget_ms)
+            .min(job.budget_ms / 2)
+    } else {
+        0
+    };
+    let native_rescue_reserved_ms = if job.native_rescue.enabled {
+        late_native_budget_ms.min(rescue_reserved_ms)
+    } else {
+        0
+    };
+    let post_grid_rescue_reserved_ms = rescue_reserved_ms - native_rescue_reserved_ms;
+    let native_rescue_before_awx = job.native_rescue.enabled
+        && job.native_rescue.stage == NativeRescueStage::BeforeAwx;
+    let deadline = overall_deadline - Duration::from_millis(rescue_reserved_ms);
+    let native_rescue_deadline =
+        overall_deadline - Duration::from_millis(post_grid_rescue_reserved_ms);
+    let pre_fanout = native_fanout_stage::run(
+        &mut board,
+        &baseline,
+        &job.protected_nets,
+        &job.pre_fanout,
+        deadline,
+        job.min_annular_ring_mm,
+    )?;
+
     let (free_via_pads, same_net_pads) =
         endpoint_pad_metadata(&board, job.hole_to_hole_clearance_mm > 0.0)?;
-    let baseline = board.clone();
-    let before = fr_engine::pipeline::stats::incomplete_count(&board.board, None);
     let (incomplete_counts, incomplete_total) = full_incomplete_counts(&board);
-    if incomplete_total != before {
+    let prepared_before = fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+    if incomplete_total != prepared_before {
         return Err(format!(
-            "per-net initial count disagrees with full count: per_net={incomplete_total}, full={before}"
+            "per-net prepared count disagrees with full count: per_net={incomplete_total}, full={prepared_before}"
         ));
     }
     let count_witness = IncompleteCountWitness::new(&board);
-    let started = Instant::now();
-    let deadline = started + Duration::from_millis(job.budget_ms);
-    let log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
+    let mut log = fs::File::create(&log_path).map_err(|e| e.to_string())?;
+    log_event(
+        &mut log,
+        &serde_json::json!({"stage":"pre_fanout","summary":pre_fanout}),
+    )?;
     let mut driver = Driver {
         ctx: EndpointContext {
             free_via_pads,
@@ -2400,7 +2811,7 @@ pub fn run(path: &Path) -> Result<(), String> {
         recovery: RecoveryState::default(),
         pending: Vec::new(),
         best_board: board.clone(),
-        best_incompletes: before,
+        best_incompletes: prepared_before,
         incomplete_counts,
         incomplete_total,
         count_witness,
@@ -2419,6 +2830,189 @@ pub fn run(path: &Path) -> Result<(), String> {
         .iter()
         .map(|n| (n.net_number, n.name.clone()))
         .collect();
+
+    let pre_fine_started = Instant::now();
+    let pre_fine_before = fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+    let original_failed_pin_ids: BTreeSet<i32> = pre_fanout
+        .failed_pins
+        .iter()
+        .map(|failure| failure.pin_id)
+        .collect();
+    let failed_pin_net_pairs: BTreeSet<(i32, NetNo)> = pre_fanout
+        .failed_pins
+        .iter()
+        .map(|failure| (failure.pin_id, failure.net))
+        .collect();
+    let pre_fine_deadline = (started + Duration::from_millis(job.pre_fanout.budget_ms)).min(deadline);
+    let eligibility_scan_requested = pre_fanout.enabled
+        && job.pre_fanout.fine_grid_fallback
+        && !failed_pin_net_pairs.is_empty();
+    let eligibility_scan_enabled =
+        eligibility_scan_requested && Instant::now() < pre_fine_deadline;
+    let mut failed_pin_scope = BTreeSet::new();
+    let mut failed_pin_exclusions = Vec::new();
+    let mut eligibility_scan_truncated = eligibility_scan_requested && !eligibility_scan_enabled;
+    if eligibility_scan_enabled {
+        for (pin_index, &(pin_id, net)) in failed_pin_net_pairs.iter().enumerate() {
+            if Instant::now() >= pre_fine_deadline {
+                eligibility_scan_truncated = pin_index < failed_pin_net_pairs.len();
+                break;
+            }
+            let Some(source_key) = baseline.board.get_item(ItemId(pin_id)) else {
+                failed_pin_exclusions.push(serde_json::json!({"pin_id":pin_id,"net":net,"reason":"missing_from_source"}));
+                continue;
+            };
+            let source_pin = baseline.board.item(source_key);
+            if !source_pin.is_pin()
+                || !source_pin.contains_net(net)
+                || source_pin.first_layer(&baseline.board) != source_pin.last_layer(&baseline.board)
+            {
+                failed_pin_exclusions.push(serde_json::json!({"pin_id":pin_id,"net":net,"reason":"not_original_single_layer_smd"}));
+                continue;
+            }
+            let Some(current_key) = board.board.get_item(ItemId(pin_id)) else {
+                failed_pin_exclusions.push(serde_json::json!({"pin_id":pin_id,"net":net,"reason":"missing_from_current_board"}));
+                continue;
+            };
+            let current_pin = board.board.item(current_key);
+            if !current_pin.is_pin()
+                || !current_pin.contains_net(net)
+                || current_pin.first_layer(&board.board) != current_pin.last_layer(&board.board)
+            {
+                failed_pin_exclusions.push(serde_json::json!({"pin_id":pin_id,"net":net,"reason":"no_longer_single_layer_pin_on_original_net"}));
+                continue;
+            }
+            let live = NetIncompletes::new(
+                &board.board,
+                net,
+                &board.board.get_connectable_items(net),
+            );
+            if live.count() == 0 {
+                failed_pin_exclusions.push(serde_json::json!({"pin_id":pin_id,"net":net,"reason":"net_already_connected"}));
+                continue;
+            }
+            let route_layers = net_route_layers(&board, net);
+            if route_layers.is_empty() {
+                failed_pin_exclusions.push(serde_json::json!({"pin_id":pin_id,"net":net,"reason":"no_active_route_layers"}));
+                continue;
+            }
+            let pin_layer = current_pin.first_layer(&board.board);
+            if !route_layers.iter().any(|(layer, _)| *layer == pin_layer) {
+                failed_pin_exclusions.push(serde_json::json!({"pin_id":pin_id,"net":net,"reason":"pin_layer_not_active"}));
+                continue;
+            }
+            let group = board.board.connected_set(current_key, net, false);
+            let candidates = connected_group_candidates(&board, &group, &route_layers);
+            if candidates.is_empty() {
+                failed_pin_exclusions.push(serde_json::json!({"pin_id":pin_id,"net":net,"reason":"no_active_group_candidate"}));
+                continue;
+            }
+            let has_other_active_layer = route_layers.iter().any(|(layer, name)| {
+                *layer != pin_layer
+                    && candidates
+                        .iter()
+                        .any(|candidate| candidate.layer.as_str() == name.as_str())
+            });
+            if has_other_active_layer {
+                failed_pin_exclusions.push(serde_json::json!({"pin_id":pin_id,"net":net,"reason":"connected_group_has_other_active_layer_candidate"}));
+                continue;
+            }
+            failed_pin_scope.insert(pin_id);
+        }
+    }
+    let failed_net_ids: BTreeSet<NetNo> = failed_pin_net_pairs
+        .iter()
+        .filter_map(|(pin_id, net)| failed_pin_scope.contains(pin_id).then_some(*net))
+        .collect();
+    let pre_fine_nets: Vec<(NetNo, String)> = original_nets
+        .iter()
+        .filter(|(net, _)| failed_net_ids.contains(net))
+        .cloned()
+        .collect();
+    let pre_fine_skip_reason = if !pre_fanout.enabled {
+        Some("pre_fanout_disabled")
+    } else if !job.pre_fanout.fine_grid_fallback {
+        Some("fine_grid_fallback_disabled")
+    } else if pre_fanout.failed_pins.is_empty() {
+        Some("no_native_failed_pins")
+    } else if eligibility_scan_truncated || Instant::now() >= pre_fine_deadline {
+        Some("pre_fanout_budget_exhausted")
+    } else if failed_pin_scope.is_empty() || pre_fine_nets.is_empty() {
+        Some("no_eligible_failed_pin")
+    } else {
+        None
+    };
+    let (pre_fine_summary, pre_fine_ran) = if pre_fine_skip_reason.is_none() {
+        let previous_deadline = driver.ctx.deadline;
+        driver.ctx.deadline = pre_fine_deadline;
+        let result = driver.fine_grid_rescue(&mut board, &pre_fine_nets, Some(&failed_pin_scope));
+        driver.ctx.deadline = previous_deadline;
+        (result?, true)
+    } else {
+        (serde_json::Value::Null, false)
+    };
+    let after_pre_fine_grid =
+        fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+    let (pre_fine_counts, pre_fine_total) = full_incomplete_counts(&board);
+    if pre_fine_total != after_pre_fine_grid || driver.incomplete_total != after_pre_fine_grid {
+        return Err(format!(
+            "pre-native-failure fine-grid count disagrees with driver/full board: driver={}, per_net={pre_fine_total}, full={after_pre_fine_grid}",
+            driver.incomplete_total
+        ));
+    }
+    driver.incomplete_counts = pre_fine_counts;
+    driver.incomplete_total = pre_fine_total;
+    driver.count_witness = IncompleteCountWitness::new(&board);
+    let no_scope_gap_candidate = pre_fine_ran
+        && pre_fine_summary.as_object().is_some_and(|summaries| {
+            summaries
+                .values()
+                .all(|summary| summary["attempted"].as_u64().unwrap_or(0) == 0)
+        });
+    let pre_fine_reported_skip_reason = pre_fine_skip_reason
+        .or_else(|| no_scope_gap_candidate.then_some("no_scope_connected_group_gap"));
+    let pre_fine_grid_rescue = serde_json::json!({
+        "ran":pre_fine_ran,
+        "skip_reason":pre_fine_reported_skip_reason,
+        "original_failed_pin_ids":original_failed_pin_ids,
+        "eligible_pin_ids":failed_pin_scope,
+        "excluded_pins":failed_pin_exclusions,
+        "before_incompletes":pre_fine_before,
+        "after_incompletes":after_pre_fine_grid,
+        "elapsed_ms":pre_fine_started.elapsed().as_millis() as u64,
+        "summary":pre_fine_summary
+    });
+
+    let mut early_native_rescue: Option<(i32, i32, NativeRescueSummary)> = None;
+    if native_rescue_before_awx {
+        let early_before = fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+        let early_summary = native_fanout_stage::run_rescue(
+            &mut board,
+            &baseline,
+            &job.protected_nets,
+            &job.native_rescue,
+            deadline,
+            job.min_annular_ring_mm,
+        )?;
+        let (early_counts, early_total) = full_incomplete_counts(&board);
+        let early_after = fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+        if early_total != early_after {
+            return Err(format!(
+                "per-net early native rescue count disagrees with full count: per_net={early_total}, full={early_after}"
+            ));
+        }
+        if early_after > early_before {
+            return Err(format!(
+                "early native rescue increased incompletes: before={early_before}, after={early_after}"
+            ));
+        }
+        driver.incomplete_counts = early_counts;
+        driver.incomplete_total = early_total;
+        driver.count_witness = IncompleteCountWitness::new(&board);
+        driver.best_board = board.clone();
+        driver.best_incompletes = early_total;
+        early_native_rescue = Some((early_before, early_after, early_summary));
+    }
 
     let nets = crate::awx::net_ordering::order_native_nets_mps(&board, &original_nets)?;
 
@@ -2532,12 +3126,368 @@ pub fn run(path: &Path) -> Result<(), String> {
             driver.incomplete_total
         ));
     }
-    let fine_grid_rescue = driver.fine_grid_rescue(&mut board, &nets)?;
+    let fine_grid_rescue = driver.fine_grid_rescue(&mut board, &nets, None)?;
+    let connected_group_residual_rescue =
+        driver.connected_group_residual_rescue(&mut board, &nets)?;
+    let mut final_reconcile_laps = Vec::new();
+    let mut final_scope = crate::awx::final_reconcile::open_nets(&board, &job.protected_nets);
+    final_scope.sort_by_key(|net| {
+        nets.iter().position(|(candidate, _)| candidate == net).unwrap_or(usize::MAX)
+    });
+    let net_names = |board: &BoardAdapter, ids: &BTreeSet<NetNo>| -> Vec<String> {
+        ids.iter().filter_map(|&net| board.board.rules.nets.get(net).map(|info| info.name.clone())).collect()
+    };
+    let final_scope_names: Vec<String> = final_scope.iter()
+        .filter_map(|&net| board.board.rules.nets.get(net).map(|info| info.name.clone()))
+        .collect();
+    let scope_set: BTreeSet<NetNo> = final_scope.iter().copied().collect();
+    let source_net_set: BTreeSet<NetNo> = original_nets.iter().map(|(net, _)| *net).collect();
+    let mut authorized = BTreeSet::new();
+    let initial_hints = driver.recovery.take_preexisting_hints();
+    let initial_grants = crate::awx::final_reconcile::grant_authority(
+        &board, &initial_hints, &scope_set, &job.protected_nets, &mut authorized,
+    );
+    let initial_grant_set: BTreeSet<NetNo> = initial_grants.iter().copied().collect();
+    let initial_grant_names = net_names(&board, &initial_grant_set);
+    let mut pending_hints = initial_hints;
+    let mut stop_reason = if final_scope.is_empty() { "no_open_nets" } else { "lap_limit" };
+    for lap in 0..3 {
+        if Instant::now() >= deadline {
+            stop_reason = "deadline";
+            break;
+        }
+        let open_now: BTreeSet<NetNo> = crate::awx::final_reconcile::open_nets(
+            &board,
+            &job.protected_nets,
+        )
+        .into_iter()
+        .collect();
+        let mut lap_scope_set: BTreeSet<NetNo> = scope_set
+            .iter()
+            .copied()
+            .filter(|net| {
+                source_net_set.contains(net)
+                    && board
+                        .board
+                        .rules
+                        .nets
+                        .get(*net)
+                        .is_some_and(|info| !job.protected_nets.contains(&info.name))
+            })
+            .collect();
+        lap_scope_set.extend(authorized.iter().copied().filter(|net| {
+            open_now.contains(net)
+                && source_net_set.contains(net)
+                && board
+                    .board
+                    .rules
+                    .nets
+                    .get(*net)
+                    .is_some_and(|info| !job.protected_nets.contains(&info.name))
+        }));
+        let lap_scope: Vec<NetNo> = nets
+            .iter()
+            .filter_map(|(net, _)| lap_scope_set.contains(net).then_some(*net))
+            .collect();
+        let lap_scope_names: Vec<String> = lap_scope
+            .iter()
+            .filter_map(|&net| board.board.rules.nets.get(net).map(|info| info.name.clone()))
+            .collect();
+        if lap_scope.is_empty() {
+            stop_reason = "no_open_nets";
+            break;
+        }
+        let before_board = board.clone();
+        let before_best = driver.best_board.clone();
+        let before_best_count = driver.best_incompletes;
+        let before_counts = driver.incomplete_counts.clone();
+        let before_total = driver.incomplete_total;
+        let before_witness = IncompleteCountWitness::new(&before_board);
+        let before_quality = crate::awx::final_reconcile::quality_score(&before_board);
+        let mut mutable = scope_set.clone();
+        mutable.extend(authorized.iter().copied());
+        let lap_result = driver.scoped_lap(&mut board, &lap_scope, &authorized, &baseline);
+        let mut hints = match lap_result {
+            Ok(hints) => hints,
+            Err(error) => {
+                board = before_board.clone();
+                driver.best_board = before_best;
+                driver.best_incompletes = before_best_count;
+                driver.incomplete_counts = before_counts;
+                driver.incomplete_total = before_total;
+                driver.count_witness = before_witness;
+                final_reconcile_laps.push(serde_json::json!({"lap":lap+1,"scope":lap_scope,"authority":authorized,
+                    "scope_names":lap_scope_names,"authority_names":net_names(&board, &authorized),
+                    "before":before_quality,"after":before_quality,"accepted":false,"new_grants":[],
+                    "new_grant_names":[],"error":error}));
+                stop_reason = "lap_error";
+                break;
+            }
+        };
+        let live_quality = crate::awx::final_reconcile::quality_score(&board);
+        let best_quality = crate::awx::final_reconcile::quality_score(&driver.best_board);
+        let live_guard = crate::awx::final_reconcile::assert_lap_candidate(
+            &before_board, &board, &baseline, &job.protected_nets, &mutable,
+        );
+        let best_guard = crate::awx::final_reconcile::assert_lap_candidate(
+            &before_board, &driver.best_board, &baseline, &job.protected_nets, &mutable,
+        );
+        if live_guard.is_err() && best_guard.is_err() {
+            let error = format!("live candidate rejected: {}; best candidate rejected: {}",
+                live_guard.unwrap_err(), best_guard.unwrap_err());
+            board = before_board.clone();
+            driver.best_board = before_best;
+            driver.best_incompletes = before_best_count;
+            driver.incomplete_counts = before_counts;
+            driver.incomplete_total = before_total;
+            driver.count_witness = before_witness;
+            final_reconcile_laps.push(serde_json::json!({"lap":lap+1,"scope":lap_scope,"authority":authorized,
+                "scope_names":lap_scope_names,"authority_names":net_names(&board, &authorized),
+                "before":before_quality,"live_candidate":live_quality,"best_candidate":best_quality,
+                "accepted":false,"new_grants":[],"new_grant_names":[],"error":error}));
+            stop_reason = "candidate_rejected";
+            break;
+        }
+        let choose_best = best_guard.is_ok()
+            && (live_guard.is_err()
+                || best_quality.incomplete_connections < live_quality.incomplete_connections);
+        if choose_best {
+            board = driver.best_board.clone();
+        } else {
+            driver.best_board = board.clone();
+        }
+        let selected_quality = if choose_best { best_quality.clone() } else { live_quality.clone() };
+        let selected_name = if choose_best { "best" } else { "live" };
+        let new_grants = crate::awx::final_reconcile::grant_authority(
+            &board, &hints, &scope_set, &job.protected_nets, &mut authorized,
+        );
+        let new_grant_set: BTreeSet<NetNo> = new_grants.iter().copied().collect();
+        let new_grant_names = net_names(&board, &new_grant_set);
+        let (counts, total) = full_incomplete_counts(&board);
+        driver.incomplete_counts = counts;
+        driver.incomplete_total = total;
+        driver.count_witness = IncompleteCountWitness::new(&board);
+        driver.best_incompletes = total;
+        let improved = selected_quality.broken_nets < before_quality.broken_nets
+            || selected_quality.disconnected_pins < before_quality.disconnected_pins
+            || selected_quality.incomplete_connections < before_quality.incomplete_connections;
+        final_reconcile_laps.push(serde_json::json!({"lap":lap+1,"scope":lap_scope,"authority":authorized,
+            "scope_names":lap_scope_names,"authority_names":net_names(&board, &authorized),
+            "new_grant_names":new_grant_names,
+            "before":before_quality,"after":selected_quality,"live_candidate":live_quality,
+            "best_candidate":best_quality,"selected":selected_name,
+            "accepted":true,"new_grants":new_grants,"improved":improved}));
+        let open_custody_remains = crate::awx::final_reconcile::open_nets(
+            &board,
+            &job.protected_nets,
+        )
+        .iter()
+        .any(|net| {
+            (scope_set.contains(net) || authorized.contains(net))
+                && source_net_set.contains(net)
+                && board
+                    .board
+                    .rules
+                    .nets
+                    .get(*net)
+                    .is_some_and(|info| !job.protected_nets.contains(&info.name))
+        });
+        if !open_custody_remains {
+            stop_reason = "scope_completed";
+            break;
+        }
+        if !improved && new_grants.is_empty() {
+            stop_reason = "no_improvement_or_new_authority";
+            break;
+        }
+        pending_hints = std::mem::take(&mut hints);
+        if lap == 2 { stop_reason = "lap_limit"; }
+    }
+    let final_reconcile = serde_json::json!({"scope":final_scope,"scope_names":final_scope_names,
+        "initial_authority":initial_grants,"initial_authority_names":initial_grant_names,
+        "laps":final_reconcile_laps,"stop_reason":stop_reason,"remaining_authority":authorized,
+        "remaining_authority_names":net_names(&board, &authorized),
+        "pending_hints":pending_hints});
+    let (before_native_rescue, after_native_rescue, native_rescue) =
+        if let Some(early_result) = early_native_rescue.take() {
+            early_result
+        } else {
+            let before_native_rescue =
+                fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+            let original_best_incompletes = driver.best_incompletes;
+            let native_rescue = native_fanout_stage::run_rescue(
+                &mut board,
+                &baseline,
+                &job.protected_nets,
+                &job.native_rescue,
+                native_rescue_deadline,
+                job.min_annular_ring_mm,
+            )?;
+            let (incomplete_counts, incomplete_total) = full_incomplete_counts(&board);
+            let after_native_rescue =
+                fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+            if incomplete_total != after_native_rescue {
+                return Err(format!(
+                    "per-net native rescue count disagrees with full count: per_net={incomplete_total}, full={after_native_rescue}"
+                ));
+            }
+            driver.incomplete_counts = incomplete_counts;
+            driver.incomplete_total = incomplete_total;
+            driver.count_witness = IncompleteCountWitness::new(&board);
+            if incomplete_total > original_best_incompletes {
+                return Err(format!(
+                    "native rescue increased incompletes beyond the prior best: before_best={original_best_incompletes}, after={incomplete_total}"
+                ));
+            }
+            driver.best_board = board.clone();
+            driver.best_incompletes = incomplete_total;
+            (before_native_rescue, after_native_rescue, native_rescue)
+        };
+    let mut post_awx_native_rescue = None;
+    let mut post_awx_native_accepted = false;
+    let mut post_awx_native_workers = 0usize;
+    let mut post_awx_native_improved = false;
+    if native_rescue_before_awx {
+        let post_awx_before = fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+        let (post_awx_entry_counts, post_awx_entry_total) = full_incomplete_counts(&board);
+        if post_awx_entry_total != post_awx_before {
+            return Err(format!(
+                "per-net post-AWX native rescue entry count disagrees with full count: per_net={post_awx_entry_total}, full={post_awx_before}"
+            ));
+        }
+        let post_awx_best_before = driver.best_incompletes;
+        let open_before_post_awx =
+            crate::awx::final_reconcile::open_nets(&board, &job.protected_nets);
+        let post_awx_skip_reason = if native_rescue_reserved_ms == 0 {
+            Some("no_post_awx_budget_reserved")
+        } else if open_before_post_awx.is_empty() {
+            Some("no_open_nets")
+        } else {
+            None
+        };
+        if let Some(skip_reason) = post_awx_skip_reason {
+            post_awx_native_rescue = Some(serde_json::json!({
+                "before_incompletes":post_awx_before,
+                "after_incompletes":post_awx_before,
+                "summary":serde_json::Value::Null,
+                "budget_ms":native_rescue_reserved_ms,
+                "skip_reason":skip_reason
+            }));
+        } else {
+            let mut post_awx_config = job.native_rescue.clone();
+            post_awx_config.stage = NativeRescueStage::AfterAwx;
+            post_awx_config.budget_ms = native_rescue_reserved_ms;
+            post_awx_config.post_awx_budget_ms = 0;
+            let post_awx_summary = native_fanout_stage::run_rescue(
+                &mut board,
+                &baseline,
+                &job.protected_nets,
+                &post_awx_config,
+                native_rescue_deadline,
+                job.min_annular_ring_mm,
+            )?;
+            let (post_awx_counts, post_awx_total) = full_incomplete_counts(&board);
+            let post_awx_after = fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+            if post_awx_total != post_awx_after {
+                return Err(format!(
+                    "per-net post-AWX native rescue count disagrees with full count: per_net={post_awx_total}, full={post_awx_after}"
+                ));
+            }
+            if post_awx_after > post_awx_before || post_awx_after > post_awx_best_before {
+                return Err(format!(
+                    "post-AWX native rescue worsened its entry/best count: before={post_awx_before}, best={post_awx_best_before}, after={post_awx_after}"
+                ));
+            }
+            driver.incomplete_counts = post_awx_counts;
+            driver.incomplete_total = post_awx_total;
+            driver.count_witness = IncompleteCountWitness::new(&board);
+            driver.best_board = board.clone();
+            driver.best_incompletes = post_awx_total;
+            post_awx_native_accepted = post_awx_summary.accepted > 0;
+            post_awx_native_workers = post_awx_summary.multi_start_actual_workers;
+            post_awx_native_improved = post_awx_after < post_awx_before;
+            post_awx_native_rescue = Some(serde_json::json!({
+                "before_incompletes":post_awx_before,
+                "after_incompletes":post_awx_after,
+                "summary":post_awx_summary,
+                "budget_ms":native_rescue_reserved_ms,
+                "skip_reason":serde_json::Value::Null
+            }));
+        }
+    }
+    let native_improved = after_native_rescue < before_native_rescue || post_awx_native_improved;
+    let post_grid_before =
+        fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+    let (post_entry_counts, post_entry_total) = full_incomplete_counts(&board);
+    if post_entry_total != post_grid_before {
+        return Err(format!(
+            "per-net post-grid entry count disagrees with full count: per_net={post_entry_total}, full={post_grid_before}"
+        ));
+    }
+    driver.incomplete_counts = post_entry_counts;
+    driver.incomplete_total = post_entry_total;
+    driver.count_witness = IncompleteCountWitness::new(&board);
+    if post_entry_total <= driver.best_incompletes {
+        driver.best_board = board.clone();
+        driver.best_incompletes = post_entry_total;
+    }
+    let post_grid_started = Instant::now();
+    let open_after_native = crate::awx::final_reconcile::open_nets(&board, &job.protected_nets);
+    let post_grid_skip_reason = if !native_improved {
+        Some("native_no_global_improvement")
+    } else if post_grid_rescue_reserved_ms == 0 {
+        Some("no_post_grid_budget_reserved")
+    } else if open_after_native.is_empty() {
+        Some("no_open_nets")
+    } else if Instant::now() >= overall_deadline {
+        Some("overall_deadline_reached")
+    } else {
+        None
+    };
+    let (post_fine_grid_rescue, post_connected_group_residual_rescue, post_grid_ran) =
+        if post_grid_skip_reason.is_none() {
+            driver.ctx.deadline = overall_deadline.min(
+                Instant::now() + Duration::from_millis(post_grid_rescue_reserved_ms),
+            );
+            let fine = driver.fine_grid_rescue(&mut board, &nets, None)?;
+            let residual = driver.connected_group_residual_rescue(&mut board, &nets)?;
+            (fine, residual, true)
+        } else {
+            (serde_json::Value::Null, serde_json::Value::Null, false)
+        };
+    board = driver.best_board.clone();
+    let (post_counts, post_total) = full_incomplete_counts(&board);
+    let after_post_grid_rescue =
+        fr_engine::pipeline::stats::incomplete_count(&board.board, None);
+    if post_total != after_post_grid_rescue {
+        return Err(format!(
+            "per-net post-native grid rescue count disagrees with full count: per_net={post_total}, full={after_post_grid_rescue}"
+        ));
+    }
+    if post_total > post_grid_before {
+        return Err(format!(
+            "post-native grid rescue worsened its entry board: before_post={post_grid_before}, after_post={post_total}"
+        ));
+    }
+    driver.incomplete_counts = post_counts;
+    driver.incomplete_total = post_total;
+    driver.count_witness = IncompleteCountWitness::new(&board);
+    driver.best_board = board.clone();
+    driver.best_incompletes = post_total;
+    let post_native_grid_rescue = serde_json::json!({
+        "ran":post_grid_ran,
+        "skip_reason":post_grid_skip_reason,
+        "before_incompletes":post_grid_before,
+        "after_incompletes":after_post_grid_rescue,
+        "elapsed_ms":post_grid_started.elapsed().as_millis() as u64,
+        "fine_grid_rescue":post_fine_grid_rescue,
+        "connected_group_residual_rescue":post_connected_group_residual_rescue
+    });
     let final_board_incompletes =
         fr_engine::pipeline::stats::incomplete_count(&board.board, None);
     if final_board_incompletes != driver.incomplete_total {
         return Err(format!(
-            "record_best final count disagrees after fine-grid rescue: cached={}, full={final_board_incompletes}",
+            "record_best final count disagrees after terminal rescues: cached={}, full={final_board_incompletes}",
             driver.incomplete_total
         ));
     }
@@ -2559,7 +3509,6 @@ pub fn run(path: &Path) -> Result<(), String> {
     board.assert_invariants(&baseline, &job.protected_nets, true)?;
 
     let session = board.ses();
-
     // Restore authorized physical via definitions independently from the source
     // and explicit job rules before materializing the serialized route copper.
     let replay_layer = baseline
@@ -2589,6 +3538,10 @@ pub fn run(path: &Path) -> Result<(), String> {
         .collect::<Result<_, String>>()?;
     let mut replay =
         BoardAdapter::load_session_with_via_candidates(&input, &session, &replay_candidates)?;
+    crate::awx::board_snapshot::BoardSnapshot::apply_configured_via_drill(
+        &mut replay,
+        job.via_drill_mm,
+    )?;
 
     replay.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
     replay
@@ -2615,22 +3568,49 @@ pub fn run(path: &Path) -> Result<(), String> {
     let accepted = driver.accepted;
     let skips = driver.skips;
     let new_violations = board.new_violations_since(&baseline).len();
+    let fanout_accepted = pre_fanout.accepted_direct + pre_fanout.accepted_via > 0;
+    let native_accepted = native_rescue.accepted > 0 || post_awx_native_accepted;
+    let actual_solver = match (native_accepted, fanout_accepted) {
+        (true, true) => "native fanout + native maze + awx_grid::GridRouter",
+        (true, false) => "native maze + awx_grid::GridRouter",
+        (false, true) => "native fanout + awx_grid::GridRouter",
+        (false, false) => "awx_grid::GridRouter",
+    };
+    let native_effective_workers = native_rescue
+        .multi_start_actual_workers
+        .max(post_awx_native_workers);
+    let effective_threads = 1usize.max(native_effective_workers);
 
     let legacy_wall_seconds = started.elapsed().as_secs_f64();
     let final_unconnected =
         final_unconnected_inventory(&board, &nets, &attempts, &skips, &driver.retry_counts);
-    let report = serde_json::json!({
-        "actual_solver":"awx_grid::GridRouter","scope":"all native incompletes; active signal stack and native via transitions",
+    let mut report = serde_json::json!({
+        "actual_solver":actual_solver,"scope":"all native incompletes; active signal stack and native via transitions",
         "pad_access":job.pad_access.as_str(),
+        "pre_fanout":pre_fanout,
+        "pre_fine_grid_rescue":pre_fine_grid_rescue,
         "grid_step_mm":job.grid_step_mm,
         "scheduler":"native NetIncompletes Delaunay/Kruskal airlines; recomputed after each accepted transaction",
         "whole_bga_bus_stages":"not applicable: flattened component identity",
-        "budget_ms":job.budget_ms,"requested_threads":job.threads,"effective_threads":1,
-        "parallel_policy":"serial board transactions","wall_seconds":legacy_wall_seconds,
+        "budget_ms":job.budget_ms,"requested_threads":job.threads,
+        "effective_threads":effective_threads,
+        "native_rescue_reserved_ms":native_rescue_reserved_ms,
+        "post_grid_rescue_reserved_ms":post_grid_rescue_reserved_ms,
+        "parallel_policy":"serial AWX board transactions; native multi-start on independent board clones","wall_seconds":legacy_wall_seconds,
         "record_best_final_check":record_best_final_check,
         "fine_grid_rescue":fine_grid_rescue,
+        "connected_group_residual_rescue":connected_group_residual_rescue,
+        "final_reconcile":final_reconcile,
+        "native_rescue":native_rescue,
+        "post_native_grid_rescue":post_native_grid_rescue,
         "final_unconnected_nets":final_unconnected,
         "before_incompletes":before,"after_incompletes":fr_engine::pipeline::stats::incomplete_count(&board.board,None),
+        "after_final_incompletes":final_board_incompletes,
+        "after_pre_fanout_incompletes":prepared_before,
+        "after_pre_fine_grid_incompletes":after_pre_fine_grid,
+        "before_native_rescue_incompletes":before_native_rescue,
+        "after_native_rescue_incompletes":after_native_rescue,
+        "after_post_grid_rescue_incompletes":after_post_grid_rescue,
         "session_replay_incompletes":fr_engine::pipeline::stats::incomplete_count(&replay.board,None),
         "session_replay_vias":replay_vias.len(), "session_replay_via_geometry":replay_vias,
         "session_replay_new_violations":session_replay_new_violations,
@@ -2638,6 +3618,38 @@ pub fn run(path: &Path) -> Result<(), String> {
         "new_vias":board.board.get_vias().len().saturating_sub(baseline.board.get_vias().len()),"new_violations":new_violations,
         "attempts":attempts,"skipped":skips,"output":job.output
     });
+    let report_object = report
+        .as_object_mut()
+        .ok_or("final endpoint report is not a JSON object")?;
+    report_object.insert(
+        "awx_effective_threads".into(),
+        serde_json::Value::from(1usize),
+    );
+    report_object.insert(
+        "native_effective_workers".into(),
+        serde_json::Value::from(native_effective_workers),
+    );
+    report_object.insert(
+        "native_requested_starts".into(),
+        serde_json::Value::from(job.native_rescue.multi_start),
+    );
+    let native_rescue_stage = match job.native_rescue.stage {
+        NativeRescueStage::BeforeAwx => "before_awx",
+        NativeRescueStage::AfterAwx => "after_awx",
+    };
+    report_object.insert(
+        "native_rescue_stage".into(),
+        serde_json::Value::from(native_rescue_stage),
+    );
+    if native_rescue_before_awx {
+        report_object.insert(
+            "post_awx_native_rescue_reserved_ms".into(),
+            serde_json::Value::from(native_rescue_reserved_ms),
+        );
+        if let Some(post_awx_native_rescue) = post_awx_native_rescue {
+            report_object.insert("post_awx_native_rescue".into(), post_awx_native_rescue);
+        }
+    }
     let serialized_report = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
     write_atomic(&output_path, &session)?;
     let mut stdout = std::io::stdout().lock();
@@ -2695,6 +3707,10 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
     let input = fs::read(&input_path).map_err(|e| e.to_string())?;
     let session_input = fs::read(&session_path).map_err(|e| e.to_string())?;
     let mut dsn_board = BoardAdapter::load(&input)?;
+    crate::awx::board_snapshot::BoardSnapshot::apply_configured_via_drill(
+        &mut dsn_board,
+        job.via_drill_mm,
+    )?;
     dsn_board.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
     dsn_board
         .board
@@ -2726,6 +3742,10 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
         .collect::<Result<Vec<_>, String>>()?;
     let mut board =
         BoardAdapter::load_session_with_via_candidates(&input, &session_input, &via_candidates)?;
+    crate::awx::board_snapshot::BoardSnapshot::apply_configured_via_drill(
+        &mut board,
+        job.via_drill_mm,
+    )?;
     board.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
     board
         .board
@@ -2930,6 +3950,10 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
     let session = board.ses();
     let mut replay =
         BoardAdapter::load_session_with_via_candidates(&input, &session, &via_candidates)?;
+    crate::awx::board_snapshot::BoardSnapshot::apply_configured_via_drill(
+        &mut replay,
+        job.via_drill_mm,
+    )?;
     replay.configure_awx_hole_rules(job.hole_to_hole_clearance_mm);
     replay
         .board
@@ -3017,7 +4041,46 @@ pub fn run_residual(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod pad_access_tests {
-    use super::{EndpointJob, PadAccess, ResidualJob};
+    use super::{
+        build_endpoint_request, rules_for_layer, EndpointContext, EndpointJob, PadAccess,
+        ResidualJob,
+    };
+    use crate::{
+        awx::{board_snapshot::BoardSnapshot, native_rung},
+        board_adapter::BoardAdapter,
+    };
+    use std::time::{Duration, Instant};
+
+    const CLASS_VIA_DSN: &str = r#"(pcb test (resolution mil 1000) (unit mil)
+      (structure (layer Top (type signal)) (layer Bottom (type signal))
+        (boundary (rect pcb 0 0 1000 1000)) (via VIA_SMALL VIA_LARGE)
+        (rule (width 10) (clearance 4)))
+      (library
+        (padstack VIA_SMALL (shape (circle Top 20)) (shape (circle Bottom 20)))
+        (padstack VIA_LARGE (shape (circle Top 24)) (shape (circle Bottom 24))))
+      (network (net SMALL) (net LARGE)
+        (class small SMALL (circuit (use_via VIA_SMALL)) (rule (width 10) (clearance 4)))
+        (class large LARGE (circuit (use_via VIA_LARGE)) (rule (width 10) (clearance 4))))
+      (wiring))"#;
+
+    fn board_with_test_drills() -> BoardAdapter {
+        let mut board = BoardAdapter::load(CLASS_VIA_DSN.as_bytes()).unwrap();
+        BoardSnapshot::apply_configured_via_drill(&mut board, 0.3).unwrap();
+        board
+    }
+
+    fn endpoint_context() -> EndpointContext {
+        EndpointContext {
+            free_via_pads: Vec::new(),
+            same_net_pads: Vec::new(),
+            grid_step_mm: 0.05,
+            via_drill_mm: 0.3,
+            min_annular_ring_mm: 0.1,
+            hole_to_hole_clearance_mm: 0.0,
+            max_iterations: 10_000,
+            deadline: Instant::now() + Duration::from_secs(5),
+        }
+    }
 
     fn endpoint_job_toml(pad_access: Option<&str>) -> String {
         let pad_access = pad_access
@@ -3061,4 +4124,64 @@ mod pad_access_tests {
 
         assert!(matches!(residual.pad_access, PadAccess::CopperArea));
     }
+
+    #[test]
+    fn endpoint_rules_use_each_nets_source_class_via() {
+        let board = board_with_test_drills();
+        let top = board.board.layer_structure.get_no("Top");
+        for (name, expected) in [("SMALL", 0.508), ("LARGE", 0.6096)] {
+            let net = board.net_number(name).unwrap();
+            let rules = rules_for_layer(&board, net, top, 0.05, 0.3, 0.1, 0.0).unwrap();
+            assert!((rules.via_size - expected).abs() < 1e-6, "{name}: {rules:?}");
+            assert!((rules.via_drill - 0.3).abs() < 1e-6, "{name}: {rules:?}");
+            assert_eq!(rules.net_via_sizes.len(), 1);
+            let selected = rules.net_via_sizes.get(&(net as i32)).unwrap();
+            assert!((selected[0] - expected).abs() <= 1e-9, "{name}: {selected:?}");
+            assert!((selected[1] - 0.3).abs() <= 1e-9, "{name}: {selected:?}");
+        }
+    }
+
+    #[test]
+    fn endpoint_request_drops_unlisted_refit_and_unblock_vias() {
+        let board = board_with_test_drills();
+        let net = board.net_number("SMALL").unwrap();
+        let layers = vec![(board.board.layer_structure.get_no("Top"), "Top".to_owned())];
+        let request = build_endpoint_request(
+            &board,
+            &endpoint_context(),
+            net,
+            "SMALL",
+            "test",
+            crate::awx::braid_connect::RungEndpoint {
+                point: [2.0, 2.0],
+                layer: "Top".to_owned(),
+            },
+            crate::awx::braid_connect::RungEndpoint {
+                point: [4.0, 2.0],
+                layer: "Top".to_owned(),
+            },
+            &layers,
+        )
+        .unwrap();
+        let mut request = request;
+        request.rules.via_size = 1.5;
+        request.rules.via_drill = 0.4;
+        request.fab_via_rungs = vec![(1.5, 0.4), (0.6096, 0.3), (0.508, 0.3)];
+        let mut starts = vec![request.start.clone()];
+        let mut targets = vec![request.end.clone()];
+        assert!(native_rung::normalize_request_vias(&mut request, &mut starts, &mut targets)
+            .unwrap()
+            .is_none());
+        assert!((request.rules.via_size - 0.508).abs() < 1e-6);
+        assert!((request.rules.via_drill - 0.3).abs() < 1e-6);
+        assert_eq!(request.fab_via_rungs.len(), 1);
+        assert!((request.fab_via_rungs[0].0 - 0.508).abs() <= 1e-9);
+        assert!((request.fab_via_rungs[0].1 - 0.3).abs() <= 1e-9);
+        assert_eq!(request.rules.net_via_sizes.len(), 1);
+        let selected = request.rules.net_via_sizes.get(&(net as i32)).unwrap();
+        assert!((selected[0] - 0.508).abs() <= 1e-9);
+        assert!((selected[1] - 0.3).abs() <= 1e-9);
+    }
+
+
 }

@@ -347,6 +347,7 @@ fn stamp_item_via_cells(
     config: &NativeGridConfig,
     key: ItemKey,
     new_diameter: i32,
+    new_via_clearance_class: ClearanceClassNo,
     rung: usize,
     static_base: bool,
 ) -> Result<bool, String> {
@@ -361,7 +362,7 @@ fn stamp_item_via_cells(
             resolved_clearance(
                 board,
                 config,
-                config.via_clearance_class,
+                new_via_clearance_class,
                 item.clearance_class(),
                 *layer,
             )
@@ -435,6 +436,28 @@ pub fn add_foreign_via_obstacles(
     existing_vias: &[CopperVia],
     static_base: bool,
 ) -> Result<(), String> {
+    add_foreign_via_obstacles_projected(
+        obstacles,
+        board,
+        config,
+        own_nets,
+        pads,
+        existing_vias,
+        static_base,
+        super::native_obstacles::MapProjection::Full,
+    )
+}
+
+pub(crate) fn add_foreign_via_obstacles_projected(
+    obstacles: &mut GridObstacleMap,
+    board: &BoardAdapter,
+    config: &NativeGridConfig,
+    own_nets: &[NetNo],
+    pads: &[ContextPad],
+    existing_vias: &[CopperVia],
+    static_base: bool,
+    projection: super::native_obstacles::MapProjection,
+) -> Result<(), String> {
     if config.grid_step <= 0 || config.route_layers.len() != config.layer_numbers.len() {
         return Err("invalid native foreign-via grid configuration".into());
     }
@@ -453,109 +476,35 @@ pub fn add_foreign_via_obstacles(
     }
     // This map is independent of which copper layers are routable: source
     // stamps trace-to-via footprints on route and non-route copper layers.
-    stamp_foreign_trace_vias(obstacles, board, config, &own, static_base);
-    let native_pads = board.pads();
     let mut foreign_pad_meta = Vec::new();
-    for pad in pads {
-        if own.contains(&(pad.net_id as NetNo)) {
-            continue;
-        }
-        let mut native_match = None;
-        for native in &native_pads {
-            if native.reference == pad.key {
-                native_match = Some(native);
-                break;
+    if projection.via() {
+        stamp_foreign_trace_vias(obstacles, board, config, &own, static_base);
+        let native_pads = board.pads();
+        for pad in pads {
+            if own.contains(&(pad.net_id as NetNo)) {
+                continue;
             }
+            let mut native_match = None;
+            for native in &native_pads {
+                if native.reference == pad.key {
+                    native_match = Some(native);
+                    break;
+                }
+            }
+            let Some(native) = native_match else {
+                continue;
+            };
+            let Some(key) = native.key else {
+                continue;
+            };
+            foreign_pad_meta.push((pad, key));
         }
-        let Some(native) = native_match else {
-            continue;
-        };
-        let Some(key) = native.key else {
-            continue;
-        };
-        foreign_pad_meta.push((pad, key));
     }
 
     // Via-to-track keep-out is fixed by the obstacle via and route track, so
     // it is stamped once into the base track maps. The via-placement map is
     // rebuilt below for rung 0 and every distinct configured route-via size.
-    for via in &foreign_vias {
-        let gx = grid_round(via.center[0].round() as i32, step);
-        let gy = grid_round(via.center[1].round() as i32, step);
-        let off = ((via.center[0] - gx as f64 * step as f64).powi(2)
-            + (via.center[1] - gy as f64 * step as f64).powi(2))
-        .sqrt()
-            / step as f64;
-        for (layer_index, &layer_no) in config.layer_numbers.iter().enumerate() {
-            let clearance = resolved_clearance(
-                board,
-                config,
-                config.trace_clearance_class,
-                via.class,
-                layer_no,
-            );
-            let track_radius = ((via.diameter as f64 / 2.0
-                + config.track_width as f64 / 2.0
-                + clearance as f64
-                + config.extra_clearance as f64)
-                / step as f64)
-                .ceil()
-                .max(1.0)
-                + VIA_DIAGONAL_MARGIN_CELLS
-                + off;
-            let cells = circle_cells([gx, gy], track_radius);
-            for cell in cells {
-                stamp_track_cells(obstacles, &[cell], layer_index, static_base);
-            }
-        }
-    }
-
-    let mut rung_sizes = via_rung_geometries(config);
-    // Rung 0 is the configured run geometry; following indexes use the exact
-    // `obstacle_cache.via_rungs` order exposed by NativeGridConfig.
-    let mut geometries = vec![(0usize, config.via_size, config.via_drill)];
-    geometries.extend(
-        rung_sizes
-            .drain(..)
-            .enumerate()
-            .map(|(index, (size, drill))| (index + 1, size, drill)),
-    );
-
-    for (rung, new_diameter, new_drill) in geometries {
-        let mut generic_pin_stamps = BTreeSet::new();
-        let can_skip_duplicate_static_stamp = rung == 0 && static_base;
-        // Through-vias occupy every physical copper layer. Explicit keepouts
-        // foreign planes and native pads need their own via-radius footprint,
-        // independently of the thinner track footprint in the layer map.
-        for key in board.board.get_items() {
-            let item = board.board.item(key);
-            if item.is_on_board()
-                && !item.net_numbers().iter().any(|n| own.contains(n))
-                && matches!(
-                    item.board_item_type(),
-                    BoardItemType::ObstacleArea
-                        | BoardItemType::ViaObstacleArea
-                        | BoardItemType::ConductionArea
-                        | BoardItemType::Pin
-                )
-            {
-                let stamped = stamp_item_via_cells(
-                    obstacles,
-                    board,
-                    config,
-                    key,
-                    new_diameter,
-                    rung,
-                    static_base,
-                )?;
-                if can_skip_duplicate_static_stamp
-                    && item.board_item_type() == BoardItemType::Pin
-                    && stamped
-                {
-                    generic_pin_stamps.insert(key);
-                }
-            }
-        }
+    if projection.track() {
         for via in &foreign_vias {
             let gx = grid_round(via.center[0].round() as i32, step);
             let gy = grid_round(via.center[1].round() as i32, step);
@@ -563,50 +512,142 @@ pub fn add_foreign_via_obstacles(
                 + (via.center[1] - gy as f64 * step as f64).powi(2))
             .sqrt()
                 / step as f64;
-            let stack_clearance =
-                stack_clearance(board, config, config.via_clearance_class, via.class);
-            let radius =
-                via_placement_radius(via.diameter, new_diameter, stack_clearance, step) + off;
-            let cells = circle_cells([gx, gy], radius);
-            stamp_via_cells(obstacles, &cells, rung, static_base);
-            let holes = h2h_cells(
-                via.center,
-                via.drill,
-                new_drill,
-                config.hole_to_hole_clearance,
-                step,
-                upm,
-            );
-            stamp_via_cells(obstacles, &holes, rung, static_base);
-        }
-        for &(pad, key) in &foreign_pad_meta {
-            if !(can_skip_duplicate_static_stamp && generic_pin_stamps.contains(&key)) {
-                stamp_item_via_cells(
-                    obstacles,
+            for (layer_index, &layer_no) in config.layer_numbers.iter().enumerate() {
+                let clearance = resolved_clearance(
                     board,
                     config,
-                    key,
-                    new_diameter,
-                    rung,
-                    static_base,
-                )?;
+                    config.trace_clearance_class,
+                    via.class,
+                    layer_no,
+                );
+                let track_radius = ((via.diameter as f64 / 2.0
+                    + config.track_width as f64 / 2.0
+                    + clearance as f64
+                    + config.extra_clearance as f64)
+                    / step as f64)
+                    .ceil()
+                    .max(1.0)
+                    + VIA_DIAGONAL_MARGIN_CELLS
+                    + off;
+                let cells = circle_cells([gx, gy], track_radius);
+                for cell in cells {
+                    stamp_track_cells(obstacles, &[cell], layer_index, static_base);
+                }
             }
-            if pad.drill <= 0.0 || config.hole_to_hole_clearance <= 0 {
-                continue;
+        }
+    }
+
+    if projection.via() {
+        let mut rung_sizes = via_rung_geometries(config);
+        // Rung 0 is the configured run geometry; following indexes use the exact
+        // `obstacle_cache.via_rungs` order exposed by NativeGridConfig.
+        let mut geometries = vec![(0usize, config.via_size, config.via_drill)];
+        geometries.extend(
+            rung_sizes
+                .drain(..)
+                .enumerate()
+                .map(|(index, (size, drill))| (index + 1, size, drill)),
+        );
+
+        for (rung, new_diameter, new_drill) in geometries {
+            let (new_via_clearance_class, attach_smd_allowed) = config
+                .via_rule_geometry
+                .get(&(new_diameter, new_drill))
+                .copied()
+                .unwrap_or((config.via_clearance_class, false));
+            let mut generic_pin_stamps = BTreeSet::new();
+            let can_skip_duplicate_static_stamp = rung == 0 && static_base;
+            // Through-vias occupy every physical copper layer. Explicit keepouts
+            // foreign planes and native pads need their own via-radius footprint,
+            // independently of the thinner track footprint in the layer map.
+            for key in board.board.get_items() {
+                let item = board.board.item(key);
+                let own_pin = item.is_pin() && item.net_numbers().iter().any(|n| own.contains(n));
+                let own_pin_blocks_via = own_pin
+                    && (item.first_layer(&board.board) != item.last_layer(&board.board)
+                        || !attach_smd_allowed);
+                let foreign_via_keepout = !own_pin
+                    && !item.net_numbers().iter().any(|n| own.contains(n))
+                    && matches!(
+                        item.board_item_type(),
+                        BoardItemType::ObstacleArea
+                            | BoardItemType::ViaObstacleArea
+                            | BoardItemType::ConductionArea
+                            | BoardItemType::Pin
+                    );
+                if item.is_on_board() && (foreign_via_keepout || own_pin_blocks_via) {
+                    let stamped = stamp_item_via_cells(
+                        obstacles,
+                        board,
+                        config,
+                        key,
+                        new_diameter,
+                        new_via_clearance_class,
+                        rung,
+                        static_base,
+                    )?;
+                    if can_skip_duplicate_static_stamp
+                        && !own_pin
+                        && item.board_item_type() == BoardItemType::Pin
+                        && stamped
+                    {
+                        generic_pin_stamps.insert(key);
+                    }
+                }
             }
-            let axis = pad
-                .drill_axis
-                .unwrap_or([pad.point, pad.point])
-                .map(|p| [p[0] * upm, p[1] * upm]);
-            let cells = drill_axis_cells(
-                axis,
-                pad.drill * upm,
-                new_drill,
-                config.hole_to_hole_clearance,
-                step,
-                upm,
-            );
-            stamp_via_cells(obstacles, &cells, rung, static_base);
+            for via in &foreign_vias {
+                let gx = grid_round(via.center[0].round() as i32, step);
+                let gy = grid_round(via.center[1].round() as i32, step);
+                let off = ((via.center[0] - gx as f64 * step as f64).powi(2)
+                    + (via.center[1] - gy as f64 * step as f64).powi(2))
+                .sqrt()
+                    / step as f64;
+                let stack_clearance =
+                    stack_clearance(board, config, new_via_clearance_class, via.class);
+                let radius =
+                    via_placement_radius(via.diameter, new_diameter, stack_clearance, step) + off;
+                let cells = circle_cells([gx, gy], radius);
+                stamp_via_cells(obstacles, &cells, rung, static_base);
+                let holes = h2h_cells(
+                    via.center,
+                    via.drill,
+                    new_drill,
+                    config.hole_to_hole_clearance,
+                    step,
+                    upm,
+                );
+                stamp_via_cells(obstacles, &holes, rung, static_base);
+            }
+            for &(pad, key) in &foreign_pad_meta {
+                if !(can_skip_duplicate_static_stamp && generic_pin_stamps.contains(&key)) {
+                    stamp_item_via_cells(
+                        obstacles,
+                        board,
+                        config,
+                        key,
+                        new_diameter,
+                        new_via_clearance_class,
+                        rung,
+                        static_base,
+                    )?;
+                }
+                if pad.drill <= 0.0 || config.hole_to_hole_clearance <= 0 {
+                    continue;
+                }
+                let axis = pad
+                    .drill_axis
+                    .unwrap_or([pad.point, pad.point])
+                    .map(|p| [p[0] * upm, p[1] * upm]);
+                let cells = drill_axis_cells(
+                    axis,
+                    pad.drill * upm,
+                    new_drill,
+                    config.hole_to_hole_clearance,
+                    step,
+                    upm,
+                );
+                stamp_via_cells(obstacles, &cells, rung, static_base);
+            }
         }
     }
     Ok(())
@@ -633,5 +674,87 @@ mod layer_name_tests {
         assert!(is_copper_layer(&board, "F.Cu"));
         assert!(is_copper_layer(&board, "B.Cu"));
         assert!(!is_copper_layer(&board, "*.Cu"));
+    }
+}
+
+#[cfg(test)]
+mod same_net_pin_via_tests {
+    use super::{add_foreign_via_obstacles, grid_round};
+    use crate::{awx::native_obstacles::NativeGridConfig, board_adapter::BoardAdapter};
+    use awx_grid::obstacle_map::GridObstacleMap;
+    use fr_engine::ids::NetNo;
+    use std::collections::BTreeMap;
+
+    fn config(attach_smd_allowed: bool) -> NativeGridConfig {
+        NativeGridConfig {
+            grid_step: 100,
+            clearance: 0,
+            track_width: 100,
+            via_size: 400,
+            via_drill: 200,
+            hole_to_hole_clearance: 0,
+            same_net_pad_clearance: 0,
+            board_edge_clearance: 0,
+            bga_exclusion_zones: Vec::new(),
+            bga_proximity_radius: 0,
+            bga_proximity_cost: 0.0,
+            extra_clearance: 0.0,
+            route_layers: vec!["Top".to_owned(), "Bottom".to_owned()],
+            layer_numbers: vec![0, 1],
+            net_via_sizes: BTreeMap::new(),
+            via_rule_geometry: BTreeMap::from([((400, 200), (0, attach_smd_allowed))]),
+            fab_via_rungs: Vec::new(),
+            ordered_via_rungs: Vec::new(),
+            trace_clearance_class: 0,
+            via_clearance_class: 0,
+        }
+    }
+
+    #[test]
+    fn same_net_smd_pin_blocks_only_unattached_new_vias() {
+        let dsn = include_bytes!("../../tests/fixtures/two_chip.dsn");
+        let board = BoardAdapter::load(dsn).unwrap();
+        let net = board.net_number("BUS").unwrap();
+        let pin = board
+            .board
+            .get_pins()
+            .into_iter()
+            .map(|key| board.board.item(key))
+            .find(|item| item.net_numbers().contains(&net))
+            .expect("fixture has a same-net SMD pad");
+        assert_eq!(pin.first_layer(&board.board), pin.last_layer(&board.board));
+        let center = pin.center(&board.board).to_float();
+        let cell = (
+            grid_round(center.x.round() as i32, 100),
+            grid_round(center.y.round() as i32, 100),
+        );
+
+        let mut blocked = GridObstacleMap::new(2);
+        add_foreign_via_obstacles(
+            &mut blocked,
+            &board,
+            &config(false),
+            &[net as NetNo],
+            &[],
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(blocked.is_via_blocked_rung(cell.0, cell.1, 0));
+        assert!(!blocked.is_blocked(cell.0, cell.1, 0));
+
+        let mut attach_allowed = GridObstacleMap::new(2);
+        add_foreign_via_obstacles(
+            &mut attach_allowed,
+            &board,
+            &config(true),
+            &[net as NetNo],
+            &[],
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(!attach_allowed.is_via_blocked_rung(cell.0, cell.1, 0));
+        assert!(!attach_allowed.is_blocked(cell.0, cell.1, 0));
     }
 }

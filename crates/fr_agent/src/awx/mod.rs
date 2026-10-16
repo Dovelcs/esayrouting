@@ -30,6 +30,7 @@ pub mod board_snapshot;
 pub mod whole_snap;
 
 pub mod native_execution;
+pub mod native_fanout_stage;
 
 pub mod whole_route;
 pub mod relayer;
@@ -94,3 +95,4 @@ pub mod via_pad_tap;
 pub mod net_multipoint;
 pub mod endpoint_recovery;
 pub mod via_blocker;
+pub(crate) mod final_reconcile;

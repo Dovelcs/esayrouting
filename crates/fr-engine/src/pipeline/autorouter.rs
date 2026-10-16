@@ -58,6 +58,9 @@ pub struct BatchAutorouter {
     pub remove_unconnected_vias: bool,
     pub trace_costs: Vec<ExpansionCostFactor>,
     pub retain_autoroute_database: bool,
+    /// Defer strict DRC to the caller, which must run exact DRC on a trial clone and roll back
+    /// the whole trial if it fails.
+    pub defer_strict_drc_to_caller: bool,
     pub start_ripup_costs: i32,
     pub trace_pull_tight_accuracy: i32,
     pub total_items_routed: i32,
@@ -113,6 +116,20 @@ pub struct PassCounters {
 }
 
 impl BatchAutorouter {
+    /// Whether the current pass exceeded the best incomplete count by the native rollback
+    /// threshold. Keep this predicate shared with callers that evaluate the same policy.
+    pub fn should_rollback_regression(
+        pass_no: i32,
+        after: i32,
+        fewest: i32,
+        ignored: i32,
+        rollbacks: i32,
+    ) -> bool {
+        pass_no >= 2
+            && rollbacks < MAX_REGRESSION_ROLLBACKS
+            && after > fewest + ((fewest - ignored) * 3 / 10).max(20)
+    }
+
     /// Java `new BatchAutorouter(job)`.
     pub fn for_job(board: &RoutingBoard, settings: &RouterSettings) -> Self {
         Self::new(
@@ -186,6 +203,7 @@ impl BatchAutorouter {
             remove_unconnected_vias,
             trace_costs,
             retain_autoroute_database: false,
+            defer_strict_drc_to_caller: false,
             start_ripup_costs,
             trace_pull_tight_accuracy: pull_tight_accuracy,
             total_items_routed: 0,
@@ -420,13 +438,13 @@ impl BatchAutorouter {
                 let net_no = board.item(current).net_number(i);
                 let mut ripped = ItemSet::new();
                 let mut ripped_costs: HashMap<ItemKey, i32> = HashMap::new();
-                let snapshot = if settings.is_strict_drc() { Some(board.deep_copy()) } else { None };
+                let snapshot = if settings.is_strict_drc() && !self.defer_strict_drc_to_caller { Some(board.deep_copy()) } else { None };
                 let outcome = route_connection(board, settings, &params, current, net_no, &mut ripped, Some(&mut ripped_costs), pass_no, Some(stop));
                 let mut result = outcome.result;
                 if result.state == AutorouteAttemptState::Routed {
                     if let Some(max_id) = outcome.max_item_id_before_route {
                         // AutorouteConnectionRouter.applyStrictDrcAfterRoute
-                        if settings.is_strict_drc() || pass_no >= 3 {
+                        if !self.defer_strict_drc_to_caller && (settings.is_strict_drc() || pass_no >= 3) {
                             if let Some(rejection) = enforce_strict_drc(board, net_no, max_id) {
                                 if let Some(s) = snapshot {
                                     // Java replaces the board by the snapshot and continues with
@@ -624,6 +642,7 @@ impl BatchAutorouter {
                         }
                         let base = snapshot.get_or_insert_with(|| Arc::new(board.clone())).clone();
                         let tx = tx.clone();
+                        let defer_strict_drc_to_caller = self.defer_strict_drc_to_caller;
                         scope.spawn(move |_| {
                             let mut w = (*base).clone();
                             let done = match w.get_item(id) {
@@ -636,7 +655,7 @@ impl BatchAutorouter {
                                         route_connection(&mut w, settings, params_ref, key, net, &mut ripped, Some(&mut costs), pass_no, Some(stop));
                                     let mut result = outcome.result;
                                     let mut keep = result.state == AutorouteAttemptState::Routed;
-                                    if keep && pass_no >= 3 {
+                                    if keep && pass_no >= 3 && !defer_strict_drc_to_caller {
                                         if let Some(max_id) = outcome.max_item_id_before_route {
                                             if let Some(rejection) = enforce_strict_drc(&mut w, net, max_id) {
                                                 result = rejection;
@@ -804,7 +823,7 @@ impl BatchAutorouter {
         let mut costs: HashMap<ItemKey, i32> = HashMap::new();
         let outcome = route_connection(board, settings, params, key, net, &mut ripped, Some(&mut costs), pass_no, Some(stop));
         let mut result = outcome.result;
-        if result.state == AutorouteAttemptState::Routed && pass_no >= 3 {
+        if result.state == AutorouteAttemptState::Routed && pass_no >= 3 && !self.defer_strict_drc_to_caller {
             if let Some(max_id) = outcome.max_item_id_before_route {
                 if let Some(rejection) = enforce_strict_drc(board, net, max_id) {
                     result = rejection;
@@ -1054,10 +1073,13 @@ impl BatchAutorouter {
                 // the next pass starts from the best board so far. Java keeps routing from the
                 // worse board and restores the history only every few passes.
                 let best = fewest_incomplete.min(after.incomplete_count);
-                if current_pass >= 2
-                    && rollbacks < MAX_REGRESSION_ROLLBACKS
-                    && after.incomplete_count > fewest_incomplete + ((fewest_incomplete - ignored) * 3 / 10).max(20)
-                {
+                if Self::should_rollback_regression(
+                    current_pass,
+                    after.incomplete_count,
+                    fewest_incomplete,
+                    ignored,
+                    rollbacks,
+                ) {
                     if let Some(b) = bh.restore_best_board() {
                         let lost = after.incomplete_count;
                         *board = b;

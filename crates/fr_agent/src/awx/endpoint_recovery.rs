@@ -63,7 +63,8 @@ use crate::board_adapter::BoardAdapter;
 use awx_grid::blocking_analysis::{
     self, NetObstacles, Ranking, TrackObstacle, ViaObstacle,
 };
-use fr_engine::ids::NetNo;
+use fr_engine::ids::{FixedState, NetNo};
+use fr_geom::{Point, Polyline};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -119,6 +120,17 @@ pub(crate) struct RecoveryState {
     /// the ladder (the pop resets it), so no edge ever inherits a stale keystone.
     /// Empty means the failing attempt named no blame — never a fabricated net.
     attempt_blame: BTreeSet<NetNo>,
+    /// Snapshot and existing routed nets at the start of a nested source
+    /// reconcile epoch. The ordinary top-level pass continues to use its
+    /// original source baseline.
+    epoch_start: Option<Arc<BoardAdapter>>,
+    epoch_existing_nets: BTreeSet<NetNo>,
+    nested_authorized_nets: BTreeSet<NetNo>,
+    nested: bool,
+    nested_stub_boards: BTreeMap<NetNo, Arc<BoardAdapter>>,
+    priority_sweep_taken: bool,
+    routed_result_nets: BTreeSet<NetNo>,
+    preexisting_hints: BTreeMap<NetNo, Vec<NetNo>>,
 }
 
 impl RecoveryState {
@@ -156,9 +168,105 @@ impl RecoveryState {
     /// the ladder's rip order. A popped victim leaves the dedup set, so a later
     /// rip of the same net is not silently lost.
     pub(crate) fn pop_queued_victim(&mut self) -> Option<(NetNo, Arc<BoardAdapter>)> {
-        let victim = self.queued_victims.pop_front()?;
-        self.queued_net_ids.remove(&victim);
-        Some((victim, self.victim_restore_boards.remove(&victim)?))
+        while let Some(victim) = self.queued_victims.pop_front() {
+            self.queued_net_ids.remove(&victim);
+            if let Some(saved) = self.victim_restore_boards.remove(&victim) {
+                return Some((victim, saved));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn begin_nested(&mut self, start: &BoardAdapter, authorized: &BTreeSet<NetNo>) {
+        self.queued_victims.clear();
+        self.victim_restore_boards.clear();
+        self.queued_net_ids.clear();
+        self.successful_commits.clear();
+        self.rip_ancestry.clear();
+        self.restore_protected_net_ids.clear();
+        self.routed_result_nets.clear();
+        self.preexisting_hints.clear();
+        self.nested_stub_boards.clear();
+        self.priority_sweep_taken = false;
+        self.attempt_blame.clear();
+        self.attempt_source_xy = None;
+        self.attempt_target_xy = None;
+        self.epoch_start = Some(Arc::new(start.clone()));
+        let existing_copper = start
+            .board
+            .get_traces()
+            .into_iter()
+            .chain(start.board.get_vias())
+            .map(|key| {
+                let detachable = !start.is_source_protected_copper(key);
+                let nets = start.board.item(key).net_numbers().to_vec();
+                (detachable, nets)
+            })
+            .collect::<Vec<_>>();
+        self.epoch_existing_nets = existing_copper
+            .iter()
+            .flat_map(|(_, nets)| nets.iter().copied())
+            .collect();
+        self.nested_authorized_nets = authorized.clone();
+        let detachable_nets: BTreeSet<NetNo> = existing_copper
+            .iter()
+            .filter(|(detachable, _)| *detachable)
+            .flat_map(|(_, nets)| nets.iter().copied())
+            .collect();
+        self.routed_result_nets
+            .extend(authorized.intersection(&detachable_nets).copied());
+        self.nested = true;
+    }
+
+    pub(crate) fn take_preexisting_hints(&mut self) -> BTreeMap<NetNo, Vec<NetNo>> {
+        std::mem::take(&mut self.preexisting_hints)
+    }
+
+    pub(crate) fn note_routed_result(&mut self, net: NetNo) {
+        self.routed_result_nets.insert(net);
+    }
+
+    pub(crate) fn routed_result_nets(&self) -> &BTreeSet<NetNo> {
+        &self.routed_result_nets
+    }
+
+    pub(crate) fn record_terminal_restore(
+        &mut self,
+        net: NetNo,
+        saved: Arc<BoardAdapter>,
+        status: &str,
+    ) {
+        if status == "stub" {
+            self.nested_stub_boards.insert(net, saved);
+        } else if status == "full" || status == "full_open" {
+            self.nested_stub_boards.remove(&net);
+        }
+    }
+
+    pub(crate) fn take_priority_candidates(&mut self) -> Vec<(NetNo, Arc<BoardAdapter>)> {
+        if !self.nested || self.priority_sweep_taken {
+            return Vec::new();
+        }
+        self.priority_sweep_taken = true;
+        std::mem::take(&mut self.nested_stub_boards).into_iter().collect()
+    }
+
+    pub(crate) fn restore_protected_nets(&self) -> &BTreeSet<NetNo> {
+        &self.restore_protected_net_ids
+    }
+
+    pub(crate) fn commit_priority_restore(
+        &mut self,
+        target: NetNo,
+        owners: Vec<NetNo>,
+        before: &BoardAdapter,
+    ) {
+        self.record_commit(target, owners.clone(), before);
+        self.restore_protected_net_ids.insert(target);
+        self.routed_result_nets.insert(target);
+        for owner in owners {
+            self.routed_result_nets.remove(&owner);
+        }
     }
 
     /// Successful-commit history, needed by the driver for casualty custody and
@@ -212,6 +320,10 @@ impl RecoveryState {
     /// be re-queued.
     fn record_commit(&mut self, target: NetNo, victims: Vec<NetNo>, before_rip: &BoardAdapter) {
         self.queued_net_ids.remove(&target);
+        self.routed_result_nets.insert(target);
+        for victim in &victims {
+            self.routed_result_nets.remove(victim);
+        }
         // `before_rip` is the same custody source for every victim in this
         // committed combo. Share one owned snapshot instead of cloning the
         // entire board once per victim. The source keeps a per-victim copper
@@ -238,6 +350,38 @@ pub(crate) struct RipAccepted<T> {
     pub victims: Vec<NetNo>,
 }
 
+pub(crate) struct FailedVictimRestore {
+    pub board: Option<BoardAdapter>,
+    pub status: &'static str,
+    pub full_restore_error: Option<String>,
+    pub full_invariant_error: Option<String>,
+    pub stub_error: Option<String>,
+    pub restored_segments: usize,
+    pub restored_vias: usize,
+    pub retained_new_drc: Vec<serde_json::Value>,
+}
+
+#[derive(Clone)]
+struct EscapeStubSegment {
+    start: Point,
+    end: Point,
+    far_mm: [f64; 2],
+    layer: i32,
+    half_width: i32,
+    clearance_class: i32,
+    fixed_state: FixedState,
+}
+
+#[derive(Clone)]
+struct EscapeStubVia {
+    padstack_name: String,
+    center: Point,
+    center_mm: [f64; 2],
+    clearance_class: i32,
+    fixed_state: FixedState,
+    attach_allowed: bool,
+}
+
 /// Resolve a native net number to its board name.
 fn net_name(board: &BoardAdapter, net: NetNo) -> Result<String, String> {
     board
@@ -247,6 +391,413 @@ fn net_name(board: &BoardAdapter, net: NetNo) -> Result<String, String> {
         .get(net)
         .map(|net| net.name.clone())
         .ok_or_else(|| format!("native board has no net {net}"))
+}
+
+fn retained_drc_rows(
+    board: &BoardAdapter,
+    rows: &[crate::board_adapter::NewClearanceViolation],
+    phase: &str,
+) -> Vec<serde_json::Value> {
+    let items: BTreeMap<_, _> = board
+        .board
+        .get_items()
+        .into_iter()
+        .map(|key| (board.board.item(key).id().0, key))
+        .collect();
+    rows.iter()
+        .map(|violation| {
+            let record = &violation.record;
+            let item_row = |item_id: i32, kind: &str| {
+                let nets = items
+                    .get(&item_id)
+                    .map(|&key| {
+                        board
+                            .board
+                            .item(key)
+                            .net_numbers()
+                            .iter()
+                            .filter_map(|&net| board.board.rules.nets.get(net))
+                            .map(|net| net.name.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                serde_json::json!({"item_id":item_id,"type":kind,"nets":nets})
+            };
+            serde_json::json!({
+                "phase": phase,
+                "signature": violation.signature,
+                "pair": [
+                    item_row(record.first_id, &record.first_type),
+                    item_row(record.second_id, &record.second_type),
+                ],
+                "layer": record.layer,
+                "native_gap_units": record.actual_clearance_mm * board.units_per_mm,
+                "native_gap_mm": record.actual_clearance_mm,
+                "exact_copper_clearance_mm": record.exact_copper_clearance_mm,
+                "expected_clearance_mm": record.expected_clearance_mm,
+                "exact_shortfall_mm": record.exact_copper_clearance_mm
+                    .map(|gap| record.expected_clearance_mm - gap),
+                "overlap_bounds": record.overlap_bounds,
+            })
+        })
+        .collect()
+}
+
+fn victim_copper_added(before: &BoardAdapter, after: &BoardAdapter, victim: NetNo) -> (usize, usize) {
+    let before_ids: BTreeSet<_> = before
+        .board
+        .get_traces()
+        .into_iter()
+        .chain(before.board.get_vias())
+        .filter(|&key| before.board.item(key).contains_net(victim))
+        .map(|key| before.board.item(key).id().0)
+        .collect();
+    let count = |keys: Vec<fr_engine::board::ItemKey>| {
+        keys.into_iter()
+            .filter(|&key| {
+                let item = after.board.item(key);
+                item.contains_net(victim) && !before_ids.contains(&item.id().0)
+            })
+            .count()
+    };
+    (count(after.board.get_traces()), count(after.board.get_vias()))
+}
+
+fn segment_already_present(
+    board: &BoardAdapter,
+    net: NetNo,
+    candidate: &EscapeStubSegment,
+) -> bool {
+    let a_key = crate::board_adapter::canonical_point_key(&candidate.start);
+    let b_key = crate::board_adapter::canonical_point_key(&candidate.end);
+    board.board.get_traces().into_iter().any(|key| {
+        let item = board.board.item(key);
+        if !item.contains_net(net) {
+            return false;
+        }
+        let trace = item.trace();
+        if trace.layer() != candidate.layer || trace.half_width() != candidate.half_width {
+            return false;
+        }
+        trace.polyline().corners().windows(2).any(|pair| {
+            let start = crate::board_adapter::canonical_point_key(&pair[0]);
+            let end = crate::board_adapter::canonical_point_key(&pair[1]);
+            (start == a_key && end == b_key) || (start == b_key && end == a_key)
+        })
+    })
+}
+
+fn via_already_present(board: &BoardAdapter, net: NetNo, candidate: &EscapeStubVia) -> bool {
+    let center = crate::board_adapter::canonical_point_key(&candidate.center);
+    let center_mm_key = rounded_mm_key(candidate.center_mm);
+    board.board.get_vias().into_iter().any(|key| {
+        let item = board.board.item(key);
+        let item_center = item.center(&board.board);
+        let point = item_center.to_float();
+        let item_mm_key = rounded_mm_key([
+            point.x / board.units_per_mm,
+            point.y / board.units_per_mm,
+        ]);
+        item.contains_net(net)
+            && item
+                .padstack(&board.board)
+                .is_some_and(|stack| stack.name.as_str() == candidate.padstack_name)
+            && crate::board_adapter::canonical_point_key(&item_center) == center
+            && item_mm_key == center_mm_key
+    })
+}
+
+fn round_three_mm(value: f64) -> i64 {
+    (value * 1000.0).round_ties_even() as i64
+}
+
+fn rounded_mm_key(point: [f64; 2]) -> Option<(i64, i64)> {
+    point
+        .iter()
+        .all(|value| value.is_finite())
+        .then(|| (round_three_mm(point[0]), round_three_mm(point[1])))
+}
+
+fn axis_near_mm(a: [f64; 2], b: [f64; 2]) -> bool {
+    (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3
+}
+
+pub(crate) fn restore_failed_victim(
+    saved: &BoardAdapter,
+    current: &BoardAdapter,
+    baseline: &BoardAdapter,
+    protected: &BTreeSet<String>,
+    victim: NetNo,
+) -> FailedVictimRestore {
+    let mut outcome = FailedVictimRestore {
+        board: None,
+        status: "declined",
+        full_restore_error: None,
+        full_invariant_error: None,
+        stub_error: None,
+        restored_segments: 0,
+        restored_vias: 0,
+        retained_new_drc: Vec::new(),
+    };
+    let victim_name = match net_name(saved, victim) {
+        Ok(name) => name,
+        Err(error) => {
+            outcome.full_restore_error = Some(error);
+            return outcome;
+        }
+    };
+    let victim_names = BTreeSet::from([victim_name]);
+
+    let mut full = current.clone();
+    match native_execution::restore_nets(saved, &mut full, &victim_names) {
+        Err(error) => outcome.full_restore_error = Some(error),
+        Ok(()) => {
+            let (check, violations) =
+                full.assert_invariants_with_violation_report(baseline, protected, true);
+            if check.is_ok() {
+                let open = fr_engine::drc::NetIncompletes::new(
+                    &full.board,
+                    victim,
+                    &full.board.get_connectable_items(victim),
+                )
+                .count();
+                let (segments, vias) = victim_copper_added(current, &full, victim);
+                outcome.board = Some(full);
+                outcome.status = if open == 0 { "full" } else { "full_open" };
+                outcome.restored_segments = segments;
+                outcome.restored_vias = vias;
+                return outcome;
+            }
+            outcome.full_invariant_error = check.err();
+            outcome
+                .retained_new_drc
+                .extend(retained_drc_rows(&full, &violations, "full_restore"));
+        }
+    }
+
+    let mut pad_centers = Vec::<[f64; 2]>::new();
+    for key in current.board.get_pins() {
+        let item = current.board.item(key);
+        if !item.contains_net(victim) {
+            continue;
+        }
+        let center = item.center(&current.board).to_float();
+        pad_centers.push([
+            center.x / current.units_per_mm,
+            center.y / current.units_per_mm,
+        ]);
+    }
+
+    let mut stubs = Vec::<EscapeStubSegment>::new();
+    for key in saved.board.get_traces() {
+        let item = saved.board.item(key);
+        if !item.contains_net(victim) || saved.is_source_protected_copper(key) {
+            continue;
+        }
+        let trace = item.trace();
+        for pair in trace.polyline().corners().windows(2) {
+            let start = pair[0].to_float();
+            let end = pair[1].to_float();
+            let start_mm = [start.x / saved.units_per_mm, start.y / saved.units_per_mm];
+            let end_mm = [end.x / saved.units_per_mm, end.y / saved.units_per_mm];
+            if (end_mm[0] - start_mm[0]).hypot(end_mm[1] - start_mm[1]) > 2.0 {
+                continue;
+            }
+            let far_mm = if pad_centers
+                .iter()
+                .any(|pad| axis_near_mm(start_mm, *pad))
+            {
+                Some(end_mm)
+            } else if pad_centers.iter().any(|pad| axis_near_mm(end_mm, *pad)) {
+                Some(start_mm)
+            } else {
+                None
+            };
+            let Some(far_mm) = far_mm else { continue };
+            let rounded_far = rounded_mm_key(far_mm)
+                .map(|(x, y)| [x as f64 / 1000.0, y as f64 / 1000.0])
+                .unwrap_or(far_mm);
+            stubs.push(EscapeStubSegment {
+                start: pair[0].clone(),
+                end: pair[1].clone(),
+                far_mm: rounded_far,
+                layer: trace.layer(),
+                half_width: trace.half_width(),
+                clearance_class: item.clearance_class(),
+                fixed_state: item.fixed_state(),
+            });
+        }
+    }
+    let far_end_keys: BTreeSet<_> = stubs
+        .iter()
+        .filter_map(|stub| rounded_mm_key(stub.far_mm))
+        .collect();
+
+    let mut stub_vias = Vec::<EscapeStubVia>::new();
+    for key in saved.board.get_vias() {
+        let item = saved.board.item(key);
+        if !item.contains_net(victim) || saved.is_source_protected_copper(key) {
+            continue;
+        }
+        let Some(stack) = item.padstack(&saved.board) else {
+            outcome
+                .stub_error
+                .get_or_insert_with(|| "saved via has no padstack".into());
+            continue;
+        };
+        let Some(via) = item.as_via() else {
+            outcome
+                .stub_error
+                .get_or_insert_with(|| "saved via item lost via data".into());
+            continue;
+        };
+        let center = item.center(&saved.board);
+        let point = center.to_float();
+        let center_mm = [point.x / saved.units_per_mm, point.y / saved.units_per_mm];
+        let is_terminal = rounded_mm_key(center_mm)
+            .is_some_and(|key| far_end_keys.contains(&key))
+            || pad_centers
+                .iter()
+                .any(|pad| axis_near_mm(center_mm, *pad));
+        if !is_terminal {
+            continue;
+        }
+        stub_vias.push(EscapeStubVia {
+            padstack_name: stack.name.clone(),
+            center,
+            center_mm,
+            clearance_class: item.clearance_class(),
+            fixed_state: item.fixed_state(),
+            attach_allowed: via.attach_allowed,
+        });
+    }
+    if stubs.is_empty() && stub_vias.is_empty() {
+        outcome
+            .stub_error
+            .get_or_insert_with(|| "no eligible terminal escape stubs".into());
+        return outcome;
+    }
+
+    let mut stage = current.clone();
+    let mut usable_stubs = 0usize;
+    for stub in &stubs {
+        if stub.layer < 0 || stub.layer as usize >= stage.board.layer_structure.layers.len() {
+            outcome.stub_error.get_or_insert_with(|| {
+                format!("stub trace uses unknown saved layer {}", stub.layer)
+            });
+            continue;
+        }
+        if stub.clearance_class < 0
+            || stub.clearance_class >= stage.board.rules.clearance_matrix.get_class_count()
+        {
+            outcome
+                .stub_error
+                .get_or_insert_with(|| "stub trace has an unknown clearance class".into());
+            continue;
+        }
+        if segment_already_present(&stage, victim, stub) {
+            usable_stubs += 1;
+            continue;
+        }
+        let mut candidate = stage.clone();
+        let polyline = Polyline::from_two_points(&stub.start, &stub.end);
+        let inserted = candidate.board.insert_trace_without_cleaning(
+            polyline,
+            stub.layer,
+            stub.half_width,
+            &[victim],
+            stub.clearance_class,
+            stub.fixed_state,
+        );
+        if inserted.is_none() {
+            outcome
+                .stub_error
+                .get_or_insert_with(|| "stub trace insertion failed".into());
+            continue;
+        }
+        let report = candidate.new_clearance_violations_since(&stage);
+        if report.signatures.is_empty() {
+            stage = candidate;
+            outcome.restored_segments += 1;
+            usable_stubs += 1;
+        } else {
+            outcome.retained_new_drc.extend(retained_drc_rows(
+                &candidate,
+                &report.records,
+                "stub_segment",
+            ));
+            outcome
+                .stub_error
+                .get_or_insert_with(|| "stub trace caused retained new DRC".into());
+        }
+    }
+    for stub in &stub_vias {
+        if stub.clearance_class < 0
+            || stub.clearance_class >= stage.board.rules.clearance_matrix.get_class_count()
+        {
+            outcome
+                .stub_error
+                .get_or_insert_with(|| "stub via has an unknown clearance class".into());
+            continue;
+        }
+        if via_already_present(&stage, victim, stub) {
+            usable_stubs += 1;
+            continue;
+        }
+        let Some(padstack) = stage
+            .board
+            .library
+            .padstacks
+            .get_by_name(&stub.padstack_name)
+        else {
+            outcome.stub_error.get_or_insert_with(|| {
+                format!("stub via padstack {} is unknown", stub.padstack_name)
+            });
+            continue;
+        };
+        let mut candidate = stage.clone();
+        candidate.board.insert_via(
+            padstack.id,
+            stub.center.clone(),
+            &[victim],
+            stub.clearance_class,
+            stub.fixed_state,
+            stub.attach_allowed,
+        );
+        let report = candidate.new_clearance_violations_since(&stage);
+        if report.signatures.is_empty() {
+            stage = candidate;
+            outcome.restored_vias += 1;
+            usable_stubs += 1;
+        } else {
+            outcome.retained_new_drc.extend(retained_drc_rows(
+                &candidate,
+                &report.records,
+                "stub_via",
+            ));
+            outcome
+                .stub_error
+                .get_or_insert_with(|| "stub via caused retained new DRC".into());
+        }
+    }
+    if usable_stubs == 0 {
+        outcome
+            .stub_error
+            .get_or_insert_with(|| "no stub copper passed insertion and retained DRC".into());
+        return outcome;
+    }
+    let (check, violations) =
+        stage.assert_invariants_with_violation_report(baseline, protected, true);
+    if let Err(error) = check {
+        outcome.stub_error = Some(error);
+        outcome
+            .retained_new_drc
+            .extend(retained_drc_rows(&stage, &violations, "stub_final_invariants"));
+        return outcome;
+    }
+    outcome.status = "stub";
+    outcome.board = Some(stage);
+    outcome
 }
 
 /// Nets the run itself introduced: present in `current`, absent from the actual
@@ -260,6 +811,8 @@ fn this_run_eligible(
     target: NetNo,
     protected: &BTreeSet<String>,
     excluded: &BTreeSet<NetNo>,
+    nested: bool,
+    authorized: &BTreeSet<NetNo>,
 ) -> Result<BTreeSet<String>, String> {
     let target_name = net_name(current, target)?;
     let baseline_ids: BTreeSet<i32> = baseline
@@ -277,7 +830,14 @@ fn this_run_eligible(
         .chain(current.board.get_vias())
     {
         let item = current.board.item(key);
-        if baseline_ids.contains(&item.id().0) {
+        if current.is_source_protected_copper(key) {
+            continue;
+        }
+        let is_new = !baseline_ids.contains(&item.id().0);
+        let is_authorized_existing = nested
+            && authorized.iter().any(|net| item.contains_net(*net))
+            && !current.is_source_protected_copper(key);
+        if !is_new && !is_authorized_existing {
             continue;
         }
         for &number in item.net_numbers() {
@@ -456,6 +1016,186 @@ fn rank_victims(
     Ok(order)
 }
 
+/// Collect source-backed blockers that existed at the input/epoch boundary
+/// and still obstruct the actual frontier, while excluding nets the current
+/// pass can already rip (including nets only hidden by rip ancestry).
+fn record_preexisting_hints(
+    current: &BoardAdapter,
+    source: &BoardAdapter,
+    existing_nets: &BTreeSet<NetNo>,
+    target: NetNo,
+    protected: &BTreeSet<String>,
+    nested: bool,
+    authorized: &BTreeSet<NetNo>,
+    report: &braid_connect::RungReport,
+    target_xy: Option<[f64; 2]>,
+    source_xy: Option<[f64; 2]>,
+    state: &mut RecoveryState,
+) -> Result<(), String> {
+    if report.blocked_cells.is_empty() {
+        return Ok(());
+    }
+    let permissive_excluded = BTreeSet::from([target]);
+    let currently_rippable = this_run_eligible(
+        current,
+        source,
+        target,
+        protected,
+        &permissive_excluded,
+        nested,
+        authorized,
+    )?
+    .into_iter()
+    .filter_map(|name| current.net_number(&name).ok())
+    .collect::<BTreeSet<_>>();
+    let routed_results = state.routed_result_nets.clone();
+    let conduction_area_nets: BTreeSet<NetNo> = source
+        .board
+        .get_conduction_areas()
+        .into_iter()
+        .flat_map(|key| source.board.item(key).net_numbers().to_vec())
+        .collect();
+    let candidates: BTreeSet<NetNo> = existing_nets
+        .difference(&currently_rippable)
+        .copied()
+        .filter(|net| {
+            *net != target
+                && *net != 0
+                && !authorized.contains(net)
+                && !routed_results.contains(net)
+                && !conduction_area_nets.contains(net)
+                && current
+                    .board
+                    .rules
+                    .nets
+                    .get(*net)
+                    .is_some_and(|entry| !entry.contains_plane() && !protected.contains(&entry.name))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let candidate_names: BTreeSet<String> = candidates
+        .iter()
+        .filter_map(|&net| current.board.rules.nets.get(net).map(|n| n.name.clone()))
+        .collect();
+    let mut owners = Vec::<NetNo>::new();
+    let mut seen = BTreeSet::<NetNo>::new();
+    let anchors: Vec<[f64; 2]> = [source_xy, target_xy].into_iter().flatten().collect();
+    let step = report.grid_step_mm;
+    if step.is_finite() && step > 0.0 && !anchors.is_empty() {
+        let radius_cells = (2.0 / step) as usize;
+        let radius_mm = radius_cells.max(4) as f64 * step;
+        let near_cells = report
+            .blocked_cells
+            .iter()
+            .copied()
+            .filter(|(gx, gy, _)| {
+                let center = [*gx as f64 * step, *gy as f64 * step];
+                anchors.iter().any(|anchor| {
+                    (center[0] - anchor[0]).hypot(center[1] - anchor[1]) <= radius_mm
+                })
+            })
+            .collect();
+        append_ranked_hints(
+            current,
+            target,
+            &candidate_names,
+            report,
+            near_cells,
+            target_xy,
+            source_xy,
+            &mut owners,
+            &mut seen,
+        );
+    }
+    if owners.len() < 6 {
+        append_ranked_hints(
+            current,
+            target,
+            &candidate_names,
+            report,
+            report.blocked_cells.clone(),
+            target_xy,
+            source_xy,
+            &mut owners,
+            &mut seen,
+        );
+    }
+    // Endpoint-ring fallback follows source board trace and polyline order.
+    for anchor in anchors {
+        for key in current.board.get_traces() {
+            let item = current.board.item(key);
+            let trace = item.trace();
+            let points = trace.polyline().corners();
+            for pair in points.windows(2) {
+                let a = pair[0].to_float();
+                let b = pair[1].to_float();
+                let a_mm = [a.x / current.units_per_mm, a.y / current.units_per_mm];
+                let b_mm = [b.x / current.units_per_mm, b.y / current.units_per_mm];
+                if (a_mm[0].min(b_mm[0]) - 1.0) > anchor[0]
+                    || anchor[0] > (a_mm[0].max(b_mm[0]) + 1.0)
+                    || (a_mm[1].min(b_mm[1]) - 1.0) > anchor[1]
+                    || anchor[1] > (a_mm[1].max(b_mm[1]) + 1.0)
+                    || crate::board_adapter::point_segment_distance(anchor, a_mm, b_mm) > 1.0
+                {
+                    continue;
+                }
+                for &net in item.net_numbers() {
+                    if candidates.contains(&net) && seen.insert(net) {
+                        owners.push(net);
+                    }
+                }
+            }
+        }
+    }
+    if !owners.is_empty() {
+        let recorded = state.preexisting_hints.entry(target).or_default();
+        for net in owners {
+            if !recorded.contains(&net) {
+                recorded.push(net);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_ranked_hints(
+    current: &BoardAdapter,
+    target: NetNo,
+    candidate_names: &BTreeSet<String>,
+    report: &braid_connect::RungReport,
+    cells: Vec<(i32, i32, usize)>,
+    target_xy: Option<[f64; 2]>,
+    source_xy: Option<[f64; 2]>,
+    owners: &mut Vec<NetNo>,
+    seen: &mut BTreeSet<NetNo>,
+) {
+    if cells.is_empty() || owners.len() >= 6 {
+        return;
+    }
+    let mut subset = report.clone();
+    subset.blocked_cells = cells;
+    if let Ok(ranked) = rank_victims(
+        current,
+        target,
+        candidate_names,
+        &subset,
+        target_xy,
+        source_xy,
+    ) {
+        for name in ranked {
+            let Ok(net) = current.net_number(&name) else { continue };
+            if seen.insert(net) {
+                owners.push(net);
+                if owners.len() >= 6 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Promote the source `_via_unblock_blame` keystone to the FRONT of the ranked
 /// victims (`single_ended_loop.py:1034..1071`). Frontier attribution structurally
 /// cannot see the copper beneath a via's pad, so a boxed-pad failure names the
@@ -560,15 +1300,62 @@ where
     // Source `rip_exclude_set(state, target)`: the target, its rip ancestry and
     // the #622 restore-protected nets are never attributed, never ripped.
     let excluded = state.rip_exclude_set(target);
-    let eligible = this_run_eligible(current, baseline, target, protected, &excluded)?;
+    let nested = state.nested;
+    let authorization = if nested {
+        state.nested_authorized_nets.clone()
+    } else {
+        BTreeSet::new()
+    };
+    let epoch_start = state.epoch_start.clone();
+    let effective_baseline = epoch_start.as_deref().unwrap_or(baseline);
+    let hint_board = effective_baseline;
+    let target_xy = state.attempt_target_xy;
+    let source_xy = state.attempt_source_xy;
+    let mut standing_blame = state.take_attempt_blame();
+    let eligible = this_run_eligible(
+        current,
+        effective_baseline,
+        target,
+        protected,
+        &excluded,
+        nested,
+        &authorization,
+    )?;
+    let hint_net_ids: BTreeSet<NetNo> = if nested {
+        state.epoch_existing_nets.clone()
+    } else {
+        hint_board
+            .board
+            .get_traces()
+            .into_iter()
+            .chain(hint_board.board.get_vias())
+            .flat_map(|key| {
+                hint_board
+                    .board
+                    .item(key)
+                    .net_numbers()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    record_preexisting_hints(
+        current,
+        hint_board,
+        &hint_net_ids,
+        target,
+        protected,
+        nested,
+        &authorization,
+        frontier,
+        target_xy,
+        source_xy,
+        state,
+    )?;
     if eligible.is_empty() {
         return Ok(None);
     }
-    // Source endpoint-proximity tie-break (`single_source_xy`/`single_target_xy`),
-    // recorded by the endpoint owner before this edge. `None` stays `None`.
-    let target_xy = state.attempt_target_xy;
-    let source_xy = state.attempt_source_xy;
-
     // Default order from the ported frontier attribution. An empty frontier is
     // NOT terminal here: the source keystone below is structurally invisible to
     // this ranking, so the ladder may still have one named net to rip.
@@ -576,7 +1363,6 @@ where
     // ORIGINAL source keystone promotion (`single_ended_loop.py:1034..1071`):
     // consume the edge's via-unblock blame (the pop resets it) and promote the
     // nameable blocking net(s) to the FRONT of the ranked victims.
-    let mut standing_blame = state.take_attempt_blame();
     promote_blame(current, &eligible, &standing_blame, &mut order);
     if order.is_empty() {
         return Ok(None);
@@ -688,9 +1474,30 @@ where
         // No fresh frontier from this retry: keep the last valid report (and the
         // trial it was produced on) and advance to the next N.
         if let Some(report) = fresh {
+            record_preexisting_hints(
+                current,
+                hint_board,
+                &hint_net_ids,
+                target,
+                protected,
+                nested,
+                &authorization,
+                &report,
+                target_xy,
+                source_xy,
+                state,
+            )?;
             last_report = report;
         }
         last_trial = Some(trial);
     }
     Ok(None)
 }
+
+#[cfg(test)]
+#[path = "terminal_restore_tests.rs"]
+mod terminal_restore_tests;
+
+#[cfg(test)]
+#[path = "nested_recovery_tests.rs"]
+mod nested_recovery_tests;

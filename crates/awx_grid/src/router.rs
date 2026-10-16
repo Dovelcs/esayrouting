@@ -6,6 +6,25 @@ use std::collections::BinaryHeap;
 use crate::obstacle_map::GridObstacleMap;
 use crate::types::{GridState, OpenEntry, RouteStats, SearchSink, StatsSink, FrontierSink, DIRECTIONS, ORTHO_COST, DIAG_COST, DEFAULT_TURN_COST};
 
+/// Why a detailed route search stopped. A missing path alone cannot distinguish
+/// a complete search from one stopped by its iteration limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteTermination {
+    Found,
+    OpenSetExhausted,
+    IterationCap,
+}
+
+impl RouteTermination {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Found => "found",
+            Self::OpenSetExhausted => "open_set_exhausted",
+            Self::IterationCap => "iteration_cap",
+        }
+    }
+}
+
 /// Direction octant 0-7 for a unit step (soft-knobs N5: angle-proportional
 /// turn cost -- octant delta * 45 degrees is the turn angle).
 #[inline]
@@ -1195,6 +1214,36 @@ impl GridRouter {
         grace_tranches: u32,
         via_rung: usize,
     ) -> (Option<Vec<(i32, i32, u8)>>, u32, Vec<(i32, i32, u8)>) {
+        let (path, iterations, frontier, _) = self.route_with_frontier_detailed(
+            obstacles, sources, targets, max_iterations, collinear_vias,
+            via_exclusion_radius, start_direction, end_direction, direction_steps,
+            track_margin, max_iterations_ceiling, quantum_cells, quantum_pct,
+            grace_tranches, via_rung,
+        );
+        (path, iterations, frontier)
+    }
+
+    /// Detailed counterpart to `route_with_frontier`; the original method
+    /// remains the compatibility API for callers that only need path/frontier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_with_frontier_detailed(
+        &self,
+        obstacles: &GridObstacleMap,
+        sources: Vec<(i32, i32, u8)>,
+        targets: Vec<(i32, i32, u8)>,
+        max_iterations: u32,
+        collinear_vias: bool,
+        via_exclusion_radius: i32,
+        start_direction: Option<(i32, i32)>,
+        end_direction: Option<(f64, f64)>,
+        direction_steps: i32,
+        track_margin: TrackMarginArg,
+        max_iterations_ceiling: u32,
+        quantum_cells: f64,
+        quantum_pct: f64,
+        grace_tranches: u32,
+        via_rung: usize,
+    ) -> (Option<Vec<(i32, i32, u8)>>, u32, Vec<(i32, i32, u8)>, RouteTermination) {
         let mut opts = SearchOptions::new(collinear_vias, via_exclusion_radius,
                                       start_direction, end_direction,
                                       direction_steps, track_margin);
@@ -1207,14 +1256,91 @@ impl GridRouter {
             match search.step(self, obstacles, &mut sink) {
                 SearchStep::Found(goal_idx, _g) => {
                     let path = search.store.reconstruct_path(goal_idx);
-                    return (Some(path), search.iterations, Vec::new());
+                    return (Some(path), search.iterations, Vec::new(), RouteTermination::Found);
                 }
-                SearchStep::IterationCap | SearchStep::Exhausted => break,
+                SearchStep::IterationCap => {
+                    return (None, search.iterations, sink.tracker.get_blocked(), RouteTermination::IterationCap);
+                }
+                SearchStep::Exhausted => {
+                    return (None, search.iterations, sink.tracker.get_blocked(), RouteTermination::OpenSetExhausted);
+                }
                 SearchStep::Progress | SearchStep::Skipped => {}
             }
         }
+    }
+}
 
-        (None, search.iterations, sink.tracker.get_blocked())
+#[cfg(test)]
+mod termination_tests {
+    use super::{GridRouter, RouteTermination, TrackMarginArg};
+    use crate::obstacle_map::GridObstacleMap;
+
+    fn router() -> GridRouter {
+        GridRouter::new(
+            1000,
+            2.3,
+            Some(1000),
+            Some(10),
+            0,
+            0,
+            Some(vec![1000]),
+            Some(0),
+            Some(vec![255]),
+            250,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+
+    fn search(
+        obstacles: &GridObstacleMap,
+        target: (i32, i32, u8),
+        budget: u32,
+    ) -> (Option<Vec<(i32, i32, u8)>>, u32, Vec<(i32, i32, u8)>, RouteTermination) {
+        router().route_with_frontier_detailed(
+            obstacles,
+            vec![(0, 0, 0)],
+            vec![target],
+            budget,
+            false,
+            0,
+            None,
+            None,
+            8,
+            TrackMarginArg::Scalar(0.0),
+            budget,
+            2.0,
+            2.0,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn enclosed_source_reports_open_set_exhausted() {
+        let mut obstacles = GridObstacleMap::new(1);
+        obstacles.add_source_target_cell(0, 0, 0);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if dx != 0 || dy != 0 {
+                    obstacles.add_blocked_cell(dx, dy, 0);
+                }
+            }
+        }
+        let (path, _, _, termination) = search(&obstacles, (3, 0, 0), 100);
+        assert!(path.is_none());
+        assert_eq!(termination, RouteTermination::OpenSetExhausted);
+    }
+
+    #[test]
+    fn open_route_stopped_by_small_budget_reports_iteration_cap() {
+        let obstacles = GridObstacleMap::new(1);
+        let (path, iterations, _, termination) = search(&obstacles, (20, 0, 0), 1);
+        assert!(path.is_none());
+        assert_eq!(iterations, 1);
+        assert_eq!(termination, RouteTermination::IterationCap);
     }
 }
 

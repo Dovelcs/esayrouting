@@ -121,7 +121,23 @@ pub fn add_same_net_pad_drill_via_clearance(
     if config.hole_to_hole_clearance <= 0 {
         return Ok(());
     }
-    let new_drill = same_net_new_via_drill(config, net_id);
+    let base_drill = same_net_new_via_drill(config, net_id);
+    let cells = same_net_pad_drill_keepout_cells(board, net_id, config, pads, base_drill)?;
+    stamp_cells(obstacles, 0, &cells);
+    for (rung, (_, new_drill)) in populated_pad_rung_geometries(obstacles, config) {
+        let rung_cells = same_net_pad_drill_keepout_cells(board, net_id, config, pads, new_drill)?;
+        stamp_cells(obstacles, rung, &rung_cells);
+    }
+    Ok(())
+}
+
+fn same_net_pad_drill_keepout_cells(
+    board: &BoardAdapter,
+    net_id: NetNo,
+    config: &NativeGridConfig,
+    pads: &[ContextPad],
+    new_drill: i32,
+) -> Result<Vec<Cell>, String> {
     let mut cells = Vec::new();
     for pad in pads
         .iter()
@@ -144,6 +160,7 @@ pub fn add_same_net_pad_drill_via_clearance(
         let expand = ((required + half_len) / config.grid_step as f64).ceil() as i64 + 1;
         for dx in -expand..=expand {
             for dy in -expand..=expand {
+                // Keep the existing plated-barrel center free for layer exchange.
                 if dx == 0 && dy == 0 {
                     continue;
                 }
@@ -156,11 +173,7 @@ pub fn add_same_net_pad_drill_via_clearance(
             }
         }
     }
-    stamp_cells(obstacles, 0, &cells);
-    for rung in populated_via_rungs(obstacles) {
-        stamp_cells(obstacles, rung, &cells);
-    }
-    Ok(())
+    Ok(cells)
 }
 
 fn same_net_via_ring_cells(
@@ -214,6 +227,17 @@ fn populated_pad_rung_geometries(
     obstacles: &GridObstacleMap,
     config: &NativeGridConfig,
 ) -> Vec<(usize, ViaGeometry)> {
+    if !config.ordered_via_rungs.is_empty() {
+        return config
+            .ordered_via_rungs
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, geometry)| (index + 1, geometry))
+            .filter(|(rung, _)| obstacles.rung_len(*rung) > 0)
+            .collect();
+    }
+
     let run = (config.via_size, config.via_drill);
     let mut per: Vec<_> = config
         .net_via_sizes

@@ -140,6 +140,8 @@ pub struct RungBaseRequest {
     pub existing_vias: Vec<CopperVia>,
     /// Per-pad source paste geometry keyed by native pad key.
     pub paste_pads: BTreeMap<String, RungPastePadMetadata>,
+    /// Minimum annular ring required by this run's explicit fabrication policy.
+    pub min_annular_ring_mm: f64,
     pub rules: RoutingRules,
     /// Source AWX fabrication resolver, retained through every rung.
     pub fabrication: crate::awx::fab_rules::FabTier,
@@ -183,6 +185,7 @@ pub struct RungRequest {
     pub same_net_pads: Vec<ContextPad>,
     pub existing_vias: Vec<CopperVia>,
     pub paste_pads: BTreeMap<String, RungPastePadMetadata>,
+    pub min_annular_ring_mm: f64,
     pub rules: RoutingRules,
     pub fabrication: crate::awx::fab_rules::FabTier,
     pub escalation: crate::awx::fab_rules::EscalationPolicy,
@@ -360,6 +363,7 @@ pub fn connect_ladder<E: RungExecutor, B: RungBandFactory>(
             same_net_pads: base.same_net_pads.clone(),
             existing_vias: base.existing_vias.clone(),
             paste_pads: base.paste_pads.clone(),
+            min_annular_ring_mm: base.min_annular_ring_mm,
             rules: base.rules.clone(),
             fabrication: base.fabrication,
             escalation: base.escalation,

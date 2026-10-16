@@ -300,15 +300,20 @@ fn retain_clearance_candidate(
     } else {
         None
     };
+    let mut forbidden_same_net_smd_contact = false;
     if let Some((via_key, pin_key)) = via_pin {
         let via = board.item(via_key);
         let pin = board.item(pin_key);
         if via.shares_net(pin) {
             let attach_allowed = via.as_via().is_some_and(|via| via.attach_allowed);
-            if !attach_allowed {
+            if !attach_allowed && pin.drill_allowed(board) {
+                // An unattached via may not touch same-net SMD copper. A native
+                // tile candidate outside the real pad still goes through the
+                // exact gap check below, which also enforces numeric clearance.
+                forbidden_same_net_smd_contact = true;
+            } else if !attach_allowed {
                 return true;
-            }
-            if !pin.drill_allowed(board) {
+            } else if !pin.drill_allowed(board) {
                 let same_single_net = via.net_numbers().len() == 1
                     && pin.net_numbers().len() == 1
                     && via.net_numbers()[0] == pin.net_numbers()[0];
@@ -330,6 +335,9 @@ fn retain_clearance_candidate(
     ) else {
         return true;
     };
+    if forbidden_same_net_smd_contact && actual_gap <= 0.0 {
+        return true;
+    }
     !actual_gap.is_finite() || actual_gap < violation.expected_clearance
 }
 
@@ -340,6 +348,236 @@ pub(crate) fn canonical_point_key(point: &fr_geom::Point) -> String {
             let (x, y, z) = point.normalized_homogeneous_coordinates();
             format!("{x},{y},{z}")
         }
+    }
+}
+
+#[cfg(test)]
+mod unattached_same_net_smd_via_clearance_tests {
+    use super::retain_clearance_candidate;
+    use crate::board_adapter::BoardAdapter;
+    use fr_engine::{
+        board::ItemKey,
+        drc::clearance_violation::{clearance_violations, ClearanceViolation},
+        ids::FixedState,
+    };
+    use fr_geom::{IntPoint, Point};
+
+    const CUSTOM_PAD_DSN: &str = r#"
+(pcb unattached_same_net_smd_via
+(resolution mil 1000)
+ (unit mil)
+ (structure
+  (layer TopLayer (type signal))
+  (layer BottomLayer (type signal))
+  (via V24)
+  (boundary (rect pcb 0 0 2000 2000))
+  (rule (width 9.84))
+  (rule (clear 3.94))
+ )
+ (library
+  (image CHIP (pin CUSTOM 1 0 0))
+  (padstack CUSTOM
+   (shape (polygon TopLayer 0.1
+    -128.42 57.27 -84.18 112.63 128.42 -57.27 84.18 -112.63
+   ))
+  )
+  (padstack V24
+   (shape (circle TopLayer 24))
+   (shape (circle BottomLayer 24))
+  )
+ )
+ (placement (component CHIP (place U1 400 400 front 0)))
+ (network
+  (net N (pins U1-1))
+  (class N N
+   (circuit (use_via V24))
+   (rule (width 9.84) (clearance 3.94))
+  )
+ )
+)
+"#;
+
+    fn candidate_geometry(
+        offset_mil: [f64; 2],
+        attach_smd_allowed: bool,
+    ) -> Result<(BoardAdapter, ItemKey, ItemKey), String> {
+        let mut adapter = BoardAdapter::load(CUSTOM_PAD_DSN.as_bytes())
+            .map_err(|error| format!("fixture DSN load failed: {error}"))?;
+        let pin_key = adapter
+            .board
+            .get_pins()
+            .first()
+            .copied()
+            .ok_or("fixture did not load its SMD pin")?;
+        let pin = adapter.board.item(pin_key);
+        let pin_center = pin.center(&adapter.board).to_float();
+        let net = pin
+            .net_numbers()
+            .first()
+            .copied()
+            .ok_or("fixture SMD pin has no net")?;
+        if !pin.drill_allowed(&adapter.board) {
+            return Err("fixture pin is not a single-layer SMD pad".into());
+        }
+        let net_class = adapter
+            .board
+            .rules
+            .nets
+            .get(net)
+            .ok_or("fixture net missing from board rules")?
+            .get_net_class();
+        let via_rule_id = adapter.board.rules.net_classes[net_class]
+            .get_via_rule()
+            .ok_or("fixture net class has no via rule")?;
+        let via_info_id = adapter.board.rules.via_rules[via_rule_id]
+            .vias()
+            .first()
+            .copied()
+            .ok_or("fixture via rule has no ViaInfo candidate")?;
+        let (padstack, clearance_class) = {
+            let via_info = &adapter.board.rules.via_infos[via_info_id];
+            (
+                via_info.get_padstack(),
+                via_info.get_clearance_class_index(),
+            )
+        };
+        // The fixture imports attach=false by default; toggle only the in-memory
+        // ViaInfo for the positive predicate case.
+        adapter
+            .board
+            .rules_mut()
+            .via_infos[via_info_id]
+            .set_attach_smd_allowed(attach_smd_allowed);
+        let scale = adapter.units_per_mm * 0.0254;
+        let via_center = Point::Int(IntPoint::new(
+            (pin_center.x + offset_mil[0] * scale).round() as i32,
+            (pin_center.y + offset_mil[1] * scale).round() as i32,
+        ));
+        let via_key = adapter.board.insert_via(
+            padstack,
+            via_center,
+            &[net],
+            clearance_class,
+            FixedState::UserFixed,
+            attach_smd_allowed,
+        );
+        Ok((adapter, pin_key, via_key))
+    }
+
+    fn native_candidate(
+        offset_mil: [f64; 2],
+    ) -> Result<(BoardAdapter, ItemKey, ClearanceViolation), String> {
+        let (adapter, pin_key, via_key) = candidate_geometry(offset_mil, false)?;
+        let is_pair = |violation: &ClearanceViolation| {
+            (violation.first_item == pin_key && violation.second_item == via_key)
+                || (violation.first_item == via_key && violation.second_item == pin_key)
+        };
+        let via_query = clearance_violations(&adapter.board, via_key)
+            .into_iter()
+            .find(|violation| is_pair(violation))
+            .ok_or("via-key clearance query produced no Via/Pin candidate")?;
+        let pin_query = clearance_violations(&adapter.board, pin_key)
+            .into_iter()
+            .find(|violation| is_pair(violation))
+            .ok_or("pin-key clearance query produced no Via/Pin candidate")?;
+        if pin_query.layer != via_query.layer
+            || pin_query.expected_clearance != via_query.expected_clearance
+            || pin_query.actual_clearance != via_query.actual_clearance
+        {
+            return Err(format!(
+                "Pin-key and Via-key candidate records differ: pin={pin_query:?}, via={via_query:?}"
+            ));
+        }
+        let violation = via_query;
+        Ok((adapter, via_key, violation))
+    }
+
+    #[test]
+    fn unattached_smd_via_uses_real_custom_polygon_gap_after_native_candidate() {
+        // Fixed world vector from the pin center to the via center, in mil.
+        // The DSN relative-coordinate transform preserves both axes.
+        let (adapter, _, violation) = native_candidate([-0.251, -66.090])
+            .expect("legal-offset setup should produce a native tile candidate");
+        let raw_gap = crate::copper_clearance::actual_copper_gap(
+            &adapter.board,
+            violation.first_item,
+            violation.second_item,
+            violation.layer,
+        )
+        .expect("legal-offset pair has exact custom-polygon and via copper shapes");
+        let raw_gap_mm = raw_gap / adapter.units_per_mm;
+        let expected_mm = violation.expected_clearance / adapter.units_per_mm;
+        assert!(
+            (expected_mm - 0.100076).abs() < 1e-6,
+            "expected {expected_mm} mm"
+        );
+        assert!(
+            raw_gap_mm > expected_mm,
+            "legal offset gap {raw_gap_mm} mm must exceed {expected_mm} mm"
+        );
+        assert!(
+            (raw_gap_mm - 0.1105643).abs() < 1e-4,
+            "legal offset gap changed: {raw_gap_mm} mm"
+        );
+        assert!(!retain_clearance_candidate(
+            &adapter.board,
+            &violation,
+            false
+        ));
+
+        // Move 0.5 mil toward the pad along the inward normal of edge D→A;
+        // the real gap becomes about 3.85 mil, below the 3.94 mil rule.
+        let (adapter, _, violation) = native_candidate([0.061, -65.700])
+            .expect("near-clearance setup should produce a native tile candidate");
+        let gap = crate::copper_clearance::actual_copper_gap(
+            &adapter.board,
+            violation.first_item,
+            violation.second_item,
+            violation.layer,
+        )
+        .expect("near-clearance pair has exact custom-polygon and via copper shapes");
+        let gap_mm = gap / adapter.units_per_mm;
+        let expected_mm = violation.expected_clearance / adapter.units_per_mm;
+        assert!(
+            gap_mm < expected_mm,
+            "near gap {gap_mm} vs {expected_mm} mm"
+        );
+        assert!(
+            (gap_mm - 0.0978784).abs() < 1e-4,
+            "near-offset gap changed: {gap_mm} mm"
+        );
+        assert!(retain_clearance_candidate(
+            &adapter.board,
+            &violation,
+            false
+        ));
+
+        let (adapter, _, mut overlap) = native_candidate([0.0, 0.0])
+            .expect("overlap setup should produce a native tile candidate");
+        let overlap_gap = crate::copper_clearance::actual_copper_gap(
+            &adapter.board,
+            overlap.first_item,
+            overlap.second_item,
+            overlap.layer,
+        )
+        .expect("overlap pair has real copper on the candidate layer");
+        assert!(overlap_gap <= 0.0, "overlap gap is {overlap_gap} native units");
+        overlap.expected_clearance = 0.0;
+        assert!(retain_clearance_candidate(&adapter.board, &overlap, false));
+
+        let (blocked, blocked_pin, blocked_via) = candidate_geometry([0.0, 0.0], false)
+            .expect("unattached predicate pair geometry");
+        let pin = blocked.board.item(blocked_pin);
+        let via = blocked.board.item(blocked_via);
+        assert!(pin.is_obstacle(blocked_pin, via, blocked_via, &blocked.board));
+        assert!(via.is_obstacle(blocked_via, pin, blocked_pin, &blocked.board));
+
+        let (allowed, allowed_pin, allowed_via) = candidate_geometry([0.0, 0.0], true)
+            .expect("attached predicate pair geometry");
+        let pin = allowed.board.item(allowed_pin);
+        let via = allowed.board.item(allowed_via);
+        assert!(!pin.is_obstacle(allowed_pin, via, allowed_via, &allowed.board));
+        assert!(!via.is_obstacle(allowed_via, pin, allowed_pin, &allowed.board));
     }
 }
 
@@ -371,6 +609,119 @@ fn canonical_polyline_key(points: &[fr_geom::Point]) -> String {
     }
 }
 
+#[cfg(test)]
+mod session_replay_copper_count_tests {
+    use super::BoardAdapter;
+    use std::collections::BTreeSet;
+
+    fn board_with_fixed_bus_trace() -> BoardAdapter {
+        let source = String::from_utf8(include_bytes!("../tests/fixtures/two_chip.dsn").to_vec())
+            .unwrap();
+        let source = source.trim_end().strip_suffix(')').unwrap();
+        let source = format!(
+            "{source}\n (wiring (wire (path Top 0.15 2 3 18 3) (net BUS) (type fix)))\n)\n"
+        );
+        BoardAdapter::load(source.as_bytes()).unwrap()
+    }
+
+    fn bus_trace(adapter: &BoardAdapter) -> fr_engine::board::ItemKey {
+        let net = adapter.net_number("BUS").unwrap();
+        adapter
+            .board
+            .get_traces()
+            .into_iter()
+            .find(|&key| adapter.board.item(key).net_numbers().contains(&net))
+            .unwrap()
+    }
+
+    fn bus_trace_count(adapter: &BoardAdapter) -> usize {
+        let net = adapter.net_number("BUS").unwrap();
+        adapter
+            .board
+            .get_traces()
+            .into_iter()
+            .filter(|&key| adapter.board.item(key).net_numbers().contains(&net))
+            .count()
+    }
+
+    fn duplicate_bus_trace(adapter: &mut BoardAdapter) {
+        let key = bus_trace(adapter);
+        let item = adapter.board.item(key);
+        let trace = item.trace();
+        let polyline = trace.polyline().clone();
+        let layer = trace.layer();
+        let half_width = trace.half_width();
+        let clearance_class = item.clearance_class();
+        let fixed_state = item.fixed_state();
+        let net = item.net_numbers()[0];
+        adapter
+            .board
+            .insert_trace_without_cleaning(
+                polyline,
+                layer,
+                half_width,
+                &[net],
+                clearance_class,
+                fixed_state,
+            )
+            .unwrap();
+    }
+
+    fn remove_one_bus_trace(adapter: &mut BoardAdapter) {
+        let key = bus_trace(adapter);
+        adapter
+            .board
+            .item_mut(key)
+            .set_fixed_state(fr_engine::ids::FixedState::Unfixed);
+        adapter.board.remove_item(key);
+    }
+
+    #[test]
+    fn replay_accepts_an_extra_identical_nonprotected_trace() {
+        let before = board_with_fixed_bus_trace();
+        let mut replay = before.clone();
+        duplicate_bus_trace(&mut replay);
+
+        replay
+            .assert_session_invariants(&before, &BTreeSet::new(), true)
+            .unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_removing_one_of_two_original_identical_traces() {
+        let mut before = board_with_fixed_bus_trace();
+        duplicate_bus_trace(&mut before);
+        assert_eq!(bus_trace_count(&before), 2);
+        let mut replay = before.clone();
+        remove_one_bus_trace(&mut replay);
+        assert_eq!(bus_trace_count(&replay), 1);
+
+        let error = replay
+            .assert_session_invariants(&before, &BTreeSet::new(), true)
+            .unwrap_err();
+        assert!(
+            error.contains("required original copper geometry/classification changed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn replay_rejects_an_extra_identical_protected_trace() {
+        let before = board_with_fixed_bus_trace();
+        let mut replay = before.clone();
+        duplicate_bus_trace(&mut replay);
+        let protected = BTreeSet::from(["BUS".to_owned()]);
+
+        let error = replay
+            .assert_session_invariants(&before, &protected, true)
+            .unwrap_err();
+        assert!(
+            error.contains("protected copper changed or acquired new geometry"),
+            "{error}"
+        );
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Pad {
     pub reference: String,
@@ -398,11 +749,40 @@ pub struct BoardAdapter {
     /// edge contours, not holes through the board.
     pub board_edge_contours: Vec<Vec<[i32; 2]>>,
 }
+
+pub type ClearanceViolationSignature = (i32, i32, i32, u64, u64);
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RetainedClearanceViolation {
+    pub first_id: i32,
+    pub first_type: String,
+    pub second_id: i32,
+    pub second_type: String,
+    pub layer: i32,
+    pub expected_clearance_mm: f64,
+    pub exact_copper_clearance_mm: Option<f64>,
+    pub actual_clearance_mm: f64,
+    pub overlap_bounds: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NewClearanceViolation {
+    pub signature: ClearanceViolationSignature,
+    #[serde(flatten)]
+    pub record: RetainedClearanceViolation,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NewClearanceViolationReport {
+    pub signatures: BTreeSet<ClearanceViolationSignature>,
+    pub records: Vec<NewClearanceViolation>,
+}
+
 impl BoardAdapter {
     /// Apply the AWX source policy only when the job disables H2H and the native
     /// board has no copper-to-hole clearance rule. Unknown source drill sizes
     /// remain unverified; this does not establish hole safety.
-    pub(crate) fn configure_awx_hole_rules(&mut self, job_hole_to_hole_clearance_mm: f64) {
+    pub fn configure_awx_hole_rules(&mut self, job_hole_to_hole_clearance_mm: f64) {
         self.awx_same_net_via_pad_contact =
             job_hole_to_hole_clearance_mm == 0.0 && self.board.rules.get_hole_clearance() == 0;
     }
@@ -688,6 +1068,7 @@ impl BoardAdapter {
     pub fn ses(&self) -> Vec<u8> {
         fr_io::ses_writer::ses_bytes(&self.board, "fr_agent.dsn")
     }
+
     pub fn check_candidate(
         &self,
         candidate: &PlanCandidate,
@@ -996,11 +1377,13 @@ impl BoardAdapter {
         self.board.rules_mut().clearance_tolerance_um = previous_tolerance;
         Ok(key)
     }
-    pub fn violations(&self) -> BTreeSet<(i32, i32, i32, u64, u64)> {
+    pub fn violations(&self) -> BTreeSet<ClearanceViolationSignature> {
         self.violations_for_scan()
     }
-    fn violations_for_scan(&self) -> BTreeSet<(i32, i32, i32, u64, u64)> {
-        let mut result = BTreeSet::new();
+    fn for_each_retained_violation(
+        &self,
+        mut visit: impl FnMut(ClearanceViolationSignature, ClearanceViolation),
+    ) {
         for key in self.board.item_repository().iter() {
             for candidate in clearance_violations(&self.board, key) {
                 if retain_clearance_candidate(
@@ -1010,16 +1393,32 @@ impl BoardAdapter {
                 ) {
                     let a = self.board.item(candidate.first_item).id().0;
                     let b = self.board.item(candidate.second_item).id().0;
-                    result.insert((
+                    let signature = (
                         a.min(b),
                         a.max(b),
                         candidate.layer,
                         candidate.expected_clearance.to_bits(),
                         candidate.actual_clearance.to_bits(),
-                    ));
+                    );
+                    visit(signature, candidate);
                 }
             }
         }
+    }
+    fn violations_for_scan(&self) -> BTreeSet<ClearanceViolationSignature> {
+        let mut result = BTreeSet::new();
+        self.for_each_retained_violation(|signature, _| {
+            result.insert(signature);
+        });
+        result
+    }
+    fn retained_violations_for_scan(
+        &self,
+    ) -> BTreeMap<ClearanceViolationSignature, ClearanceViolation> {
+        let mut result = BTreeMap::new();
+        self.for_each_retained_violation(|signature, violation| {
+            result.entry(signature).or_insert(violation);
+        });
         result
     }
     /// Exact-copper DRC additions relative to `before`, excluding only a
@@ -1028,9 +1427,31 @@ impl BoardAdapter {
     pub fn new_violations_since(
         &self,
         before: &BoardAdapter,
-    ) -> BTreeSet<(i32, i32, i32, u64, u64)> {
+    ) -> BTreeSet<ClearanceViolationSignature> {
+        self.added_violation_signatures_since(before, self.violations_for_scan())
+    }
+
+    /// Return the exact retained DRC records behind the public signature delta.
+    /// Each candidate is passed through the same filter as `new_violations_since`;
+    /// this preserves the existing baseline and center-bridge exceptions.
+    pub fn new_clearance_violations_since(
+        &self,
+        before: &BoardAdapter,
+    ) -> NewClearanceViolationReport {
+        let after = self.retained_violations_for_scan();
+        let signatures = self.added_violation_signatures_since(
+            before,
+            after.keys().copied().collect(),
+        );
+        self.violation_report(signatures, &after)
+    }
+
+    fn added_violation_signatures_since(
+        &self,
+        before: &BoardAdapter,
+        after: BTreeSet<ClearanceViolationSignature>,
+    ) -> BTreeSet<ClearanceViolationSignature> {
         let baseline = cached_baseline_violations(before);
-        let after = self.violations_for_scan();
         let mut added = after.difference(&baseline).copied().collect::<BTreeSet<_>>();
         if self.board.rules.get_hole_clearance() > 0
             || before.board.rules.get_hole_clearance() > 0
@@ -1080,6 +1501,47 @@ impl BoardAdapter {
             }
         }
         added
+    }
+
+    fn violation_report(
+        &self,
+        signatures: BTreeSet<ClearanceViolationSignature>,
+        retained: &BTreeMap<ClearanceViolationSignature, ClearanceViolation>,
+    ) -> NewClearanceViolationReport {
+        let records = signatures
+            .iter()
+            .filter_map(|signature| {
+                retained
+                    .get(signature)
+                    .map(|violation| (*signature, violation))
+            })
+            .map(|(signature, violation)| {
+                let first = self.board.item(violation.first_item);
+                let second = self.board.item(violation.second_item);
+                NewClearanceViolation {
+                    signature,
+                    record: RetainedClearanceViolation {
+                        first_id: first.id().0,
+                        first_type: format!("{:?}", first.board_item_type()),
+                        second_id: second.id().0,
+                        second_type: format!("{:?}", second.board_item_type()),
+                        layer: violation.layer,
+                        expected_clearance_mm: violation.expected_clearance / self.units_per_mm,
+                        exact_copper_clearance_mm: crate::copper_clearance::actual_copper_gap(
+                            &self.board,
+                            violation.first_item,
+                            violation.second_item,
+                            violation.layer,
+                        )
+                        .filter(|gap| gap.is_finite())
+                        .map(|gap| gap / self.units_per_mm),
+                        actual_clearance_mm: violation.actual_clearance / self.units_per_mm,
+                        overlap_bounds: format!("{:?}", violation.shape.bounding_box()),
+                    },
+                }
+            })
+            .collect();
+        NewClearanceViolationReport { signatures, records }
     }
 
     fn center_bridge_pair_is_baseline_proven(
@@ -1393,32 +1855,29 @@ impl BoardAdapter {
         fn add_count(counts: &mut BTreeMap<String, usize>, signature: String) {
             *counts.entry(signature).or_default() += 1;
         }
-
         let mut required = BTreeMap::new();
         let mut protected_original = BTreeMap::new();
         for key in before.board.item_repository().iter() {
             let item = before.board.item(key);
             if item.is_trace() || item.is_via() {
                 let protected_item = is_protected(before, item, protected)?;
-                if strict || item.fixed_state() != FixedState::Unfixed || protected_item {
-                    add_count(
-                        &mut required,
-                        copper_signature(
-                            before,
-                            item,
-                            self.authorized_drill_upgrade(before, item),
-                        )?,
-                    );
-                }
-                if protected_item {
-                    add_count(
-                        &mut protected_original,
-                        copper_signature(
-                            before,
-                            item,
-                            self.authorized_drill_upgrade(before, item),
-                        )?,
-                    );
+                let required_signature = if strict
+                    || item.fixed_state() != FixedState::Unfixed
+                    || protected_item
+                {
+                    Some(copper_signature(
+                        before,
+                        item,
+                        self.authorized_drill_upgrade(before, item),
+                    )?)
+                } else {
+                    None
+                };
+                if let Some(signature) = required_signature {
+                    add_count(&mut required, signature.clone());
+                    if protected_item {
+                        add_count(&mut protected_original, signature);
+                    }
                 }
                 continue;
             }
@@ -1459,8 +1918,51 @@ impl BoardAdapter {
                 }
             }
         }
-        if required != actual_required {
-            return Err("required original copper geometry/classification changed".into());
+        if let Some((signature, required_count)) = required.iter().find(|(signature, count)| {
+            actual_required.get(*signature).copied().unwrap_or(0) < **count
+        }) {
+            let source_ids: Vec<_> = before
+                .board
+                .item_repository()
+                .iter()
+                .filter_map(|key| {
+                    let item = before.board.item(key);
+                    (item.is_trace() || item.is_via())
+                        .then(|| {
+                            copper_signature(
+                                before,
+                                item,
+                                self.authorized_drill_upgrade(before, item),
+                            )
+                            .ok()
+                            .filter(|item_signature| item_signature == signature)
+                            .map(|_| item.id().0)
+                        })
+                        .flatten()
+                })
+                .take(2)
+                .collect();
+            let replay_ids: Vec<_> = self
+                .board
+                .item_repository()
+                .iter()
+                .filter_map(|key| {
+                    let item = self.board.item(key);
+                    (item.is_trace() || item.is_via())
+                        .then(|| {
+                            copper_signature(self, item, None)
+                                .ok()
+                                .filter(|item_signature| item_signature == signature)
+                                .map(|_| item.id().0)
+                        })
+                        .flatten()
+                })
+                .take(2)
+                .collect();
+            return Err(format!(
+                "required original copper geometry/classification changed; first_diff signature={signature:?} required_count={required_count} actual_count={} baseline_item_ids={source_ids:?} replay_item_ids_for_signature={replay_ids:?}",
+                actual_required.get(signature).copied().unwrap_or(0),
+            ));
         }
         if protected_original != protected_actual {
             return Err("protected copper changed or acquired new geometry".into());
@@ -1496,6 +1998,37 @@ impl BoardAdapter {
         protected: &BTreeSet<String>,
         strict: bool,
         moved_components: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        self.assert_invariants_impl(before, protected, strict, moved_components, None)
+    }
+
+    /// Run the same invariant check while returning the exact retained new DRC
+    /// records from its clearance scan. This avoids a second full-board scan
+    /// when a caller needs both the decision and its witness records.
+    pub fn assert_invariants_with_violation_report(
+        &self,
+        before: &Self,
+        protected: &BTreeSet<String>,
+        strict: bool,
+    ) -> (Result<(), String>, Vec<NewClearanceViolation>) {
+        let mut records = Vec::new();
+        let result = self.assert_invariants_impl(
+            before,
+            protected,
+            strict,
+            &BTreeSet::new(),
+            Some(&mut records),
+        );
+        (result, records)
+    }
+
+    fn assert_invariants_impl(
+        &self,
+        before: &Self,
+        protected: &BTreeSet<String>,
+        strict: bool,
+        moved_components: &BTreeSet<String>,
+        violation_records: Option<&mut Vec<NewClearanceViolation>>,
     ) -> Result<(), String> {
         let after: BTreeMap<_, _> = self
             .board
@@ -1656,7 +2189,14 @@ impl BoardAdapter {
         if protected_copper_found {
             return Err("protected net acquired new copper".into());
         }
-        if !self.new_violations_since(before).is_empty() {
+        let has_new_violations = if let Some(records) = violation_records {
+            let report = self.new_clearance_violations_since(before);
+            *records = report.records;
+            !report.signatures.is_empty()
+        } else {
+            !self.new_violations_since(before).is_empty()
+        };
+        if has_new_violations {
             return Err("new full-board clearance violation".into());
         }
         let previous = cached_baseline_connectivity(before);
@@ -2340,7 +2880,7 @@ fn replay_full_session(
     fn via_signature(net: i32, pad: i32, point: &Point) -> String {
         format!("via:{net}:{pad}:{}", canonical_point_key(point))
     }
-    let mut source_attributes: BTreeMap<String, (i32, FixedState)> = BTreeMap::new();
+    let mut source_attributes: BTreeMap<String, (i32, FixedState, Option<bool>)> = BTreeMap::new();
     let mut purge = Vec::new();
     for key in board.item_repository().iter() {
         let item = board.item(key);
@@ -2361,7 +2901,8 @@ fn replay_full_session(
                 &item.center(board),
             )
         };
-        let attributes = (item.clearance_class(), item.fixed_state());
+        let attach = item.as_via().map(|via| via.attach_allowed);
+        let attributes = (item.clearance_class(), item.fixed_state(), attach);
         if source_attributes
             .insert(signature, attributes)
             .is_some_and(|old| old != attributes)
@@ -2555,15 +3096,17 @@ fn replay_full_session(
                 };
                 let fixed =
                     declared.unwrap_or_else(|| source.map(|x| x.1).unwrap_or(FixedState::Unfixed));
+                let attach = source
+                    .and_then(|attributes| attributes.2)
+                    .or_else(|| info.map(|via_info| via_info.attach_smd_allowed()))
+                    .unwrap_or(pad.attach_allowed);
                 records.push(Record::Via {
                     net,
                     pad: pad.id,
                     point,
                     class,
                     fixed,
-                    attach: info
-                        .map(|v| v.attach_smd_allowed())
-                        .unwrap_or(pad.attach_allowed),
+                    attach,
                 });
             } else {
                 return Err("unsupported SES network routing record".into());

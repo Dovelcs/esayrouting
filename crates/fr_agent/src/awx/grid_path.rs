@@ -501,7 +501,15 @@ fn select_refit_via(
         {
             exact_requested = Some(via);
         }
-        if via_fits(request, point_mm, first, last, diameter, drill)? {
+        if via_fits(
+            request,
+            via.0,
+            point_mm,
+            first,
+            last,
+            diameter,
+            drill,
+        )? {
             return Ok(via);
         }
     }
@@ -556,6 +564,7 @@ fn matching_via_info(
 
 fn via_fits(
     request: &GridPathRequest<'_>,
+    via_info_id: ViaInfoId,
     point_mm: Point,
     first_copper: i32,
     last_copper: i32,
@@ -569,6 +578,9 @@ fn via_fits(
         .rules
         .net_class_of(request.net)
         .get_trace_clearance_class();
+    let via_info = &board.rules.via_infos[via_info_id];
+    let via_clearance_class = via_info.get_clearance_class_index();
+    let via_attaches_smd = via_info.attach_smd_allowed();
     let mut own_stack_clearance = 0.0f64;
     for layer in first_copper..=last_copper {
         if !board.layer_structure.layers[layer as usize].is_signal {
@@ -580,6 +592,33 @@ fn via_fits(
             .get_value(own_class, own_class, layer, false) as f64;
         own_stack_clearance = own_stack_clearance.max(own);
         let need = diameter_mm * upm / 2.0 + own - UNBLOCK_REFIT_MARGIN_MM * upm;
+
+        // A source ViaInfo with attach_smd disabled cannot be placed through
+        // a same-net SMD pad. PTH pins also remain obstacles; their existing
+        // barrels are handled by through_hole_positions before this check.
+        for key in board.get_pins() {
+            let pin = board.item(key);
+            if !pin.contains_net(request.net)
+                || !pin.is_on_layer(board, layer)
+                || (pin.drill_allowed(board) && via_attaches_smd)
+            {
+                continue;
+            }
+            let Some(shape) = pin.drill_shape_on_layer(board, layer) else {
+                continue;
+            };
+            let clearance = board.rules.clearance_matrix.get_value(
+                via_clearance_class,
+                pin.clearance_class(),
+                layer,
+                false,
+            ) as f64;
+            if shape_edge_distance(&shape, FloatPoint::new(point_board[0], point_board[1]))
+                < diameter_mm * upm / 2.0 + clearance
+            {
+                return Ok(false);
+            }
+        }
 
         let pad_distance = foreign_pad_distance(request, point_mm, layer, own)?;
         if pad_distance < need {

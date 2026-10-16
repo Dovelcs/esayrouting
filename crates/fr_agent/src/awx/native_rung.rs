@@ -9,7 +9,7 @@ use awx_grid::{GridObstacleMap, GridRouter, TrackMarginArg};
 use fr_engine::{
     autoroute::{point_router, AutorouteControl},
     ids::{FixedState, NetNo},
-    rules::{via::ViaInfoId, ViaRule},
+    rules::via::ViaInfoId,
 };
 use fr_geom::{FloatPoint, IntBox, IntPoint, Point as EnginePoint, Polyline};
 use fr_settings::RouterSettings;
@@ -304,6 +304,19 @@ struct GridSearchResult {
     registered_via_sizes: BTreeMap<(i32, i32), (f64, f64)>,
     forward_probe_iterations: usize,
     backward_probe_iterations: usize,
+    forward_probe_termination: Option<awx_grid::router::RouteTermination>,
+    backward_probe_termination: Option<awx_grid::router::RouteTermination>,
+    forward_full_termination: Option<awx_grid::router::RouteTermination>,
+    backward_full_termination: Option<awx_grid::router::RouteTermination>,
+    probe_policy_early_stop: bool,
+    small_via_rung_forward_termination: Option<awx_grid::router::RouteTermination>,
+    small_via_rung_backward_termination: Option<awx_grid::router::RouteTermination>,
+    small_via_rung_forward_full_termination: Option<awx_grid::router::RouteTermination>,
+    small_via_rung_backward_full_termination: Option<awx_grid::router::RouteTermination>,
+    small_via_rung_probe_policy_early_stop: bool,
+    small_via_rung_retry_ran: bool,
+    search_graph_scope: &'static str,
+    via_pad_unblock: ViaPadUnblockSummary,
     via_refit_rungs: Vec<(f64, f64)>,
     /// Source `_route_with_via_unblock` retains its exact working map for the
     /// optional in-pad rescue attempt after both ordinary and #568 searches.
@@ -332,6 +345,50 @@ struct GridSearchResult {
     via_unblock_blame: BTreeSet<NetNo>,
 }
 
+struct ViaPadUnblockAttempt {
+    attempt: &'static str,
+    path_found: bool,
+    forward_probe_termination: Option<&'static str>,
+    backward_probe_termination: Option<&'static str>,
+    forward_full_termination: Option<&'static str>,
+    backward_full_termination: Option<&'static str>,
+    probe_policy_early_stop: bool,
+}
+
+struct ViaPadUnblockSummary {
+    status: &'static str,
+    reason: &'static str,
+    attempts: Vec<ViaPadUnblockAttempt>,
+}
+
+impl Default for ViaPadUnblockSummary {
+    fn default() -> Self {
+        Self {
+            status: "not_attempted",
+            reason: "not_called",
+            attempts: Vec::new(),
+        }
+    }
+}
+
+impl ViaPadUnblockSummary {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "status": self.status,
+            "reason": self.reason,
+            "attempts": self.attempts.iter().map(|attempt| serde_json::json!({
+                "attempt": attempt.attempt,
+                "path_found": attempt.path_found,
+                "forward_probe_termination": attempt.forward_probe_termination,
+                "backward_probe_termination": attempt.backward_probe_termination,
+                "forward_full_termination": attempt.forward_full_termination,
+                "backward_full_termination": attempt.backward_full_termination,
+                "probe_policy_early_stop": attempt.probe_policy_early_stop,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
 struct SourceRouteAttempt {
     path: Option<Vec<(i32, i32, u8)>>,
     iterations: usize,
@@ -342,6 +399,11 @@ struct SourceRouteAttempt {
     backward_iterations: usize,
     forward_probe_iterations: usize,
     backward_probe_iterations: usize,
+    forward_probe_termination: Option<awx_grid::router::RouteTermination>,
+    backward_probe_termination: Option<awx_grid::router::RouteTermination>,
+    forward_full_termination: Option<awx_grid::router::RouteTermination>,
+    backward_full_termination: Option<awx_grid::router::RouteTermination>,
+    probe_policy_early_stop: bool,
 }
 
 fn route_core(
@@ -353,10 +415,10 @@ fn route_core(
     via_exclusion_radius: i32,
     via_rung: usize,
     dynamic: bool,
-) -> (Option<Vec<(i32, i32, u8)>>, usize, Vec<(i32, i32, u8)>) {
+) -> (Option<Vec<(i32, i32, u8)>>, usize, Vec<(i32, i32, u8)>, awx_grid::router::RouteTermination) {
     let budget = budget.min(u32::MAX as usize) as u32;
     let ceiling = if dynamic { 10_000_000 } else { budget };
-    let (path, iterations, frontier) = router.route_with_frontier(
+    let (path, iterations, frontier, termination) = router.route_with_frontier_detailed(
         obstacles,
         sources,
         targets,
@@ -373,7 +435,7 @@ fn route_core(
         0,
         via_rung,
     );
-    (path, iterations as usize, frontier)
+    (path, iterations as usize, frontier, termination)
 }
 
 /// Source `_probe_route_with_frontier` policy: forward/backward 5k probes;
@@ -403,7 +465,7 @@ fn source_route_attempt(
         // Source `_dynamic_iterations: config.max_iterations <= 10_000` keeps
         // the static cap; only larger budgets earn the 1e7 dynamic ceiling.
         let dynamic = max_iterations > 10_000;
-        let (forward, fi, mut frontier) = route_core(
+        let (forward, fi, mut frontier, forward_probe_termination) = route_core(
             router,
             obstacles,
             sources.to_vec(),
@@ -424,10 +486,15 @@ fn source_route_attempt(
                 backward_iterations: 0,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: 0,
+                forward_probe_termination: Some(forward_probe_termination),
+                backward_probe_termination: None,
+                forward_full_termination: None,
+                backward_full_termination: None,
+                probe_policy_early_stop: false,
             };
         }
         let forward_frontier = frontier.clone();
-        let (backward, bi, back_frontier) = route_core(
+        let (backward, bi, back_frontier, backward_probe_termination) = route_core(
             router,
             obstacles,
             targets.to_vec(),
@@ -450,9 +517,16 @@ fn source_route_attempt(
                 backward_iterations: bi,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: bi,
+                forward_probe_termination: Some(forward_probe_termination),
+                backward_probe_termination: Some(backward_probe_termination),
+                forward_full_termination: None,
+                backward_full_termination: None,
+                probe_policy_early_stop: false,
             };
         }
-        if fi < probe_budget || bi < probe_budget {
+        if forward_probe_termination == awx_grid::router::RouteTermination::OpenSetExhausted
+            || backward_probe_termination == awx_grid::router::RouteTermination::OpenSetExhausted
+        {
             return SourceRouteAttempt {
                 path: None,
                 iterations: fi + bi,
@@ -463,9 +537,14 @@ fn source_route_attempt(
                 backward_iterations: bi,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: bi,
+                forward_probe_termination: Some(forward_probe_termination),
+                backward_probe_termination: Some(backward_probe_termination),
+                forward_full_termination: None,
+                backward_full_termination: None,
+                probe_policy_early_stop: true,
             };
         }
-        let (full_forward, ff, mut full_frontier) = route_core(
+        let (full_forward, ff, mut full_frontier, forward_full_termination) = route_core(
             router,
             obstacles,
             sources.to_vec(),
@@ -486,10 +565,15 @@ fn source_route_attempt(
                 backward_iterations: bi,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: bi,
+                forward_probe_termination: Some(forward_probe_termination),
+                backward_probe_termination: Some(backward_probe_termination),
+                forward_full_termination: Some(forward_full_termination),
+                backward_full_termination: None,
+                probe_policy_early_stop: false,
             };
         }
         let forward_frontier = full_frontier.clone();
-        let (full_backward, fb, back_frontier) = route_core(
+        let (full_backward, fb, back_frontier, backward_full_termination) = route_core(
             router,
             obstacles,
             targets.to_vec(),
@@ -512,6 +596,11 @@ fn source_route_attempt(
                 backward_iterations: bi + fb,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: bi,
+                forward_probe_termination: Some(forward_probe_termination),
+                backward_probe_termination: Some(backward_probe_termination),
+                forward_full_termination: Some(forward_full_termination),
+                backward_full_termination: Some(backward_full_termination),
+                probe_policy_early_stop: false,
             }
         } else {
             SourceRouteAttempt {
@@ -524,6 +613,11 @@ fn source_route_attempt(
                 backward_iterations: bi + fb,
                 forward_probe_iterations: fi,
                 backward_probe_iterations: bi,
+                forward_probe_termination: Some(forward_probe_termination),
+                backward_probe_termination: Some(backward_probe_termination),
+                forward_full_termination: Some(forward_full_termination),
+                backward_full_termination: Some(backward_full_termination),
+                probe_policy_early_stop: false,
             }
         }
     }
@@ -1674,10 +1768,26 @@ fn source_grid_search_with_endpoints(
     }
     let forward_probe_iterations = attempt.forward_probe_iterations;
     let backward_probe_iterations = attempt.backward_probe_iterations;
+    let forward_probe_termination = attempt.forward_probe_termination;
+    let backward_probe_termination = attempt.backward_probe_termination;
+    let forward_full_termination = attempt.forward_full_termination;
+    let backward_full_termination = attempt.backward_full_termination;
+    let probe_policy_early_stop = attempt.probe_policy_early_stop;
     let mut registered_via_sizes = BTreeMap::new();
+    let mut small_via_rung_forward_termination = None;
+    let mut small_via_rung_backward_termination = None;
+    let mut small_via_rung_retry_ran = false;
+    let mut search_graph_scope = if pad_area_retry {
+        "pad_area_retry_before_via_pad_unblock"
+    } else {
+        "source_route_attempt_before_via_pad_unblock"
+    };
+    let mut small_via_rung_forward_full_termination = None;
+    let mut small_via_rung_backward_full_termination = None;
+    let mut small_via_rung_probe_policy_early_stop = false;
     if attempt.path.is_none()
-        && ((attempt.forward_probe_iterations > 0 && attempt.forward_probe_iterations < 5_000)
-            || (attempt.backward_probe_iterations > 0 && attempt.backward_probe_iterations < 5_000))
+        && (attempt.forward_probe_termination == Some(awx_grid::router::RouteTermination::OpenSetExhausted)
+            || attempt.backward_probe_termination == Some(awx_grid::router::RouteTermination::OpenSetExhausted))
     {
         if let Some((via_rung, diameter_mm, drill_mm)) =
             small_via_rung(&native_config, request.net_id, upm)
@@ -1694,7 +1804,14 @@ fn source_grid_search_with_endpoints(
                     request.rules.hole_to_hole_clearance,
                     grid_step_mm,
                 );
+                small_via_rung_retry_ran = true;
+                small_via_rung_forward_termination = small.forward_probe_termination;
+                small_via_rung_backward_termination = small.backward_probe_termination;
+                small_via_rung_forward_full_termination = small.forward_full_termination;
+                small_via_rung_backward_full_termination = small.backward_full_termination;
+                small_via_rung_probe_policy_early_stop = small.probe_policy_early_stop;
                 if let Some(path) = small.path.as_ref() {
+                    search_graph_scope = "small_via_rung_retry_before_via_pad_unblock";
                     iterations += small.iterations;
                     for pair in path.windows(2) {
                         let (x, y, layer) = pair[0];
@@ -1738,8 +1855,61 @@ fn source_grid_search_with_endpoints(
         landing_owners,
         pad_area_retry,
         pad_area_retry_cells,
+        forward_probe_termination,
+        backward_probe_termination,
+        forward_full_termination,
+        backward_full_termination,
+        probe_policy_early_stop,
+        small_via_rung_forward_termination,
+        small_via_rung_backward_termination,
+        small_via_rung_forward_full_termination,
+        small_via_rung_backward_full_termination,
+        small_via_rung_probe_policy_early_stop,
+        small_via_rung_retry_ran,
+        search_graph_scope,
+        via_pad_unblock: ViaPadUnblockSummary::default(),
         via_unblock_blame: BTreeSet::new(),
     })
+}
+
+fn termination_name(value: Option<awx_grid::router::RouteTermination>) -> Option<&'static str> {
+    value.map(awx_grid::router::RouteTermination::as_str)
+}
+
+fn via_pad_unblock_attempt(
+    name: &'static str,
+    attempt: &SourceRouteAttempt,
+) -> ViaPadUnblockAttempt {
+    ViaPadUnblockAttempt {
+        attempt: name,
+        path_found: attempt.path.is_some(),
+        forward_probe_termination: termination_name(attempt.forward_probe_termination),
+        backward_probe_termination: termination_name(attempt.backward_probe_termination),
+        forward_full_termination: termination_name(attempt.forward_full_termination),
+        backward_full_termination: termination_name(attempt.backward_full_termination),
+        probe_policy_early_stop: attempt.probe_policy_early_stop,
+    }
+}
+
+fn search_termination(outcome: &GridSearchResult) -> &'static str {
+    if outcome.path.is_some() {
+        return "found";
+    }
+    if outcome.probe_policy_early_stop {
+        if outcome.forward_probe_termination == Some(awx_grid::router::RouteTermination::OpenSetExhausted)
+            || outcome.backward_probe_termination == Some(awx_grid::router::RouteTermination::OpenSetExhausted)
+        {
+            "open_set_exhausted"
+        } else {
+            "probe_policy_early_stop"
+        }
+    } else if outcome.forward_full_termination == Some(awx_grid::router::RouteTermination::OpenSetExhausted)
+        || outcome.backward_full_termination == Some(awx_grid::router::RouteTermination::OpenSetExhausted)
+    {
+        "open_set_exhausted"
+    } else {
+        "iteration_cap"
+    }
 }
 
 fn small_via_rung(
@@ -1763,6 +1933,174 @@ fn small_via_rung(
         .position(|pair| *pair == candidate)?
         + 1;
     Some((index, candidate.0 as f64 / upm, candidate.1 as f64 / upm))
+}
+
+/// Return the first full-board through via allowed by this net's native rule,
+/// using the padstack's actual copper and drill dimensions.
+pub(crate) fn allowed_through_vias(
+    board: &BoardAdapter,
+    net: NetNo,
+) -> Result<Vec<(ViaInfoId, [f64; 2], f64)>, String> {
+    let net_class = board.board.rules.net_class_of(net);
+    let Some(rule_id) = net_class.get_via_rule() else {
+        return Ok(Vec::new());
+    };
+    let copper_layers: Vec<_> = board
+        .board
+        .layer_structure
+        .layers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, layer)| layer.is_signal.then_some(index as i32))
+        .collect();
+    let (Some(&first_copper), Some(&last_copper)) =
+        (copper_layers.first(), copper_layers.last())
+    else {
+        return Err("native rung board has no copper layers".into());
+    };
+    let rules = &board.board.rules;
+    let via_rule = &rules.via_rules[rule_id];
+    let mut candidates = Vec::new();
+    for &via_info_id in via_rule.vias() {
+        let via_info = &rules.via_infos[via_info_id];
+        let padstack = board
+            .board
+            .library
+            .padstacks
+            .get(via_info.get_padstack())
+            .ok_or("native net via rule references a missing padstack")?;
+        if padstack.from_layer() != first_copper || padstack.to_layer() != last_copper {
+            continue;
+        }
+        let shapes: Vec<_> = (first_copper..=last_copper)
+            .filter(|&layer| board.board.layer_structure.layers[layer as usize].is_signal)
+            .filter_map(|layer| padstack.get_shape(layer))
+            .collect();
+        let Some(drill_radius) = padstack.get_explicit_drill_radius() else {
+            continue;
+        };
+        let diameter = shapes
+            .iter()
+            .map(|shape| shape.max_width())
+            .fold(0.0_f64, f64::max)
+            / board.units_per_mm;
+        let drill = 2.0 * drill_radius / board.units_per_mm;
+        let minimum_ring = shapes
+            .iter()
+            .map(|shape| (shape.min_width() - 2.0 * drill_radius) / (2.0 * board.units_per_mm))
+            .fold(f64::INFINITY, f64::min);
+        if diameter.is_finite() && drill.is_finite() && drill > 0.0 && diameter > drill {
+            candidates.push((via_info_id, [diameter, drill], minimum_ring));
+        }
+    }
+    Ok(candidates)
+}
+
+fn has_source_through_via(board: &BoardAdapter, net: NetNo) -> bool {
+    let class = board.board.rules.net_class_of(net);
+    let Some(rule_id) = class.get_via_rule() else {
+        return false;
+    };
+    let copper: Vec<_> = board
+        .board
+        .layer_structure
+        .layers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, layer)| layer.is_signal.then_some(index as i32))
+        .collect();
+    let (Some(&first), Some(&last)) = (copper.first(), copper.last()) else {
+        return false;
+    };
+    board.board.rules.via_rules[rule_id].vias().iter().any(|via_id| {
+        board
+            .board
+            .library
+            .padstacks
+            .get(board.board.rules.via_infos[*via_id].get_padstack())
+            .is_some_and(|padstack| {
+                padstack.from_layer() == first && padstack.to_layer() == last
+            })
+    })
+}
+
+pub(crate) fn allowed_through_via_sizes(
+    board: &BoardAdapter,
+    net: NetNo,
+    min_annular_ring_mm: f64,
+) -> Result<Vec<[f64; 2]>, String> {
+    Ok(allowed_through_vias(board, net)?
+        .into_iter()
+        .filter(|(_, _, ring)| *ring + 1e-9 >= min_annular_ring_mm)
+        .map(|(_, size, _)| size)
+        .collect())
+}
+
+/// Keep search sizes, unblock/refit candidates, and native ViaInfo choices in
+/// one source-class-authorized physical set. Without an explicit through drill,
+/// keep same-layer routing available and reject only cross-layer requests.
+pub(crate) fn normalize_request_vias(
+    request: &mut RungRequest,
+    starts: &mut Vec<RungEndpoint>,
+    targets: &mut Vec<RungEndpoint>,
+) -> Result<Option<String>, String> {
+    let physical_candidates = allowed_through_vias(&request.board, request.net_id)?;
+    let candidates: Vec<_> = physical_candidates
+        .iter()
+        .filter(|(_, _, ring)| *ring + 1e-9 >= request.min_annular_ring_mm)
+        .map(|(id, size, _)| (*id, *size))
+        .collect();
+    if let Some((_, first_size)) = candidates.first() {
+        request.rules.via_size = first_size[0];
+        request.rules.via_drill = first_size[1];
+        request
+            .rules
+            .net_via_sizes
+            .insert(request.net_id as i32, *first_size);
+        let mut legal_rungs = Vec::new();
+        for (diameter, drill) in request.fab_via_rungs.iter().copied() {
+            let Some((_, allowed_size)) = candidates.iter().find(|(_, [allowed_d, allowed_h])| {
+                (diameter - allowed_d).abs() <= 0.001 && (drill - allowed_h).abs() <= 0.001
+            }) else {
+                continue;
+            };
+            let exact_size = (allowed_size[0], allowed_size[1]);
+            if !legal_rungs.contains(&exact_size) {
+                legal_rungs.push(exact_size);
+            }
+        }
+        request.fab_via_rungs = legal_rungs;
+        return Ok(None);
+    }
+
+    request.fab_via_rungs.clear();
+    request
+        .rules
+        .net_via_sizes
+        .remove(&(request.net_id as i32));
+    let annular_conflict = !physical_candidates.is_empty();
+    let missing_drill = has_source_through_via(&request.board, request.net_id);
+    let same_layer = request.route_layers.iter().find(|layer| {
+        starts.iter().any(|endpoint| &endpoint.layer == *layer)
+            && targets.iter().any(|endpoint| &endpoint.layer == *layer)
+    });
+    let Some(layer) = same_layer.cloned() else {
+        let reason = if annular_conflict {
+            "rule_conflict: source use_via candidates fail the explicit minimum annular ring"
+        } else if missing_drill {
+            "Unsupported: source use_via through via lacks explicit physical drill metadata, and endpoints share no active route layer"
+        } else {
+            "Unsupported stack: source use_via has no full-board through via, and endpoints share no active route layer"
+        };
+        return Ok(Some(reason.into()));
+    };
+    request.route_layers = vec![layer.clone()];
+    starts.retain(|endpoint| endpoint.layer == layer);
+    targets.retain(|endpoint| endpoint.layer == layer);
+    request.start = starts[0].clone();
+    request.end = targets[0].clone();
+    request.b_alternatives = targets.iter().skip(1).cloned().collect();
+    Ok(None)
 }
 
 /// Source `single_ended_routing:2850..2859` declined-tap blame keystone: when the
@@ -1905,6 +2243,16 @@ fn place_unblock_tap(
         );
         return Ok(None);
     };
+    if !allowed_through_vias(&request.board, request.net_id)?
+        .iter()
+        .any(|(_, [diameter, drill], ring)| {
+            *ring + 1e-9 >= request.min_annular_ring_mm
+                && (diameter - tap.via.diameter).abs() <= 0.001
+                && (drill - tap.via.drill).abs() <= 0.001
+        })
+    {
+        return Ok(None);
+    }
     let pad_owner = native_context_pad_owner(&request.board, pad)?;
     for release in &tap.map_releases {
         outcome
@@ -1951,7 +2299,20 @@ fn try_via_pad_unblock(
         outcome.backward_probe_iterations > 0 && outcome.backward_probe_iterations < lim;
     let source_stuck =
         outcome.forward_probe_iterations > 0 && outcome.forward_probe_iterations < lim;
-    if (!target_stuck && !source_stuck) || request.route_layers.len() < 2 {
+    if !target_stuck && !source_stuck {
+        outcome.via_pad_unblock = ViaPadUnblockSummary {
+            status: "not_attempted",
+            reason: "no_probe_side_met_unblock_trigger",
+            attempts: Vec::new(),
+        };
+        return Ok(None);
+    }
+    if request.route_layers.len() < 2 {
+        outcome.via_pad_unblock = ViaPadUnblockSummary {
+            status: "not_attempted",
+            reason: "fewer_than_two_route_layers",
+            attempts: Vec::new(),
+        };
         return Ok(None);
     }
     let source_cells = outcome.source_cells.clone();
@@ -2000,13 +2361,13 @@ fn try_via_pad_unblock(
     let mut placed = Vec::<OwnedTapResult>::new();
     let mut source_tapped = false;
     let mut target_tapped = false;
+    let mut endpoint_pad_candidate_seen = false;
 
     // backward probe (from targets) exhausted -> the TARGET pad is boxed.
     if target_stuck {
-        if let Some(pad) = pads_near_grid_cells(request, &target_cells, outcome.grid_step_board)
-            .into_iter()
-            .next()
-        {
+        let pads = pads_near_grid_cells(request, &target_cells, outcome.grid_step_board);
+        endpoint_pad_candidate_seen |= !pads.is_empty();
+        if let Some(pad) = pads.into_iter().next() {
             if let Some(tap) = place_unblock_tap(
                 request,
                 outcome,
@@ -2025,10 +2386,9 @@ fn try_via_pad_unblock(
     }
     // forward probe (from sources) exhausted -> the SOURCE pad is boxed.
     if source_stuck {
-        if let Some(pad) = pads_near_grid_cells(request, &source_cells, outcome.grid_step_board)
-            .into_iter()
-            .next()
-        {
+        let pads = pads_near_grid_cells(request, &source_cells, outcome.grid_step_board);
+        endpoint_pad_candidate_seen |= !pads.is_empty();
+        if let Some(pad) = pads.into_iter().next() {
             if let Some(tap) = place_unblock_tap(
                 request,
                 outcome,
@@ -2046,6 +2406,15 @@ fn try_via_pad_unblock(
         }
     }
     if placed.is_empty() {
+        outcome.via_pad_unblock = ViaPadUnblockSummary {
+            status: "no_legal_tap",
+            reason: if endpoint_pad_candidate_seen {
+                "candidate_pad_tap_declined"
+            } else {
+                "no_endpoint_pad_candidate"
+            },
+            attempts: Vec::new(),
+        };
         return Ok(None);
     }
 
@@ -2063,7 +2432,12 @@ fn try_via_pad_unblock(
         request.rules.hole_to_hole_clearance,
         request.rules.grid_step,
     );
+    outcome
+        .via_pad_unblock
+        .attempts
+        .push(via_pad_unblock_attempt("retry_1_5k", &retry));
     outcome.iterations += retry.iterations;
+    let mut second_retry_ran = false;
     if retry.path.is_none() {
         // Second rung: the stuck side got its via but the retry still failed --
         // the OTHER side often needs layer access too. Tap it (source side
@@ -2102,6 +2476,7 @@ fn try_via_pad_unblock(
             }
         }
         if second {
+            second_retry_ran = true;
             retry = source_route_attempt(
                 &router,
                 &outcome.obstacles,
@@ -2113,11 +2488,37 @@ fn try_via_pad_unblock(
                 request.rules.hole_to_hole_clearance,
                 request.rules.grid_step,
             );
+            outcome
+                .via_pad_unblock
+                .attempts
+                .push(via_pad_unblock_attempt("retry_2_10k", &retry));
             outcome.iterations += retry.iterations;
         }
     }
     let Some(path) = retry.path else {
+        let attempts = std::mem::take(&mut outcome.via_pad_unblock.attempts);
+        outcome.via_pad_unblock = ViaPadUnblockSummary {
+            status: "retry_failed",
+            reason: if second_retry_ran {
+                "retry_attempts_found_no_path"
+            } else if source_tapped && target_tapped {
+                "both_endpoints_tapped_no_second_retry"
+            } else {
+                "retry_1_failed_no_second_legal_tap"
+            },
+            attempts,
+        };
         return Ok(None);
+    };
+    let attempts = std::mem::take(&mut outcome.via_pad_unblock.attempts);
+    outcome.via_pad_unblock = ViaPadUnblockSummary {
+        status: "routed",
+        reason: if second_retry_ran {
+            "retry_2_routed"
+        } else {
+            "retry_1_routed"
+        },
+        attempts,
     };
     // Keep only the vias the retry actually reached: the path must terminate on
     // the via cell at a NON-pad layer (or via an off-pad stub), else it is
@@ -2260,8 +2661,17 @@ fn materialize_tap(
     board: &mut BoardAdapter,
     tap: &super::via_pad_tap::TapResult,
     net: NetNo,
+    min_annular_ring_mm: f64,
 ) -> Result<(), String> {
-    let info_id = select_pair_via_info(board, net, tap.via.diameter, tap.via.drill)?;
+    let info_id = allowed_through_vias(board, net)?
+        .into_iter()
+        .find_map(|(info_id, [diameter, drill], ring)| {
+            (ring + 1e-9 >= min_annular_ring_mm
+                && (diameter - tap.via.diameter).abs() <= 0.001
+                && (drill - tap.via.drill).abs() <= 0.001)
+                .then_some(info_id)
+        })
+        .ok_or("via-pad tap does not match a source use_via candidate")?;
     let info = board.board.rules.via_infos[info_id].clone();
     let point = board.point(tap.via.point)?;
     board.board.insert_via(
@@ -2498,19 +2908,15 @@ fn execute_single(
     soft_vias: &[super::whole_context::CopperVia],
     soft_cost: Option<f64>,
 ) -> Result<RungExecution<NativeRungRoute>, String> {
-    // `single_ended_routing._per_net_via_config` installs the current net's
-    // actual via before connect builds its obstacle map.
-    if let Some(sizes) = request
-        .rules
-        .net_via_sizes
-        .get(&(request.net_id as i32))
-        .copied()
-    {
-        request.rules.via_size = sizes[0];
-        request.rules.via_drill = sizes[1];
-    }
     if request.net_id != request.board.net_number(&request.net)? {
         return Err(format!("rung net id does not match {}", request.net));
+    }
+    let mut starts = vec![request.start.clone()];
+    let mut targets = std::iter::once(request.end.clone())
+        .chain(request.b_alternatives.iter().cloned())
+        .collect::<Vec<_>>();
+    if let Some(reason) = normalize_request_vias(&mut request, &mut starts, &mut targets)? {
+        return Ok(refused(&reason));
     }
     if request.rules.validate().is_err() {
         return Err("invalid native rung routing rules".into());
@@ -2682,7 +3088,12 @@ fn execute_single(
         .into_iter()
         .collect::<BTreeSet<_>>();
     for tap in &tap_results {
-        materialize_tap(&mut trial, &tap.tap, request.net_id)?;
+        materialize_tap(
+            &mut trial,
+            &tap.tap,
+            request.net_id,
+            request.min_annular_ring_mm,
+        )?;
     }
     materialize_grid_geometry(&mut trial, &geometry, request.net_id, &[])?;
     // Native trace contact is `*point == other.center(self)`: a newly materialized
@@ -3295,7 +3706,7 @@ pub(crate) fn prepare_control_for_net_with_vias(
     net: NetNo,
     rules: &super::whole_context::RoutingRules,
     route_layers: &[String],
-    fab_via_rungs: &[(f64, f64)],
+    _fab_via_rungs: &[(f64, f64)],
 ) -> Result<(AutorouteControl, RouterSettings), String> {
     let layer_count = board.board.layer_count().max(0) as usize;
     let half_width = size_in_units(rules.track_width / 2.0, board.units_per_mm)?;
@@ -3402,10 +3813,21 @@ pub(crate) fn prepare_control_for_net_with_vias(
     let mut control = AutorouteControl::new(&board.board, net, &settings, via_costs, trace_costs);
     control.trace_clearance_class = routed_class;
     control.trace_half_width.fill(half_width);
-    control.compensated_trace_half_width.fill(half_width);
+    for layer in 0..layer_count as i32 {
+        let index = layer as usize;
+        control.compensated_trace_half_width[index] = control.trace_half_width[index].wrapping_add(
+            board
+                .board
+                .rules
+                .clearance_matrix
+                .clearance_compensation_value(routed_class, layer),
+        );
+    }
 
-    let via_rule = matching_via_rule(board, net, rules, fab_via_rungs)?;
-    control.via_rule = via_rule;
+    // AutorouteControl::new has already loaded the net class's ViaRule. Keep
+    // that rule as the candidate set: RoutingRules dimensions and fabrication
+    // rungs describe search envelopes, and must not authorize padstacks that
+    // the source DSN's (class ... (circuit (use_via ...))) excludes.
     control.rebuild_via_info(&board.board, via_costs, net);
     control.vias_allowed = !control.via_infos.is_empty() && settings.get_vias_allowed();
     if !control.vias_allowed {
@@ -3441,39 +3863,6 @@ pub(crate) fn pair_clearance_mm(
             .max(board.board.clearance_value(n, p, layer));
     }
     Ok(max_clearance.max(0) as f64 / board.units_per_mm)
-}
-
-fn matching_via_rule(
-    board: &mut BoardAdapter,
-    net: NetNo,
-    rules: &super::whole_context::RoutingRules,
-    fab_via_rungs: &[(f64, f64)],
-) -> Result<ViaRule, String> {
-    let expected = rules
-        .net_via_sizes
-        .get(&net)
-        .copied()
-        .unwrap_or([rules.via_size, rules.via_drill]);
-    let mut matched = ViaRule::new(format!("native_rung_{net}"));
-    let mut candidates = vec![(expected[0], expected[1])];
-    candidates.extend(fab_via_rungs.iter().copied());
-    candidates.dedup_by(|a, b| (a.0 - b.0).abs() <= 1e-9 && (a.1 - b.1).abs() <= 1e-9);
-    let net_name = board
-        .board
-        .rules
-        .nets
-        .get(net)
-        .ok_or("native via net missing")?
-        .name
-        .clone();
-    for (diameter, drill) in candidates {
-        let info_id =
-            super::native_execution::ensure_via_candidate(board, &net_name, diameter, drill)?;
-        if !matched.vias().contains(&info_id) {
-            matched.append_via(info_id);
-        }
-    }
-    Ok(matched)
 }
 
 fn size_in_units(size_mm: f64, units_per_mm: f64) -> Result<i32, String> {
@@ -3556,12 +3945,12 @@ fn route_multilayer_endpoint_sets_inner(
     if request.route_layers.is_empty() || request.pair.is_some() || request.band.is_some() {
         return Err("endpoint adapter requires active layers and a single-ended request".into());
     }
-    let starts = start_candidates
+    let mut starts = start_candidates
         .iter()
         .filter(|endpoint| request.route_layers.contains(&endpoint.layer))
         .cloned()
         .collect::<Vec<_>>();
-    let targets = target_candidates
+    let mut targets = target_candidates
         .iter()
         .filter(|endpoint| request.route_layers.contains(&endpoint.layer))
         .cloned()
@@ -3579,6 +3968,13 @@ fn route_multilayer_endpoint_sets_inner(
     request.start = starts[0].clone();
     request.end = targets[0].clone();
     request.b_alternatives = targets.iter().skip(1).cloned().collect();
+    if let Some(reason) = normalize_request_vias(&mut request, &mut starts, &mut targets)? {
+        return Ok((
+            None,
+            serde_json::json!({"accepted": false, "reason": reason}),
+            None,
+        ));
+    }
     request.rules.validate()?;
     let net = request.board.net_number(&request.net)?;
     let class = request
@@ -3604,7 +4000,7 @@ fn route_multilayer_endpoint_sets_inner(
             &[],
             None,
             class,
-            class,
+            control.via_clearance_class,
             &starts,
             &targets,
             pad_seeding_policy,
@@ -3624,6 +4020,20 @@ fn route_multilayer_endpoint_sets_inner(
         "search_evidence": {
             "forward_probe_iterations": outcome.forward_probe_iterations,
             "backward_probe_iterations": outcome.backward_probe_iterations,
+            "forward_probe_termination": termination_name(outcome.forward_probe_termination),
+            "backward_probe_termination": termination_name(outcome.backward_probe_termination),
+            "forward_full_termination": termination_name(outcome.forward_full_termination),
+            "backward_full_termination": termination_name(outcome.backward_full_termination),
+            "search_termination": search_termination(&outcome),
+            "search_graph_scope": outcome.search_graph_scope,
+            "probe_policy_early_stop": outcome.probe_policy_early_stop,
+            "small_via_rung_forward_termination": termination_name(outcome.small_via_rung_forward_termination),
+            "small_via_rung_backward_termination": termination_name(outcome.small_via_rung_backward_termination),
+            "small_via_rung_forward_full_termination": termination_name(outcome.small_via_rung_forward_full_termination),
+            "small_via_rung_backward_full_termination": termination_name(outcome.small_via_rung_backward_full_termination),
+            "small_via_rung_probe_policy_early_stop": outcome.small_via_rung_probe_policy_early_stop,
+            "small_via_rung_retry_ran": outcome.small_via_rung_retry_ran,
+            "via_pad_unblock": outcome.via_pad_unblock.to_json(),
             "forward_iterations": outcome.forward_iterations,
             "backward_iterations": outcome.backward_iterations,
             "sources_cell_count": outcome.source_cells.len(),
@@ -3633,7 +4043,7 @@ fn route_multilayer_endpoint_sets_inner(
             "pad_area_retry_cells": outcome.pad_area_retry_cells,
             "window_board": [outcome.window.ll.x, outcome.window.ll.y, outcome.window.ur.x, outcome.window.ur.y],
             "grid_step_board": outcome.grid_step_board,
-            "early_frontier_exhausted_below_probe_budget": outcome.path.is_none() && (outcome.forward_probe_iterations < 5_000 || outcome.backward_probe_iterations < 5_000),
+            "early_frontier_exhausted_below_probe_budget": outcome.forward_probe_termination == Some(awx_grid::router::RouteTermination::OpenSetExhausted) || outcome.backward_probe_termination == Some(awx_grid::router::RouteTermination::OpenSetExhausted),
             "probe_budget": 5_000,
             "interpretation": "probe exhaustion classification is policy evidence, not proof of physical unreachability"
         }
@@ -3643,15 +4053,20 @@ fn route_multilayer_endpoint_sets_inner(
         path
     } else {
         // Source `_route_with_via_unblock` (#189): an endpoint whose probe
-        // frontier exhausted BELOW the probe limit is boxed in. Drop a
-        // DRC-legal fab-floor via inside that pad and retry the SAME search
-        // before reporting no-path; only then is the failure honest.
+        // open set was exhausted may be via-unblocked before reporting failure.
         if request.deadline.is_some_and(|d| Instant::now() >= d) {
+            outcome.via_pad_unblock = ViaPadUnblockSummary {
+                status: "not_attempted",
+                reason: "deadline_elapsed_before_helper",
+                attempts: Vec::new(),
+            };
             report["reason"] = "deadline elapsed before via-pad unblock".into();
             report["_endpoint_diagnostic"]["stage"] = "deadline_before_via_pad_unblock".into();
             report["_endpoint_diagnostic"]["search_evidence"]["failfast"] = true.into();
             report["_endpoint_diagnostic"]["search_evidence"]["failfast_reason"] =
                 "deadline elapsed".into();
+            report["_endpoint_diagnostic"]["search_evidence"]["via_pad_unblock"] =
+                outcome.via_pad_unblock.to_json();
             return Ok((None, report, None));
         }
         let unblock_result = {
@@ -3667,12 +4082,26 @@ fn route_multilayer_endpoint_sets_inner(
                 report["path_cells"] = outcome.path.as_ref().map_or(0, Vec::len).into();
                 report["reason"] =
                     "source GridRouter and via-pad unblocking returned no path".into();
-                let early_frontier = outcome.path.is_none()
-                    && (outcome.forward_probe_iterations < 5_000
-                        || outcome.backward_probe_iterations < 5_000);
+                let early_frontier = outcome.forward_probe_termination == Some(awx_grid::router::RouteTermination::OpenSetExhausted)
+                    || outcome.backward_probe_termination == Some(awx_grid::router::RouteTermination::OpenSetExhausted);
+                let search_result = search_termination(&outcome);
                 report["_endpoint_diagnostic"]["search_evidence"] = serde_json::json!({
                     "forward_probe_iterations": outcome.forward_probe_iterations,
                     "backward_probe_iterations": outcome.backward_probe_iterations,
+                    "forward_probe_termination": termination_name(outcome.forward_probe_termination),
+                    "backward_probe_termination": termination_name(outcome.backward_probe_termination),
+                    "forward_full_termination": termination_name(outcome.forward_full_termination),
+                    "backward_full_termination": termination_name(outcome.backward_full_termination),
+                    "search_termination": search_result,
+                    "search_graph_scope": outcome.search_graph_scope,
+                    "probe_policy_early_stop": outcome.probe_policy_early_stop,
+                    "small_via_rung_forward_termination": termination_name(outcome.small_via_rung_forward_termination),
+                    "small_via_rung_backward_termination": termination_name(outcome.small_via_rung_backward_termination),
+                    "small_via_rung_forward_full_termination": termination_name(outcome.small_via_rung_forward_full_termination),
+                    "small_via_rung_backward_full_termination": termination_name(outcome.small_via_rung_backward_full_termination),
+                    "small_via_rung_probe_policy_early_stop": outcome.small_via_rung_probe_policy_early_stop,
+                    "small_via_rung_retry_ran": outcome.small_via_rung_retry_ran,
+                    "via_pad_unblock": outcome.via_pad_unblock.to_json(),
                     "forward_iterations": outcome.forward_iterations,
                     "backward_iterations": outcome.backward_iterations,
                     "sources_cell_count": outcome.source_cells.len(),
@@ -3680,10 +4109,10 @@ fn route_multilayer_endpoint_sets_inner(
                     "window_board": [outcome.window.ll.x, outcome.window.ll.y, outcome.window.ur.x, outcome.window.ur.y],
                     "grid_step_board": outcome.grid_step_board,
                     "early_frontier_exhausted_below_probe_budget": early_frontier,
-                    "forward_probe_budget_exhausted": outcome.forward_probe_iterations >= 5_000,
-                    "backward_probe_budget_exhausted": outcome.backward_probe_iterations >= 5_000,
+                    "forward_probe_budget_exhausted": outcome.forward_probe_termination == Some(awx_grid::router::RouteTermination::IterationCap),
+                    "backward_probe_budget_exhausted": outcome.backward_probe_termination == Some(awx_grid::router::RouteTermination::IterationCap),
                     "probe_budget": 5000,
-                    "interpretation": if early_frontier { "one or both probe searches exhausted before budget; this triggers via-pad-unblock policy and does not prove physical unreachability" } else { "probe budget exhaustion or unavailable probe evidence; does not prove physical unreachability" }
+                    "interpretation": if search_result == "open_set_exhausted" { "at least one directional search exhausted its open set; no path exists from that seed set in this finite grid search graph; the opposite probe may have hit its cap" } else if search_result == "iteration_cap" { "full search hit the iteration cap without exhausting its open set; reachability is unproven" } else { "the probe stopped by policy before a complete exhaustion or full search; reachability is unproven" }
                 });
                 report["_endpoint_diagnostic"]["stage"] = "search_no_path".into();
                 // PRIVATE keystone, not user schema: the exact foreign net(s)
@@ -3701,6 +4130,8 @@ fn route_multilayer_endpoint_sets_inner(
             }
         }
     };
+    report["_endpoint_diagnostic"]["search_evidence"]["via_pad_unblock"] =
+        outcome.via_pad_unblock.to_json();
     report["expanded"] = outcome.iterations.into();
     report["path_cells"] = path.len().into();
     report["_endpoint_diagnostic"]["actual_taps"] = serde_json::json!(tap_results.iter().map(|tap| serde_json::json!({
@@ -4074,7 +4505,12 @@ fn route_multilayer_endpoint_sets_inner(
         .into_iter()
         .collect::<BTreeSet<_>>();
     for tap in &tap_results {
-        materialize_tap(&mut trial, &tap.tap, net)?;
+        materialize_tap(
+            &mut trial,
+            &tap.tap,
+            net,
+            request.min_annular_ring_mm,
+        )?;
     }
     materialize_grid_geometry(&mut trial, &geometry, net, &exact_endpoints)?;
     report["_endpoint_diagnostic"]["stage"] = "materialized".into();
@@ -4179,14 +4615,13 @@ fn route_multilayer_endpoint_sets_inner(
             }
         }
     }
-    if let Err(error) = trial.assert_invariants(policy.baseline, policy.protected, true) {
-        let details: Vec<_>=trial.board.get_items().into_iter().flat_map(|key|fr_engine::drc::clearance_violation::clearance_violations(&trial.board,key)).map(|v| {
-            let a=trial.board.item(v.first_item);let b=trial.board.item(v.second_item);
-            serde_json::json!({"first_id":a.id().0,"first_type":format!("{:?}",a.board_item_type()),"second_id":b.id().0,"second_type":format!("{:?}",b.board_item_type()),"layer":v.layer,"expected_clearance_mm":v.expected_clearance/trial.units_per_mm,"actual_clearance_mm":v.actual_clearance/trial.units_per_mm,"overlap_bounds":format!("{:?}",v.shape.bounding_box())})
-        }).collect();
+    let (invariant_result, retained_violations) =
+        trial.assert_invariants_with_violation_report(policy.baseline, policy.protected, true);
+    if let Err(error) = invariant_result {
         report["_endpoint_diagnostic"]["stage"] = "drc".into();
         report["reason"] = error.into();
-        report["candidate_violations"] = serde_json::json!(details);
+        report["candidate_violations_scope"] = "retained_new".into();
+        report["candidate_violations"] = serde_json::json!(retained_violations);
         report["candidate_vias"]=serde_json::json!(geometry.vias.iter().map(|v|serde_json::json!({"point_mm":v.point_mm,"diameter_mm":v.diameter_mm,"drill_mm":v.drill_mm,"from_layer":v.from_layer,"to_layer":v.to_layer})).collect::<Vec<_>>());
         report["candidate_segments"]=serde_json::json!(geometry.segments.iter().map(|s|serde_json::json!({"start_mm":s.start_mm,"end_mm":s.end_mm,"layer":s.layer,"width_mm":s.width_mm})).collect::<Vec<_>>());
         return Ok((None, report, None));

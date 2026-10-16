@@ -248,7 +248,7 @@ fn infer_current_moves(ends: &mut BTreeMap<String, EndState>, context: &ProbeCon
 }
 
 impl ReplanState {
-    pub fn new(world: NativeWorld) -> Result<Self, String> {
+    pub fn new(mut world: NativeWorld) -> Result<Self, String> {
         let mut names: Vec<_> = world
             .spec
             .nets
@@ -269,6 +269,8 @@ impl ReplanState {
             .awx
             .as_ref()
             .ok_or("native replan requires AWX spec")?;
+        BoardSnapshot::apply_via_drills(&mut world.fanout, &awx.via_drills)?;
+        BoardSnapshot::apply_via_drills(&mut world.routed, &awx.via_drills)?;
         let snapshot = BoardSnapshot::capture(&world.fanout, &awx.components, &awx.via_drills)?;
         let current_grade = evolution_native::grade_board(&world.routed, &world.spec)?;
         let fanout_seed = world.fanout.clone();

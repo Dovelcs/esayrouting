@@ -38,6 +38,7 @@ struct RungFabricationSettings {
     clearance_floor_mm: f64,
     track_floor_mm: f64,
     may_narrow: bool,
+    annular_floor_mm: f64,
     via_rungs: Vec<(f64, f64)>,
 }
 
@@ -93,17 +94,22 @@ fn rung_fabrication_settings(
     }
     let stack_layers = board.board.layer_structure.layers.iter().count();
     let copper_layers = if stack_layers == 0 { 2 } else { stack_layers };
-    let via_rungs = super::fab_rules::escalation_rungs(
+    let via_floors = super::fab_rules::escalation_rungs(
         copper_layers,
         awx.fabrication,
         awx.escalation,
         &awx.fabrication_overrides,
         &board_floors,
         &rule_floors,
-    )
-    .into_iter()
-    .map(|floor| (floor.via_diameter, floor.via_drill))
-    .collect();
+    );
+    let annular_floor_mm = via_floors
+        .first()
+        .map(|floor| floor.annular)
+        .unwrap_or(0.0);
+    let via_rungs = via_floors
+        .into_iter()
+        .map(|floor| (floor.via_diameter, floor.via_drill))
+        .collect();
     let clearance_floor_mm = rule_floors.get("clearance").copied().unwrap_or(0.0).max(
         if awx.escalation == super::fab_rules::EscalationPolicy::Board {
             rules.clearance
@@ -127,6 +133,7 @@ fn rung_fabrication_settings(
         clearance_floor_mm,
         track_floor_mm,
         may_narrow: true,
+        annular_floor_mm,
         via_rungs,
     })
 }
@@ -1354,6 +1361,7 @@ fn run_rung(
         fab_clearance_floor_mm: tap_fab.clearance_floor_mm,
         fab_track_floor_mm: tap_fab.track_floor_mm,
         may_narrow: tap_fab.may_narrow,
+        min_annular_ring_mm: tap_fab.annular_floor_mm,
         fab_via_rungs: tap_fab.via_rungs,
         max_iterations,
         route_layers,
@@ -1497,6 +1505,7 @@ fn free_rung_request(
         fab_clearance_floor_mm: tap_fab.clearance_floor_mm,
         fab_track_floor_mm: tap_fab.track_floor_mm,
         may_narrow: tap_fab.may_narrow,
+        min_annular_ring_mm: tap_fab.annular_floor_mm,
         fab_via_rungs: tap_fab.via_rungs,
         max_iterations,
         route_layers: layers,
@@ -1677,6 +1686,7 @@ fn run_main_lane(
         fab_clearance_floor_mm: tap_fab.clearance_floor_mm,
         fab_track_floor_mm: tap_fab.track_floor_mm,
         may_narrow: tap_fab.may_narrow,
+        min_annular_ring_mm: tap_fab.annular_floor_mm,
         fab_via_rungs: tap_fab.via_rungs,
         max_iterations,
         route_layers,

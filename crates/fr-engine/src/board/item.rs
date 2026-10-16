@@ -596,7 +596,9 @@ impl Item {
                 if other.is_trace() || (source && other.is_pin()) {
                     return false;
                 }
-                !self.drill_allowed(board) || !other.is_via()
+                !self.drill_allowed(board)
+                    || !other.is_via()
+                    || !other.as_via().is_some_and(|via| via.attach_allowed)
             }
             ItemKind::Via(v) => {
                 // (a trace-only keepout does not block vias on boards with more than two layers,

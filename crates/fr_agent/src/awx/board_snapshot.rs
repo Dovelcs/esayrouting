@@ -79,6 +79,75 @@ pub struct SameNetPastePad<'a> {
 }
 
 impl BoardSnapshot {
+    /// Apply explicit drill diameters to named DSN padstacks before routing or
+    /// snapshot capture. Values are diameters in millimetres; unknown names and
+    /// invalid dimensions are errors rather than inferred legacy drills.
+    pub fn apply_via_drills(
+        board: &mut BoardAdapter,
+        via_drills: &BTreeMap<String, f64>,
+    ) -> Result<(), String> {
+        for (name, &drill_mm) in via_drills {
+            if !drill_mm.is_finite() || drill_mm <= 0.0 {
+                return Err(format!("invalid explicit via drill for {name}"));
+            }
+            let padstack_id = board
+                .board
+                .library
+                .padstacks
+                .get_by_name(name)
+                .map(|padstack| padstack.id)
+                .ok_or_else(|| format!("explicit via drill names unknown padstack {name}"))?;
+            let explicit_radius = board
+                .board
+                .library
+                .padstacks
+                .get(padstack_id)
+                .and_then(|padstack| padstack.get_explicit_drill_radius());
+            if explicit_radius.is_some() {
+                continue;
+            }
+            let radius = drill_mm * board.units_per_mm / 2.0;
+            board
+                .board
+                .library_mut()
+                .padstacks
+                .get_mut(padstack_id)
+                .ok_or_else(|| format!("explicit via drill padstack {name} disappeared"))?
+                .set_explicit_drill_radius(Some(radius))?;
+        }
+        Ok(())
+    }
+
+    /// Fill missing drill metadata for registered via infos using the
+    /// explicitly configured endpoint drill. Native explicit dimensions win.
+    pub fn apply_configured_via_drill(
+        board: &mut BoardAdapter,
+        drill_mm: f64,
+    ) -> Result<(), String> {
+        if !drill_mm.is_finite() || drill_mm <= 0.0 {
+            return Err("invalid configured via drill".into());
+        }
+        let names: BTreeSet<_> = board
+            .board
+            .rules
+            .via_infos
+            .iter()
+            .filter_map(|id| {
+                board
+                    .board
+                    .library
+                    .padstacks
+                    .get(board.board.rules.via_infos[id].get_padstack())
+                    .map(|padstack| padstack.name.clone())
+            })
+            .collect();
+        let drills = names
+            .into_iter()
+            .map(|name| (name, drill_mm))
+            .collect();
+        Self::apply_via_drills(board, &drills)
+    }
+
     /// Read actual copper vias without inferring logical package membership.
     pub fn capture_vias(board: &BoardAdapter, via_drills: &BTreeMap<String,f64>) -> Result<Vec<CopperVia>,String> {
         let b=&board.board;

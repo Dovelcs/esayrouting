@@ -31,6 +31,9 @@ pub struct NativeGridConfig {
     pub route_layers: Vec<String>,
     pub layer_numbers: Vec<i32>,
     pub net_via_sizes: BTreeMap<NetNo, (i32, i32)>,
+    /// Source net ViaRule metadata keyed by exact native `(diameter, drill)`.
+    /// The bool controls whether a same-net SMD pin may accept a new via.
+    pub via_rule_geometry: BTreeMap<(i32, i32), (ClearanceClassNo, bool)>,
     /// Source #568 fab ladder, in resolver order, expressed in board units.
     pub fab_via_rungs: Vec<(i32, i32)>,
     /// Exact source map rung order after run rung 0: small-fab rung first when
@@ -72,6 +75,54 @@ impl NativeGridConfig {
             .iter()
             .map(|(&n, v)| Ok((n as NetNo, (to_native(v[0])?, to_native(v[1])?))))
             .collect::<Result<BTreeMap<_, _>, String>>()?;
+        let mut via_rule_geometry = BTreeMap::new();
+        if request.pair.is_none() {
+            let class = board.board.rules.net_class_of(request.net_id);
+            if let Some(rule_id) = class.get_via_rule() {
+                let copper_layers: Vec<_> = board
+                    .board
+                    .layer_structure
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, layer)| layer.is_signal.then_some(index as i32))
+                    .collect();
+                if let (Some(&first), Some(&last)) =
+                    (copper_layers.first(), copper_layers.last())
+                {
+                    for &via_info_id in board.board.rules.via_rules[rule_id].vias() {
+                        let info = &board.board.rules.via_infos[via_info_id];
+                        let padstack = board
+                            .board
+                            .library
+                            .padstacks
+                            .get(info.get_padstack())
+                            .ok_or("source ViaRule references a missing padstack")?;
+                        if padstack.from_layer() != first || padstack.to_layer() != last {
+                            continue;
+                        }
+                        let Some(drill_radius) = padstack.get_explicit_drill_radius() else {
+                            continue;
+                        };
+                        let diameter = (first..=last)
+                            .filter(|&layer| {
+                                board.board.layer_structure.layers[layer as usize].is_signal
+                            })
+                            .filter_map(|layer| padstack.get_shape(layer))
+                            .map(|shape| shape.max_width())
+                            .fold(0.0_f64, f64::max);
+                        let native_diameter = to_native(diameter / upm)?;
+                        let native_drill = to_native(2.0 * drill_radius / upm)?;
+                        if native_diameter > native_drill && native_drill > 0 {
+                            via_rule_geometry.entry((native_diameter, native_drill)).or_insert((
+                                info.get_clearance_class_index(),
+                                info.attach_smd_allowed(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let round_mm = |value: f64, digits: i32| {
             let scale = 10_f64.powi(digits);
             (value * scale).round_ties_even() / scale
@@ -139,6 +190,7 @@ impl NativeGridConfig {
             route_layers: request.route_layers.clone(),
             layer_numbers,
             net_via_sizes,
+            via_rule_geometry,
             fab_via_rungs,
             ordered_via_rungs,
             trace_clearance_class,
@@ -152,6 +204,25 @@ pub struct ObstacleMapResult {
     /// Native board layer number for each configured route layer index.
     pub layer_numbers: Vec<i32>,
     pub config: NativeGridConfig,
+}
+
+/// Internal projection for consumers that read only one obstacle channel.
+/// Ordinary map entry points always use `Full`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MapProjection {
+    Full,
+    TrackOnly,
+    ViaOnly,
+}
+
+impl MapProjection {
+    pub(crate) fn track(self) -> bool {
+        matches!(self, Self::Full | Self::TrackOnly)
+    }
+
+    pub(crate) fn via(self) -> bool {
+        matches!(self, Self::Full | Self::ViaOnly)
+    }
 }
 
 pub fn grid_round(x: i32, step: i32) -> i32 {
@@ -205,7 +276,7 @@ pub fn build_obstacle_map_with_pair_extra(
     if config.grid_step != grid_step_board {
         return Err("native obstacle grid step differs from source route configuration".into());
     }
-    build_obstacle_map_from_config(board, request, window, own_nets, config)
+    build_obstacle_map_from_config(board, request, window, own_nets, config, MapProjection::Full)
 }
 
 /// Build both native maps from an already-resolved source config. Fine tap
@@ -217,7 +288,19 @@ pub fn build_obstacle_map_with_config(
     own_nets: &[NetNo],
     config: NativeGridConfig,
 ) -> Result<ObstacleMapResult, String> {
-    build_obstacle_map_from_config(board, request, window, own_nets, config)
+    build_obstacle_map_from_config(board, request, window, own_nets, config, MapProjection::Full)
+}
+
+/// Tap-only map builder. The public ordinary map API remains complete.
+pub(crate) fn build_obstacle_map_with_config_projected(
+    board: &BoardAdapter,
+    request: &RungRequest,
+    window: IntBox,
+    own_nets: &[NetNo],
+    config: NativeGridConfig,
+    projection: MapProjection,
+) -> Result<ObstacleMapResult, String> {
+    build_obstacle_map_from_config(board, request, window, own_nets, config, projection)
 }
 
 /// Build the source single-layer `build_routing_obstacle_map` footprint for a tap.
@@ -240,7 +323,31 @@ pub fn build_obstacle_map_on_layer(
         .ok_or("tap routing layer has no native board-layer mapping")?;
     config.route_layers = vec![layer.to_owned()];
     config.layer_numbers = vec![layer_no];
-    build_obstacle_map_from_config(board, request, window, own_nets, config)
+    build_obstacle_map_from_config(board, request, window, own_nets, config, MapProjection::Full)
+}
+
+/// Tap-only single-layer map builder. Ordinary callers retain both channels.
+pub(crate) fn build_obstacle_map_on_layer_projected(
+    board: &BoardAdapter,
+    request: &RungRequest,
+    window: IntBox,
+    own_nets: &[NetNo],
+    mut config: NativeGridConfig,
+    layer: &str,
+    projection: MapProjection,
+) -> Result<ObstacleMapResult, String> {
+    let Some(index) = config.route_layers.iter().position(|name| name == layer) else {
+        return Err(format!(
+            "tap routing layer is outside the configured route stack: {layer}"
+        ));
+    };
+    let layer_no = *config
+        .layer_numbers
+        .get(index)
+        .ok_or("tap routing layer has no native board-layer mapping")?;
+    config.route_layers = vec![layer.to_owned()];
+    config.layer_numbers = vec![layer_no];
+    build_obstacle_map_from_config(board, request, window, own_nets, config, projection)
 }
 
 fn build_obstacle_map_from_config(
@@ -249,6 +356,7 @@ fn build_obstacle_map_from_config(
     window: IntBox,
     own_nets: &[NetNo],
     config: NativeGridConfig,
+    projection: MapProjection,
 ) -> Result<ObstacleMapResult, String> {
     let grid_step_board = config.grid_step;
     if grid_step_board <= 0 {
@@ -265,6 +373,9 @@ fn build_obstacle_map_from_config(
     let map_layers = config.layer_numbers.len();
     if map_layers == 0 {
         return Err("native obstacle map requires route layers".into());
+    }
+    if projection == MapProjection::TrackOnly && map_layers != 1 {
+        return Err("track-only obstacle projection requires one route layer".into());
     }
     let mut obstacles = GridObstacleMap::new(map_layers);
     if config.bga_proximity_cost > 0.0 {
@@ -314,6 +425,9 @@ fn build_obstacle_map_from_config(
                 // exact continuous centerline capsules.
                 continue;
             };
+            if !projection.track() {
+                continue;
+            }
             let clearance = board
                 .board
                 .clearance_value(route_clearance, item.clearance_class(), layer_no)
@@ -357,6 +471,9 @@ fn build_obstacle_map_from_config(
         // with the .5/.75 grid fraction; unsupported custom polygons fall back
         // to the exact native polygon offset raster below.
         if kind == BoardItemType::Pin {
+            if !projection.track() {
+                continue;
+            }
             let clearance_class = item.clearance_class();
             let corner_buffer_fraction = if config.extra_clearance > 0.0 {
                 0.75
@@ -432,7 +549,8 @@ fn build_obstacle_map_from_config(
                 // Source obstacle_map.py: a foreign track on a copper layer outside cfg.layers
                 // cannot block a track search, but its barrel must still block a new via.
                 // The native tile shape already contains the foreign copper width/shape.
-                if matches!(kind, BoardItemType::Trace | BoardItemType::Pin)
+                if projection.via()
+                    && matches!(kind, BoardItemType::Trace | BoardItemType::Pin)
                     && board
                         .board
                         .layer_structure
@@ -473,6 +591,9 @@ fn build_obstacle_map_from_config(
                 }
                 continue;
             };
+            if !projection.track() {
+                continue;
+            }
             // The native TileShape is the foreign item's copper body; the candidate track's
             // own half-width and the source pairwise class clearance expand that exact geometry.
             let expand =
@@ -498,7 +619,7 @@ fn build_obstacle_map_from_config(
         }
     }
     crate::awx::native_outline::stamp_outline_and_cutouts(&mut obstacles, board, window, &config)?;
-    crate::awx::native_via_obstacles::add_foreign_via_obstacles(
+    crate::awx::native_via_obstacles::add_foreign_via_obstacles_projected(
         &mut obstacles,
         board,
         &config,
@@ -506,24 +627,27 @@ fn build_obstacle_map_from_config(
         &request.same_net_pads,
         &request.existing_vias,
         true,
+        projection,
     )?;
-    for &net in own_nets {
-        crate::awx::native_same_net::add_same_net_via_clearance(
-            &mut obstacles,
-            board,
-            net,
-            &config,
-            &request.same_net_pads,
-            &request.existing_vias,
-            &request.paste_pads,
-        )?;
-        crate::awx::native_same_net::add_same_net_pad_drill_via_clearance(
-            &mut obstacles,
-            board,
-            net,
-            &config,
-            &request.same_net_pads,
-        )?;
+    if projection.via() {
+        for &net in own_nets {
+            crate::awx::native_same_net::add_same_net_via_clearance(
+                &mut obstacles,
+                board,
+                net,
+                &config,
+                &request.same_net_pads,
+                &request.existing_vias,
+                &request.paste_pads,
+            )?;
+            crate::awx::native_same_net::add_same_net_pad_drill_via_clearance(
+                &mut obstacles,
+                board,
+                net,
+                &config,
+                &request.same_net_pads,
+            )?;
+        }
     }
     crate::awx::native_grid_window::fence_window(&mut obstacles, board, window, &config)?;
     crate::awx::native_grid_window::add_free_via_positions(
@@ -542,9 +666,22 @@ fn build_obstacle_map_from_config(
 
 #[cfg(test)]
 mod tests {
-    use super::blocks_track_search;
+    use super::{
+        blocks_track_search, build_obstacle_map_on_layer,
+        build_obstacle_map_on_layer_projected, build_obstacle_map_with_config,
+        build_obstacle_map_with_config_projected, MapProjection, NativeGridConfig,
+    };
+    use crate::{
+        awx::{
+            braid_connect::{RungEndpoint, RungLabel, RungRequest, RungSpec},
+            fab_rules::{EscalationPolicy, FabTier},
+            whole_context::RoutingRules,
+        },
+        board_adapter::BoardAdapter,
+    };
     use awx_grid::obstacle_map::GridObstacleMap;
     use fr_engine::board::BoardItemType;
+    use std::collections::BTreeMap;
 
     #[test]
     fn via_obstacle_area_allows_tracks_but_keeps_via_cell_blocked() {
@@ -559,6 +696,164 @@ mod tests {
 
         assert!(!map.is_blocked(0, 0, 0), "same-layer trace must pass");
         assert!(map.is_via_blocked(0, 0), "via placement must remain forbidden");
+    }
+
+    #[test]
+    fn tap_map_projections_match_their_consumer_channels() {
+        let board = BoardAdapter::load(include_bytes!("../../tests/fixtures/two_chip.dsn"))
+            .expect("load map projection fixture");
+        let net_id = board.net_number("BUS").expect("fixture BUS net");
+        let request = RungRequest {
+            board: board.clone(),
+            net: "BUS".into(),
+            net_id,
+            stage: "projection_test".into(),
+            start: RungEndpoint {
+                point: [5.0, 5.0],
+                layer: "Top".into(),
+            },
+            end: RungEndpoint {
+                point: [15.0, 5.0],
+                layer: "Top".into(),
+            },
+            b_alternatives: Vec::new(),
+            pair: None,
+            spec: RungSpec {
+                label: RungLabel::Free6,
+                slack: 0.0,
+                open_layers: false,
+                margin: 0.0,
+                use_window: false,
+            },
+            band: None,
+            band_slack: 0.0,
+            window_points: None,
+            virtual_tracks: Vec::new(),
+            virtual_vias: Vec::new(),
+            free_via_pads: Vec::new(),
+            same_net_pads: Vec::new(),
+            existing_vias: Vec::new(),
+            paste_pads: BTreeMap::new(),
+            min_annular_ring_mm: 0.0,
+            rules: RoutingRules {
+                grid_step: 0.1,
+                track_width: 0.15,
+                clearance: 0.1,
+                via_size: 0.5,
+                via_drill: 0.3,
+                pair_gap: 0.0,
+                lane_pitch: 0.5,
+                lane_min: 0.15,
+                min_turning_radius: 0.0,
+                max_turn_angle: 90.0,
+                max_setback_angle: 90.0,
+                routing_clearance_margin: 0.0,
+                board_edge_clearance: 0.0,
+                hole_to_hole_clearance: 0.0,
+                fan_clearance: 0.0,
+                geometry_pair_room: false,
+                geometry_pair_turn_room_steps: None,
+                same_net_pad_clearance: 0.0,
+                net_via_sizes: BTreeMap::new(),
+            },
+            fabrication: FabTier::Standard,
+            escalation: EscalationPolicy::Off,
+            fabrication_overrides: BTreeMap::new(),
+            fab_clearance_floor_mm: 0.1,
+            fab_track_floor_mm: 0.15,
+            may_narrow: false,
+            fab_via_rungs: Vec::new(),
+            max_iterations: 1_000,
+            route_layers: vec!["Top".into(), "Bottom".into()],
+            deadline: None,
+        };
+        let config = NativeGridConfig::from_request(&board, &request, 0, 0)
+            .expect("fixture obstacle config");
+        let window = board.board.bounding_box();
+        let own_nets = [net_id];
+
+        let via_full = build_obstacle_map_with_config(
+            &board,
+            &request,
+            window,
+            &own_nets,
+            config.clone(),
+        )
+        .expect("full via map");
+        let via_projected = build_obstacle_map_with_config_projected(
+            &board,
+            &request,
+            window,
+            &own_nets,
+            config.clone(),
+            MapProjection::ViaOnly,
+        )
+        .expect("projected via map");
+        for gx in -2..=202 {
+            for gy in -2..=102 {
+                assert_eq!(
+                    via_full.obstacles.is_via_blocked_rung(gx, gy, 0),
+                    via_projected.obstacles.is_via_blocked_rung(gx, gy, 0),
+                    "via channel differs at ({gx}, {gy})",
+                );
+            }
+        }
+
+        let route_full = build_obstacle_map_on_layer(
+            &board,
+            &request,
+            window,
+            &own_nets,
+            config.clone(),
+            "Top",
+        )
+        .expect("full route map");
+        let route_projected = build_obstacle_map_on_layer_projected(
+            &board,
+            &request,
+            window,
+            &own_nets,
+            config,
+            "Top",
+            MapProjection::TrackOnly,
+        )
+        .expect("projected route map");
+        for gx in -2..=202 {
+            for gy in -2..=102 {
+                assert_eq!(
+                    route_full.obstacles.is_blocked(gx, gy, 0),
+                    route_projected.obstacles.is_blocked(gx, gy, 0),
+                    "track channel differs at ({gx}, {gy})",
+                );
+            }
+        }
+
+        let router = fr_engine::autoroute::point_router::SourceGridConfig::from_source(
+            0.1,
+            75,
+            1,
+            &[0],
+            Some(vec![1_000]),
+            Some(vec![255]),
+        )
+        .expect("single-layer router config")
+        .router();
+        let route = |obstacles: &GridObstacleMap| {
+            fr_engine::autoroute::point_router::route_with_frontier(
+                &router,
+                obstacles,
+                vec![(50, 50, 0)],
+                vec![(150, 50, 0)],
+                1_000,
+                awx_grid::TrackMarginArg::Scalar(0.0),
+                None,
+                None,
+            )
+        };
+        let full_path = route(&route_full.obstacles).0;
+        let projected_path = route(&route_projected.obstacles).0;
+        assert_eq!(full_path, projected_path);
+        assert!(full_path.is_some(), "fixture route should be open");
     }
 }
 

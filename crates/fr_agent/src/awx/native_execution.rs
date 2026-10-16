@@ -525,6 +525,9 @@ pub fn restore_nets(
     trial: &mut BoardAdapter,
     names: &BTreeSet<String>,
 ) -> Result<(), String> {
+    if original.units_per_mm.to_bits() != trial.units_per_mm.to_bits() {
+        return Err("AWX rollback source and trial boards use different coordinate scales".into());
+    }
     let mut candidate = trial.clone();
     restore_nets_into(original, &mut candidate, names)?;
     *trial = candidate;
@@ -564,27 +567,24 @@ fn restore_nets_into(
             return Err("AWX rollback is missing source-protected trace copper".into());
         }
         for net_name in target_nets {
-            let layer = &original.board.layer_structure.layers
-                [item.first_layer(&original.board) as usize]
-                .name;
-            let points = item.trace().polyline().corner_approx_arr();
-            let width = 2. * item.trace().half_width() as f64 / original.units_per_mm;
-            for pair in points.windows(2) {
-                trace(
-                    trial,
-                    &net_name,
-                    layer,
-                    [
-                        pair[0].x / original.units_per_mm,
-                        pair[0].y / original.units_per_mm,
-                    ],
-                    [
-                        pair[1].x / original.units_per_mm,
-                        pair[1].y / original.units_per_mm,
-                    ],
-                    width,
-                )?;
+            let layer_name =
+                &original.board.layer_structure.layers[item.trace().layer() as usize].name;
+            let layer = trial.board.layer_structure.get_no(layer_name);
+            if layer < 0 {
+                return Err(format!("restored trace layer {layer_name} is missing"));
             }
+            let net = trial.net_number(&net_name)?;
+            trial
+                .board
+                .insert_trace_without_cleaning(
+                    item.trace().polyline().clone(),
+                    layer,
+                    item.trace().half_width(),
+                    &[net],
+                    item.clearance_class(),
+                    item.fixed_state(),
+                )
+                .ok_or("restored trace insertion failed")?;
         }
     }
     for key in original.board.get_vias() {
@@ -632,7 +632,9 @@ fn restore_nets_into(
                 &[net_no],
                 item.clearance_class(),
                 item.fixed_state(),
-                true,
+                item.as_via()
+                    .ok_or("source via item lost via data")?
+                    .attach_allowed,
             );
         }
     }
@@ -670,6 +672,7 @@ mod tests {
     use super::{ensure_via_candidate, restore_nets, strip_nets, trace};
     use crate::board_adapter::BoardAdapter;
     use fr_engine::ids::FixedState;
+    use fr_geom::ConvexShape;
     use std::collections::BTreeSet;
 
     fn protected_source_board(
@@ -705,6 +708,36 @@ mod tests {
         };
         dsn.push_str(&format!("\n (wiring {prior}{bus_wires}{via})\n)"));
         BoardAdapter::load(dsn.as_bytes()).expect("protected source board loads")
+    }
+
+    fn board_with_unprotected_via(attach_allowed: bool) -> BoardAdapter {
+        let mut board = BoardAdapter::load(include_bytes!("../../tests/fixtures/two_chip.dsn"))
+            .expect("fixture board loads");
+        crate::awx::board_snapshot::BoardSnapshot::apply_configured_via_drill(&mut board, 0.3)
+            .expect("fixture via drill is configured");
+        let net = board.net_number("BUS").unwrap();
+        let padstack = board
+            .board
+            .library
+            .padstacks
+            .get_by_name("VIA")
+            .expect("fixture via padstack")
+            .id;
+        let clearance_class = board
+            .board
+            .rules
+            .net_class_of(net)
+            .get_trace_clearance_class();
+        let point = board.point([5.0, 5.0]).unwrap();
+        board.board.insert_via(
+            padstack,
+            point,
+            &[net],
+            clearance_class,
+            FixedState::Unfixed,
+            attach_allowed,
+        );
+        board
     }
 
     #[test]
@@ -846,6 +879,54 @@ mod tests {
         assert_eq!(bus_traces, trial_source_keys);
         assert!(bus_traces.iter().all(|&key| trial.is_source_protected_copper(key)));
         assert!(!trial.board.item(generated_key).is_on_board());
+    }
+
+    #[test]
+    fn restore_nets_preserves_saved_via_attach_allowed() {
+        let names = BTreeSet::from(["BUS".to_string()]);
+        for attach_allowed in [false, true] {
+            let original = board_with_unprotected_via(attach_allowed);
+            let original_key = *original.board.get_vias().first().unwrap();
+            let original_item = original.board.item(original_key);
+            assert!(!original.is_source_protected_copper(original_key));
+            assert_eq!(original_item.as_via().unwrap().attach_allowed, attach_allowed);
+
+            let mut trial = original.clone();
+            restore_nets(&original, &mut trial, &names).expect("restored via retains source flags");
+
+            let restored_keys = trial.board.get_vias();
+            assert_eq!(restored_keys.len(), 1);
+            let restored = trial.board.item(restored_keys[0]);
+            assert_eq!(restored.as_via().unwrap().attach_allowed, attach_allowed);
+            assert_eq!(restored.center(&trial.board), original_item.center(&original.board));
+            assert_eq!(restored.clearance_class(), original_item.clearance_class());
+            assert_eq!(restored.fixed_state(), original_item.fixed_state());
+            let original_stack = original_item.padstack(&original.board).unwrap();
+            let restored_stack = restored.padstack(&trial.board).unwrap();
+            assert_eq!(restored_stack.name, original_stack.name);
+            let drill_radius = original_stack
+                .get_explicit_drill_radius()
+                .expect("configured via drill is explicit");
+            assert!(
+                (2.0 * drill_radius / original.units_per_mm - 0.3).abs() < 0.001,
+                "fixture via drill differs from the configured 0.3 mm"
+            );
+            assert_eq!(restored_stack.get_explicit_drill_radius(), Some(drill_radius));
+            for layer in 0..original.board.layer_structure.layers.len() {
+                match (
+                    original_stack.get_shape(layer as i32),
+                    restored_stack.get_shape(layer as i32),
+                ) {
+                    (Some(original_shape), Some(restored_shape)) => assert_eq!(
+                        restored_shape.max_width(),
+                        original_shape.max_width(),
+                        "copper size changed on layer {layer}"
+                    ),
+                    (None, None) => {}
+                    _ => panic!("copper layer span changed on layer {layer}"),
+                }
+            }
+        }
     }
 
     #[test]

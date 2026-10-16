@@ -162,6 +162,14 @@ fn sorted_components(board: &RoutingBoard, settings: &RouterSettings, skip_ignor
     result
 }
 
+/// Return SMD pins in the native batch fanout ordering.
+pub fn ordered_fanout_pins(board: &RoutingBoard, settings: &RouterSettings, skip_ignored_nets: bool) -> Vec<ItemKey> {
+    sorted_components(board, settings, skip_ignored_nets)
+        .into_iter()
+        .flat_map(|component| component.pins.into_iter().map(|pin| pin.key))
+        .collect()
+}
+
 /// Java `BatchFanout.fanoutBoard(board, settings, thread, listener)`.
 pub fn fanout_board(board: &mut RoutingBoard, settings: &RouterSettings, ctx: &PipelineContext) -> FanoutRunSummary {
     let components = sorted_components(board, settings, ctx.enhancements);
